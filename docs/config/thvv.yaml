@@ -1,0 +1,412 @@
+# ==============================================================================
+# THVV Server — 完整配置示例
+# ------------------------------------------------------------------------------
+# 用法:
+#   export THVV_HOME=/opt/thvv                      # ★ 第一个要填的地址
+#   export THVV_SECRET_KEY=$(openssl rand -base64 32)
+#   ./thvv-server -config ./config/thvv.yaml
+#   # 或: ./thvv-server -config ./config/thvv.yaml -thvv-home /opt/thvv
+#
+# ★★ 部署解耦 ★★
+#   Go 服务（本程序）与 THVV Python 工具链 **可以安装在任何位置**，无需同目录。
+#   THVV 的位置只在 roots.thvv 里写一次，其余路径一律用前缀引用它：
+#       thvv:perf/scripts        → <roots.thvv>/perf/scripts
+#       data:runs                → <roots.data>/runs
+#       bin:python               → <roots.bin>/python
+#       cfg:templates            → <配置文件所在目录>/templates
+#   前缀之外的写法：绝对路径（/opt/...）或以配置文件目录为基准的相对路径。
+#
+# 其余约定:
+#   1. `${VAR}` / `${VAR:-默认值}` 在加载时展开（仅环境变量，一轮，不递归）
+#   2. 环境变量可覆盖任意项：THVV_ + 大写路径，层级用双下划线
+#         THVV_ROOTS__THVV=/srv/thvv
+#         THVV_LIMITS__MAX_CONCURRENT_RUNS=8
+#   3. 时间用 10s / 12h / 720h；容量用 200MiB / 1GiB
+#   4. 启动时会把每个根与每个派生路径解析成绝对路径并校验存在性，配错立即退出
+# ==============================================================================
+
+version: 1
+
+# ==============================================================================
+# ★ 根目录（第一个必须设计的地址）
+# ==============================================================================
+roots:
+  # ① THVV Python 工具链根目录：包含 perf/、eval/、configs/、quickstart.sh
+  #    启动时会做「指纹校验」（见 CONFIG.md §3.2），防止指错目录。
+  thvv: "${THVV_HOME}"
+
+  # ② 服务端自有数据目录：sqlite / runs / logs / cache。
+  #    与 thvv 完全解耦，可以放在另一块盘上（压测产物很大）。
+  data: "${THVV_DATA:-./data}"
+
+  # ③ Python 解释器与 CLI 所在目录，默认 <thvv>/.venv/bin。
+  #    想用系统 python 时改成 "/usr/local/bin"。
+  bin: "thvv:.venv/bin"
+
+  # ④ 自定义根（可选）：perf 与 eval 的 evalscope 版本要求不同
+  #    （perf: >=0.13.0，eval: 固定 1.9.0），常需两套 venv。
+  #    定义后即可在 capabilities.eval.runtime 里引用。
+  # thvv-eval: "${THVV_EVAL_HOME}"
+
+# ==============================================================================
+# 服务监听
+# ==============================================================================
+server:
+  listen: "127.0.0.1:8080"          # 对外提供服务时改 "0.0.0.0:8080"
+  base_path: "/v1"
+  shutdown_timeout: 30s
+
+  # SSE 长连接要求 write_timeout 为 0。设成 60s 会把进度流掐断（启动时会 warn）。
+  read_header_timeout: 10s
+  read_timeout: 0s
+  write_timeout: 0s
+  idle_timeout: 120s
+
+  tls:
+    enabled: false
+    cert_file: ""
+    key_file: ""
+
+  cors:
+    enabled: true
+    allowed_origins: ["http://localhost:8080"]
+    allowed_headers: ["Authorization", "Content-Type", "Idempotency-Key"]
+    max_age: 600s
+
+  # 内置 Web 页面
+  ui:
+    enabled: true
+    path: "/ui/"
+    # 留空 = 用 go:embed 打进二进制的版本（推荐，不依赖 thvv 目录结构）
+    # 想改页面不重编译时指向磁盘目录（同样支持根前缀）：
+    #   dir: "../../server/web"      # 或指向任意磁盘目录
+    dir: ""
+    redirect_root: true
+
+# ==============================================================================
+# 认证
+# ==============================================================================
+auth:
+  mode: both                        # bearer | cookie | both（后者并存，先 Cookie 后 Bearer）
+
+  session:
+    cookie_name: thvv_session
+    ttl: 12h
+    secure: false                   # HTTPS 下必须 true
+    same_site: lax
+    signing_key: ${THVV_SESSION_KEY:-dev-only-change-me}
+
+  tokens:
+    - name: ci-runner
+      token: ${THVV_CI_TOKEN:-dev-ci-token}
+      role: operator
+    - name: readonly-report
+      token: ${THVV_RO_TOKEN:-dev-ro-token}
+      role: viewer
+
+  # 网页登录账号（bcrypt）
+  # 生成: htpasswd -bnBC 10 "" '你的密码' | tr -d ':\n'
+  # ⚠ 下面这行是公开示例 hash（对应口令 password），仅用于本地冒烟，务必覆盖
+  users:
+    - username: admin
+      password_hash: ${THVV_ADMIN_HASH:-$2a$10$IBU8oAPb/vYyjaHjJHAhMuaUS9nblXw3MuVZLit8R88wEZEZ.e9xC}
+      role: admin
+
+# ==============================================================================
+# 存储
+# ==============================================================================
+store:
+  driver: sqlite
+  sqlite:
+    path: "data:thvv.db"
+    wal: true
+    busy_timeout: 5s
+    max_open_conns: 4
+
+# ==============================================================================
+# 凭据加密（Target 的 api_key 落库前 AES-GCM 加密；YAML 里永不出现被测端 Key）
+# ==============================================================================
+secrets:
+  provider: env                     # env | file
+  env:
+    key: ${THVV_SECRET_KEY}         # 32 字节：base64 或 64 位 hex
+  file:
+    path: "data:master.key"         # provider=file 时读取（建议 0600）
+
+# ==============================================================================
+# 路径（全部用根前缀，无需关心 Go 服务与 thvv 的相对位置）
+# ==============================================================================
+paths:
+  runs_dir: "data:runs"             # runs/<run_id>/results/perf-<bucket>-<ts>/...
+  logs_dir: "data:logs"
+  datasets_dir: "thvv:perf/datasets_clean"   # 不存在时回落 thvv:perf/datasets
+  cache_dir: "data:cache"           # HF_HOME / MODELSCOPE_CACHE 落点
+  templates_dir: "cfg:templates"    # 不存在则用二进制内置模板
+
+# ==============================================================================
+# 限额
+# ==============================================================================
+limits:
+  max_concurrent_runs: 2
+  max_queued_runs: 16
+  max_parallel_runs_per_target: 1   # 同一端点串行，避免自相干扰污染指标
+  max_run_duration: 12h
+  run_retention: 720h
+  artifact_max_bytes: 200MiB
+
+  api:
+    request_timeout: 30s
+    max_body_bytes: 1MiB
+    rate_limit:
+      enabled: false
+      rps: 20
+      burst: 40
+
+  plan:
+    max_number: 10000
+    max_parallel: 256
+    max_buckets_per_run: 9
+    max_tpm_budget: 100000000
+
+# ==============================================================================
+# 引擎（工具注册表）
+# ==============================================================================
+engines:
+  # ============================ 内置 THVV（fork Python） ============================
+  thvv:
+    enabled: true
+    kind: subprocess
+    display_name: "THVV TokenHub Vendor Verifier"
+    version: "1.0.0"
+
+    runtime:                        # 默认运行时，各 capability 继承并可覆盖
+      home: "thvv:"                 # 工具链根；等价于 roots.thvv
+      python: "bin:python"
+      evalscope: "bin:evalscope"
+      # 注入 sitecustomize（修 transformers 5.x 的 BatchEncoding 计数问题）
+      pythonpath_prepend: ["thvv:perf/scripts"]
+      env:
+        HF_HOME: "data:cache/huggingface"
+        MODELSCOPE_CACHE: "data:cache/modelscope"
+        PYTHONUNBUFFERED: "1"
+        TOKENIZERS_PARALLELISM: "false"
+      check_on_startup: true        # 跑一次 `evalscope --version`，失败则该引擎标 unavailable
+      check_timeout: 20s
+
+    capabilities:
+      # ------------------------------ 性能压测 ------------------------------
+      perf:
+        enabled: true
+        status: ga
+        working_dir: "thvv:perf"    # 引擎进程 cwd（等价 run.sh 里的 cd perf）
+
+        defaults:
+          max_tokens: 4096
+          max_turns: 1
+          connect_timeout: 60s
+          read_timeout: 600s
+          db_commit_interval: 5
+          temperature_map:          # 顺序匹配，首条命中生效
+            - { match: "(?i)kimi|moonshot", value: 1.0 }
+            - { match: "(?i).*",            value: 0.0 }
+          tokenizer_map:            # 与 run.sh: auto_detect_tokenizer 一致
+            - { match: "(?i)glm|chatglm",      tokenizer: "zai-org/GLM-4.6" }
+            - { match: "(?i)deepseek",         tokenizer: "deepseek-ai/DeepSeek-V3" }
+            - { match: "(?i)minimax",          tokenizer: "MiniMaxAI/MiniMax-M2" }
+            - { match: "(?i)kimi|moonshot",    tokenizer: "moonshotai/Kimi-K2-Thinking" }
+            - { match: "(?i)qwen|tongyi",      tokenizer: "Qwen/Qwen3-235B-A22B" }
+            - { match: "(?i)llama",            tokenizer: "meta-llama/Llama-3.1-8B-Instruct" }
+            - { match: "(?i)mistral",          tokenizer: "mistralai/Mistral-7B-Instruct-v0.3" }
+            - { match: "(?i)baichuan",         tokenizer: "baichuan-inc/Baichuan2-13B-Chat" }
+            - { match: "(?i)yi[-_]|yi-l",      tokenizer: "01-ai/Yi-1.5-34B-Chat" }
+            - { match: "(?i)gemma|gemini",     tokenizer: "google/gemma-2-2b" }
+            - { match: "(?i)claude|anthropic", tokenizer: "Xenova/gpt-4o" }
+            - { match: "(?i)gpt|openai",       tokenizer: "Xenova/gpt-4o" }
+            - { match: "(?i)phi[-_]?3",        tokenizer: "microsoft/Phi-3-mini-4k-instruct" }
+
+        # 档位表：与 perf/run.sh 的 bucket_range / bucket_max_parallel 逐项对应
+        buckets:
+          - { label: "1k",   min: 870,    max: 1228,    max_parallel: 128 }
+          - { label: "9k",   min: 8000,   max: 11000,   max_parallel: 128 }
+          - { label: "16k",  min: 14000,  max: 18000,   max_parallel: 128 }
+          - { label: "32k",  min: 28000,  max: 36000,   max_parallel: 128 }
+          - { label: "64k",  min: 56000,  max: 72000,   max_parallel: 64 }
+          - { label: "128k", min: 112000, max: 144000,  max_parallel: 32 }
+          - { label: "200k", min: 180000, max: 220000,  max_parallel: 16 }
+          - { label: "512k", min: 500000, max: 540000,  max_parallel: 8, dataset_built_in: false }
+          - { label: "1m",   min: 980000, max: 1030000, max_parallel: 8, dataset_built_in: false }
+
+        number_by_parallel: { 1: 20, 4: 40, 8: 60, 16: 80, 32: 120, 64: 200, 128: 400 }
+        default_number: 100
+
+        extra_parallels:
+          "200k": [16]
+
+        matrix:
+          buckets: ["1k", "9k", "16k", "32k", "64k", "128k", "200k"]
+          default_ladder: [1, 8, 32, 64, 128]
+          cooldown: 120s
+          success_rate_min: 0
+          tpm_budget: 0
+          stop_on_failure: true
+          max_parallel_cap: default
+
+        long_buckets: ["512k", "1m"]
+        dataset_tokenizer: "zai-org/GLM-4.6"
+
+        scenarios:
+          - { label: "9k_cold",  bucket: "9k", file: "perf_zh_9k_cold.jsonl" }
+          - { label: "9k_hot",   bucket: "9k", file: "perf_zh_9k_hot.jsonl" }
+          - { label: "9k_mix50", bucket: "9k", file: "perf_zh_9k_mix50.jsonl" }
+
+        process:
+          kill_grace: 10s
+          stdout_queue: 1000
+          redact_patterns:
+            - "(?i)sk-[A-Za-z0-9_\\-]{8,}"
+            - "(?i)bearer\\s+[A-Za-z0-9._\\-]{8,}"
+            - "(?i)api[_-]?key[\"'\\s:=]+[A-Za-z0-9._\\-]{8,}"
+          extra_args: []
+
+      # ------------------------------ 效果评测 ------------------------------
+      # 依赖 thvv:eval（scripts/run_eval.py）。若当前 thvv 只拉了 perf，请设为 false。
+      eval:
+        enabled: true
+        status: preview
+        working_dir: "thvv:eval"
+        script: "thvv:eval/scripts/run_eval.py"
+        # eval 侧 requirements 固定 evalscope==1.9.0，与 perf (>=0.13.0) 常不兼容。
+        # 若为 eval 单独建了 venv，取消注释并在 roots 里定义 thvv-eval：
+        # runtime:
+        #   python: "thvv-eval:.venv/bin/python"
+        #   evalscope: "thvv-eval:.venv/bin/evalscope"
+        defaults:
+          repeats: 1
+          eval_batch_size: 10
+          limit: null
+        judge:
+          model: "deepseek-v4-pro"
+          base_url: "https://api.deepseek.com/v1"
+          api_key: "${JUDGE_API_KEY:-}"
+        datasets:
+          - { name: "aime26",        kind: text,  needs_judge: false }
+          - { name: "aime25",        kind: text,  needs_judge: false, excluded_from_all: true }
+          - { name: "gpqa_diamond",  kind: text,  needs_judge: false }
+          - { name: "hle",           kind: text,  needs_judge: true, default_limit: 30 }
+          - { name: "mmlu_pro",      kind: text,  needs_judge: false }
+          - { name: "simple_qa",     kind: text,  needs_judge: true }
+          - { name: "longbench_v2",  kind: text,  needs_judge: false }
+          - { name: "livecodebench", kind: text,  needs_judge: false }
+          - { name: "tau2_bench",    kind: agent, needs_judge: false }
+          - { name: "swe_bench_pro", kind: agent, needs_judge: false, excluded_from_all: true }
+
+      # ------------------------------ 功能测试（预留） ------------------------------
+      functional:
+        enabled: false
+        status: planned
+        available_at: "v1.2"
+
+  # ============================ 外部工具（HTTP 接入） ============================
+  # acme-redteam:
+  #   enabled: false
+  #   kind: http
+  #   display_name: "ACME 红队测试"
+  #   base_url: "http://127.0.0.1:9100"
+  #   auth: { scheme: bearer, token: "${ACME_TOKEN}" }
+  #   timeout: 30s
+  #   capabilities:
+  #     functional:
+  #       enabled: true
+  #       status: ga
+  #       plan_schema: "cfg:schemas/acme.functional.plan.json"
+  #       result_schema: "cfg:schemas/acme.functional.result.json"
+
+# ==============================================================================
+# 报告
+# ==============================================================================
+reports:
+  default_formats: [html, xlsx]
+  default_company: ""
+  title:
+    single: "{model} 性能压测报告 ({bucket})"
+    matrix: "{model} 性能压测报告 (全档位 {ts})"
+  xlsx:
+    sheet_metrics: "性能指标"
+    sheet_failures: "失败请求详情"
+    embed_tpm_chart: false
+  failure_excerpt_chars: 1200
+  html:
+    inline_assets: true
+    template_dir: ""
+
+# ==============================================================================
+# 验收门槛
+# ==============================================================================
+gates:
+  default_profile: "perf-sla-v1"
+  profiles:
+    perf-sla-v1:
+      capability: perf
+      description: "按平均输入长度分档的 TTFT P50/P90 阈值 + 吞吐下限"
+      tiers:                        # lo <= x < hi（上界不含，与 sla_eval.py 一致）
+        - { tier: "<4K",   lo: 1000,   hi: 4000,   ttft_p50_max_sec: 2.0,  ttft_p90_max_sec: 5.0 }
+        - { tier: "<8K",   lo: 4000,   hi: 8000,   ttft_p50_max_sec: 2.5,  ttft_p90_max_sec: 5.0 }
+        - { tier: "<32K",  lo: 8000,   hi: 32000,  ttft_p50_max_sec: 4.0,  ttft_p90_max_sec: 8.0 }
+        - { tier: "<64K",  lo: 32000,  hi: 64000,  ttft_p50_max_sec: 8.0,  ttft_p90_max_sec: 15.0 }
+        - { tier: "<128K", lo: 64000,  hi: 128000, ttft_p50_max_sec: 15.0, ttft_p90_max_sec: 35.0 }
+        - { tier: "<256K", lo: 128000, hi: 256000, ttft_p50_max_sec: 30.0, ttft_p90_max_sec: 70.0 }
+      global:
+        min_output_tokens_per_sec: 30
+        min_success_rate: 0.99
+      default_params:
+        user_tpm_quota: 5000000
+
+    perf-smoke:
+      capability: perf
+      description: "冒烟用：仅校验成功率"
+      tiers:
+        - { tier: "<4K",   lo: 1000,   hi: 4000,   ttft_p50_max_sec: 99, ttft_p90_max_sec: 99 }
+        - { tier: "<8K",   lo: 4000,   hi: 8000,   ttft_p50_max_sec: 99, ttft_p90_max_sec: 99 }
+        - { tier: "<32K",  lo: 8000,   hi: 32000,  ttft_p50_max_sec: 99, ttft_p90_max_sec: 99 }
+        - { tier: "<64K",  lo: 32000,  hi: 64000,  ttft_p50_max_sec: 99, ttft_p90_max_sec: 99 }
+        - { tier: "<128K", lo: 64000,  hi: 128000, ttft_p50_max_sec: 99, ttft_p90_max_sec: 99 }
+        - { tier: "<256K", lo: 128000, hi: 256000, ttft_p50_max_sec: 99, ttft_p90_max_sec: 99 }
+      global:
+        min_output_tokens_per_sec: 0
+        min_success_rate: 0.99
+
+# ==============================================================================
+# 回调
+# ==============================================================================
+webhooks:
+  enabled: true
+  timeout: 10s
+  retry_backoff: [5s, 25s, 2m, 10m, 30m]
+  allowed_hosts: []
+  signature_header: "X-THVV-Signature"
+
+# ==============================================================================
+# 安全
+# ==============================================================================
+security:
+  allow_private_targets: true
+  target_host_denylist: ["169.254.169.254", "metadata.google.internal"]
+  target_host_allowlist: []
+  max_targets: 200
+  redact_logs: true
+  expose_engine_cmdline: false
+
+# ==============================================================================
+# 可观测性
+# ==============================================================================
+observability:
+  log_level: info
+  log_format: text
+  access_log: true
+  slow_request_threshold: 2s
+  metrics:
+    enabled: true
+    path: "/metrics"
+  pprof:
+    enabled: false
+    path: "/debug/pprof"

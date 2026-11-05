@@ -1,0 +1,576 @@
+// Package domain 定义 THVV 的领域模型。
+//
+// 这里的 computeSteps 与前端 web/app.js 的 computeSteps() **必须逐行等价**，
+// 否则提交前后的 steps_total 会不一致（协议要求 202 时即可精确给出总步数）。
+// 算法来源：thvv/perf/run.sh 的 cmd_bench_all。
+package domain
+
+import (
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+)
+
+// ---------------- 能力 ----------------
+
+type Capability string
+
+const (
+	CapPerf       Capability = "perf"
+	CapEval       Capability = "eval"
+	CapFunctional Capability = "functional"
+)
+
+func (c Capability) Valid() bool {
+	return c == CapPerf || c == CapEval || c == CapFunctional
+}
+
+// ---------------- Target ----------------
+
+type Protocol string
+
+const (
+	ProtocolOpenAI    Protocol = "openai"
+	ProtocolAnthropic Protocol = "anthropic"
+)
+
+type TargetDefaults struct {
+	Temperature       any `json:"temperature,omitempty"` // number | "auto"
+	MaxTokens         int `json:"max_tokens,omitempty"`
+	ConnectTimeoutSec int `json:"connect_timeout_sec,omitempty"`
+	ReadTimeoutSec    int `json:"read_timeout_sec,omitempty"`
+}
+
+type TokenizerInfo struct {
+	Value  string `json:"value"`
+	Source string `json:"source"` // explicit | auto_detected | fallback
+	Cached bool   `json:"cached"`
+}
+
+type TargetHealth struct {
+	Status    string     `json:"status"` // unknown | ok | warn | error
+	CheckedAt *time.Time `json:"checked_at"`
+}
+
+type Target struct {
+	ID         string            `json:"target_id"`
+	Name       string            `json:"name"`
+	Vendor     string            `json:"vendor,omitempty"`
+	APIURL     string            `json:"api_url"`
+	Protocol   Protocol          `json:"protocol"`
+	Model      string            `json:"model"`
+	APIKeyHint string            `json:"api_key_hint"`
+	Tokenizer  *TokenizerInfo    `json:"tokenizer,omitempty"`
+	Defaults   TargetDefaults    `json:"defaults"`
+	Labels     map[string]string `json:"labels,omitempty"`
+	Health     TargetHealth      `json:"health"`
+	CreatedAt  time.Time         `json:"created_at"`
+	UpdatedAt  time.Time         `json:"updated_at"`
+
+	// 仅内部使用，不序列化
+	APIKeyEnc []byte     `json:"-"`
+	DeletedAt *time.Time `json:"-"`
+}
+
+// TargetSnapshot 是写入 Run 的不可变副本（不含凭据）。
+type TargetSnapshot struct {
+	TargetID  string   `json:"target_id"`
+	Vendor    string   `json:"vendor,omitempty"`
+	Model     string   `json:"model"`
+	Protocol  Protocol `json:"protocol"`
+	APIURL    string   `json:"api_url"`
+	Ephemeral bool     `json:"ephemeral"`
+}
+
+func (t Target) Snapshot(ephemeral bool) TargetSnapshot {
+	return TargetSnapshot{TargetID: t.ID, Vendor: t.Vendor, Model: t.Model, Protocol: t.Protocol, APIURL: t.APIURL, Ephemeral: ephemeral}
+}
+
+// ---------------- 档位与计划 ----------------
+
+type Bucket struct {
+	Label        string `json:"label"`
+	PromptTokens struct {
+		Min int `json:"min"`
+		Max int `json:"max"`
+	} `json:"prompt_tokens"`
+	MaxParallel int  `json:"max_parallel"`
+	BuiltIn     bool `json:"built_in"`
+}
+
+type BucketOverride struct {
+	Parallels   []int `json:"parallels,omitempty"`
+	MaxParallel int   `json:"max_parallel,omitempty"`
+	Number      int   `json:"number,omitempty"`
+}
+
+type RequestDefaults struct {
+	Temperature       any `json:"temperature,omitempty"`
+	MaxTokens         int `json:"max_tokens,omitempty"`
+	MaxTurns          int `json:"max_turns,omitempty"`
+	ConnectTimeoutSec int `json:"connect_timeout_sec,omitempty"`
+	ReadTimeoutSec    int `json:"read_timeout_sec,omitempty"`
+}
+
+type Plan struct {
+	Mode             string                    `json:"mode"`
+	Buckets          []string                  `json:"buckets"`
+	ParallelLadder   []int                     `json:"parallel_ladder,omitempty"`
+	Number           int                       `json:"number,omitempty"`
+	NumberByParallel map[int]int               `json:"number_by_parallel,omitempty"`
+	BucketOverrides  map[string]BucketOverride `json:"bucket_overrides,omitempty"`
+	CooldownSec      int                       `json:"cooldown_sec,omitempty"`
+	SuccessRateMin   float64                   `json:"success_rate_min,omitempty"`
+	TPMBudget        int64                     `json:"tpm_budget,omitempty"`
+	StopOnFailure    *bool                     `json:"stop_on_failure,omitempty"`
+	Request          RequestDefaults           `json:"request,omitempty"`
+	DatasetDir       string                    `json:"dataset_dir,omitempty"`
+	StepsTotal       int                       `json:"steps_total,omitempty"`
+
+	// 工具私有字段透传
+	ToolParams json.RawMessage `json:"tool_params,omitempty"`
+}
+
+func (p Plan) Cooldown() time.Duration { return time.Duration(p.CooldownSec) * time.Second }
+
+// StepSpec 是一个 (bucket, parallel, number) 执行单元。
+type StepSpec struct {
+	Index    int    `json:"index"`
+	Bucket   string `json:"bucket"`
+	Parallel int    `json:"parallel"`
+	Number   int    `json:"number"`
+	MinLen   int    `json:"min_prompt_len"`
+	MaxLen   int    `json:"max_prompt_len"`
+}
+
+type Skip struct {
+	Bucket string `json:"bucket"`
+	Reason string `json:"reason"`
+	Detail string `json:"detail,omitempty"`
+}
+
+// Normalizer 携带计算 steps 所需的默认值。
+type Normalizer struct {
+	Buckets               []Bucket
+	DefaultLadder         []int
+	NumberByParallel      map[int]int
+	DefaultNumber         int
+	ExtraParallels        map[string][]int
+	DefaultCooldownSec    int
+	DefaultSuccessRateMin float64
+	DefaultStopOnFailure  bool
+}
+
+func (n Normalizer) Bucket(label string) (Bucket, bool) {
+	for _, b := range n.Buckets {
+		if b.Label == label {
+			return b, true
+		}
+	}
+	return Bucket{}, false
+}
+
+// ComputeSteps 与前端 computeSteps() 一致：
+//
+//	maxPar = min(bucket.max_parallel, override.max_parallel, tpm_budget>0 ? floor(tpm_budget/bucketTokens) : ∞)
+//	parallels = sortedUnique(ladder ∪ override.parallels) filtered ≤ maxPar
+//	为空 → 该档跳过
+func ComputeSteps(p Plan, n Normalizer) (steps []StepSpec, skipped []Skip) {
+	ladder := p.ParallelLadder
+	if len(ladder) == 0 {
+		ladder = n.DefaultLadder
+	}
+	idx := 0
+	for _, label := range p.Buckets {
+		b, ok := n.Bucket(label)
+		if !ok {
+			skipped = append(skipped, Skip{Bucket: label, Reason: "unknown_bucket"})
+			continue
+		}
+		maxPar := b.MaxParallel
+		ov := p.BucketOverrides[label]
+		if ov.MaxParallel > 0 && ov.MaxParallel < maxPar {
+			maxPar = ov.MaxParallel
+		}
+		if p.TPMBudget > 0 {
+			if byTPM := int(p.TPMBudget / int64(maxInt(b.PromptTokens.Max, 1))); byTPM < maxPar {
+				maxPar = byTPM
+			}
+		}
+		set := map[int]bool{}
+		for _, v := range ladder {
+			if v > 0 && v <= maxPar {
+				set[v] = true
+			}
+		}
+		for _, v := range ov.Parallels {
+			if v > 0 && v <= maxPar {
+				set[v] = true
+			}
+		}
+		ps := make([]int, 0, len(set))
+		for v := range set {
+			ps = append(ps, v)
+		}
+		sort.Ints(ps)
+		if len(ps) == 0 {
+			skipped = append(skipped, Skip{
+				Bucket: label, Reason: "budget_too_low",
+				Detail: fmt.Sprintf("并发上限 %d，梯度最小值 %d", maxPar, minPositive(ladder)),
+			})
+			continue
+		}
+		for _, par := range ps {
+			// 请求数优先级（对齐 run.sh）：
+			//   plan.number（单档显式指定）> bucket_overrides[b].number（对齐 N_<label>）
+			//   > number_by_parallel（对齐 parallel_number）> default_number
+			num := 0
+			switch {
+			case p.Number > 0:
+				num = p.Number
+			case ov.Number > 0:
+				num = ov.Number
+			case n.NumberByParallel[par] > 0:
+				num = n.NumberByParallel[par]
+			case n.DefaultNumber > 0:
+				num = n.DefaultNumber
+			default:
+				num = 100
+			}
+			// TPM 预算收敛请求数（仅在未显式给 N 时）
+			if p.TPMBudget > 0 && ov.Number == 0 {
+				if perMin := int(p.TPMBudget / int64(maxInt(b.PromptTokens.Max, 1))); perMin > 0 && num > perMin {
+					num = perMin
+				}
+			}
+			steps = append(steps, StepSpec{
+				Index: idx, Bucket: label, Parallel: par, Number: num,
+				MinLen: b.PromptTokens.Min, MaxLen: b.PromptTokens.Max,
+			})
+			idx++
+		}
+	}
+	return steps, skipped
+}
+
+// StepPlanDetail 用于前端预估展示。
+type StepPlanDetail struct {
+	Bucket      string `json:"bucket"`
+	Parallels   []int  `json:"parallels"`
+	MaxParallel int    `json:"max_parallel"`
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func minPositive(v []int) int {
+	m := 0
+	for _, x := range v {
+		if x > 0 && (m == 0 || x < m) {
+			m = x
+		}
+	}
+	return m
+}
+
+func containsInt(v []int, x int) bool {
+	for _, e := range v {
+		if e == x {
+			return true
+		}
+	}
+	return false
+}
+
+// ---------------- Run ----------------
+
+type RunStatus string
+
+const (
+	StatusQueued    RunStatus = "queued"
+	StatusPreparing RunStatus = "preparing"
+	StatusRunning   RunStatus = "running"
+	StatusReporting RunStatus = "reporting"
+	StatusSucceeded RunStatus = "succeeded"
+	StatusPartial   RunStatus = "partial"
+	StatusFailed    RunStatus = "failed"
+	StatusCanceled  RunStatus = "canceled"
+)
+
+func (s RunStatus) Terminal() bool {
+	switch s {
+	case StatusSucceeded, StatusPartial, StatusFailed, StatusCanceled:
+		return true
+	}
+	return false
+}
+
+func (s RunStatus) Known() bool {
+	switch s {
+	case StatusQueued, StatusPreparing, StatusRunning, StatusReporting,
+		StatusSucceeded, StatusPartial, StatusFailed, StatusCanceled:
+		return true
+	}
+	return false
+}
+
+type StepStatus string
+
+const (
+	StepPending   StepStatus = "pending"
+	StepRunning   StepStatus = "running"
+	StepSucceeded StepStatus = "succeeded"
+	StepFailed    StepStatus = "failed"
+	StepSkipped   StepStatus = "skipped"
+)
+
+type Step struct {
+	Index       int        `json:"index"`
+	Bucket      string     `json:"bucket"`
+	Parallel    int        `json:"parallel"`
+	Number      int        `json:"number"`
+	Status      StepStatus `json:"status"`
+	SuccessRate *float64   `json:"success_rate"`
+	TTFTp50Sec  *float64   `json:"ttft_p50_sec"`
+	OutputTPS   *float64   `json:"output_tps"`
+	DurationSec *float64   `json:"duration_sec"`
+	DBPath      string     `json:"-"`
+}
+
+type Progress struct {
+	Phase      string    `json:"phase"`
+	StepsTotal int       `json:"steps_total"`
+	StepsDone  int       `json:"steps_done"`
+	Percent    float64   `json:"percent"`
+	Current    *StepHead `json:"current"`
+	ElapsedSec int       `json:"elapsed_sec"`
+	ETASec     *int      `json:"eta_sec"`
+}
+
+type StepHead struct {
+	Bucket   string `json:"bucket"`
+	Parallel int    `json:"parallel"`
+	Number   int    `json:"number"`
+}
+
+type GateSpec struct {
+	Profile   string         `json:"profile"`
+	Mode      string         `json:"mode,omitempty"` // report_only | enforce
+	Overrides map[string]any `json:"overrides,omitempty"`
+	Params    map[string]any `json:"params,omitempty"`
+}
+
+type Violation struct {
+	Scope     string  `json:"scope"`
+	Bucket    string  `json:"bucket,omitempty"`
+	Parallel  int     `json:"parallel,omitempty"`
+	Rule      string  `json:"rule"`
+	Tier      string  `json:"tier,omitempty"`
+	Actual    float64 `json:"actual"`
+	Threshold float64 `json:"threshold"`
+	Message   string  `json:"message,omitempty"`
+}
+
+type TierSummary struct {
+	Tier      string  `json:"tier"`
+	Steps     int     `json:"steps"`
+	P50MaxSec float64 `json:"p50_max_sec"`
+	P90MaxSec float64 `json:"p90_max_sec"`
+	Passed    bool    `json:"passed"`
+}
+
+type GateResult struct {
+	Passed      bool          `json:"passed"`
+	Profile     string        `json:"profile"`
+	Violations  []Violation   `json:"violations"`
+	TierSummary []TierSummary `json:"tier_summary"`
+}
+
+type EngineInfo struct {
+	Name    string `json:"name"`
+	Version string `json:"version,omitempty"`
+	Workdir string `json:"workdir,omitempty"`
+	PID     *int   `json:"pid"`
+	Cmdline string `json:"cmdline,omitempty"`
+}
+
+// ReportSpec 是报告生成参数（plan 的 report 块）。
+type ReportSpec struct {
+	Formats    []string `json:"formats,omitempty"`
+	ClientName string   `json:"client_name,omitempty"`
+	Title      string   `json:"title,omitempty"`
+}
+
+type Run struct {
+	ID         string            `json:"run_id"`
+	Status     RunStatus         `json:"status"`
+	Tool       string            `json:"tool"`
+	Capability Capability        `json:"capability"`
+	Target     TargetSnapshot    `json:"target"`
+	Plan       Plan              `json:"plan"`
+	Gate       *GateSpec         `json:"gate,omitempty"`
+	Report     ReportSpec        `json:"report,omitempty"`
+	Progress   Progress          `json:"progress"`
+	Steps      []Step            `json:"steps,omitempty"`
+	GateResult *GateResult       `json:"gate_result"`
+	Summary    map[string]any    `json:"summary"`
+	Artifacts  []Artifact        `json:"artifacts"`
+	Engine     *EngineInfo       `json:"engine,omitempty"`
+	Error      *Problem          `json:"error"`
+	Labels     map[string]string `json:"labels,omitempty"`
+	CreatedAt  time.Time         `json:"created_at"`
+	StartedAt  *time.Time        `json:"started_at"`
+	FinishedAt *time.Time        `json:"finished_at"`
+	Links      map[string]string `json:"links,omitempty"`
+}
+
+// ---------------- Artifact ----------------
+
+type ArtifactKind string
+
+const (
+	ArtHTMLReport ArtifactKind = "html_report"
+	ArtXLSXReport ArtifactKind = "xlsx_report"
+	ArtFailureCSV ArtifactKind = "failure_csv"
+	ArtSLAJSON    ArtifactKind = "sla_json"
+	ArtRawDB      ArtifactKind = "raw_db"
+	ArtRunLog     ArtifactKind = "run_log"
+	ArtArchive    ArtifactKind = "archive"
+)
+
+type Artifact struct {
+	ID          string       `json:"artifact_id"`
+	Kind        ArtifactKind `json:"kind"`
+	Filename    string       `json:"filename"`
+	ContentType string       `json:"content_type,omitempty"`
+	SizeBytes   int64        `json:"size_bytes"`
+	SHA256      string       `json:"sha256,omitempty"`
+	CreatedAt   time.Time    `json:"created_at"`
+	DownloadURL string       `json:"download_url"`
+	Path        string       `json:"-"`
+}
+
+// ---------------- Problem ----------------
+
+type Problem struct {
+	Type        string `json:"type,omitempty"`
+	Title       string `json:"title"`
+	Status      int    `json:"status"`
+	Code        string `json:"code"`
+	Detail      string `json:"detail,omitempty"`
+	Instance    string `json:"instance,omitempty"`
+	RequestID   string `json:"request_id,omitempty"`
+	Retryable   bool   `json:"retryable,omitempty"`
+	AvailableAt string `json:"available_at,omitempty"`
+}
+
+var errorBase = "https://thvv.dev/errors/"
+
+func (p *Problem) normalize() {
+	if p.Type == "" && p.Code != "" {
+		p.Type = errorBase + p.Code
+	}
+	if p.Title == "" {
+		p.Title = strings.ReplaceAll(p.Code, "_", " ")
+	}
+}
+
+// NewProblem 构造一个符合 RFC 9457 的错误。
+func NewProblem(status int, code, detail string) *Problem {
+	p := &Problem{Status: status, Code: code, Detail: detail}
+	p.normalize()
+	return p
+}
+
+// ---------------- 指标结果 ----------------
+
+type RequestCounts struct {
+	Total       int     `json:"total"`
+	Success     int     `json:"success"`
+	Failed      int     `json:"failed"`
+	SuccessRate float64 `json:"success_rate"`
+}
+
+type TTFTStats struct {
+	AvgSec float64 `json:"avg_sec"`
+	MinSec float64 `json:"min_sec"`
+	MaxSec float64 `json:"max_sec"`
+	P50Sec float64 `json:"p50_sec"`
+	P90Sec float64 `json:"p90_sec"`
+	P95Sec float64 `json:"p95_sec"`
+	P99Sec float64 `json:"p99_sec"`
+}
+
+type Scalar struct {
+	AvgSec float64 `json:"avg_sec,omitempty"`
+	AvgMs  float64 `json:"avg_ms,omitempty"`
+	P50Ms  float64 `json:"p50_ms,omitempty"`
+	P90Ms  float64 `json:"p90_ms,omitempty"`
+}
+
+type Throughput struct {
+	InputTPS  float64 `json:"input_tps"`
+	OutputTPS float64 `json:"output_tps"`
+	InputTPM  float64 `json:"input_tpm"`
+	OutputTPM float64 `json:"output_tpm"`
+	TPM       float64 `json:"tpm"`
+	QPM       float64 `json:"qpm"`
+}
+
+type TokenSums struct {
+	PromptSum     int `json:"prompt_sum"`
+	CompletionSum int `json:"completion_sum"`
+	TotalSum      int `json:"total_sum"`
+}
+
+// StepMetrics 与 perf/scripts/gen_report_from_db.py 的口径逐项对齐。
+// 注意：ITL（相邻 chunk 间隔，按 chunk 汇总）≠ TPOT（time_per_output_token，按请求）。
+type StepMetrics struct {
+	StepIndex    int            `json:"step_index"`
+	Bucket       string         `json:"bucket"`
+	Parallel     int            `json:"parallel"`
+	Number       int            `json:"number"`
+	Requests     RequestCounts  `json:"requests"`
+	TTFT         TTFTStats      `json:"ttft"`
+	TTLT         Scalar         `json:"ttlt"`
+	TPOT         Scalar         `json:"tpot"`
+	ITL          Scalar         `json:"itl"`
+	Throughput   Throughput     `json:"throughput"`
+	Tokens       TokenSums      `json:"tokens"`
+	TokenRateAvg float64        `json:"token_rate_avg"`
+	DurationSec  float64        `json:"duration_sec"`
+	Failures     map[string]int `json:"failures,omitempty"`
+	RawDB        string         `json:"raw_db,omitempty"`
+}
+
+type PerfMetrics struct {
+	PerStep         []StepMetrics    `json:"per_step"`
+	DifficultyCurve []map[string]any `json:"difficulty_curve,omitempty"`
+}
+
+type FailureItem struct {
+	StepIndex           int    `json:"step_index"`
+	Bucket              string `json:"bucket"`
+	Parallel            int    `json:"parallel"`
+	RequestIndex        int    `json:"request_index"`
+	Reason              string `json:"reason"`
+	HTTPStatus          *int   `json:"http_status"`
+	Error               string `json:"error,omitempty"`
+	RequestBodyExcerpt  string `json:"request_body_excerpt,omitempty"`
+	ResponseBodyExcerpt string `json:"response_body_excerpt,omitempty"`
+}
+
+// RunResults 是 GET /v1/runs/{id}/results 的响应体。
+type RunResults struct {
+	RunID      string         `json:"run_id"`
+	Capability Capability     `json:"capability"`
+	GateResult *GateResult    `json:"gate_result"`
+	Summary    map[string]any `json:"summary"`
+	Metrics    PerfMetrics    `json:"metrics"`
+}

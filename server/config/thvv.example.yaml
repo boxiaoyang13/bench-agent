@@ -1,0 +1,90 @@
+# ==============================================================================
+# 生产配置示例 —— fork evalscope（subprocess 引擎）
+# ------------------------------------------------------------------------------
+# ★ 第一个要填的地址：roots.thvv（THVV Python 工具链装在哪）
+#   Go 服务与 thvv 不需要同目录，靠根前缀寻址：thvv:perf / data:runs / bin:python
+#
+# 启动:
+#   export THVV_HOME=/opt/thvv
+#   export THVV_SECRET_KEY=$(openssl rand -base64 32)
+#   ./thvv-server -config ./config/thvv.example.yaml -check   # 先校验
+#   ./thvv-server -config ./config/thvv.example.yaml
+#
+# 字段全集与说明见 thvv/docs/CONFIG.md 与 thvv/docs/config/thvv.yaml
+# ==============================================================================
+version: 1
+
+roots:
+  thvv: "${THVV_HOME}"                 # ★ 必填
+  data: "${THVV_DATA:-./data}"
+  bin:  "thvv:.venv/bin"
+
+server:
+  listen: "127.0.0.1:8080"
+  write_timeout: 0s                    # SSE 需要 0
+  ui:
+    enabled: true
+
+auth:
+  mode: both
+  session:
+    ttl: 12h
+    secure: false                      # HTTPS 下必须 true
+    signing_key: "${THVV_SESSION_KEY:-change-me}"
+  tokens:
+    - { name: ci, token: "${THVV_CI_TOKEN}", role: operator }
+  users:
+    - username: admin
+      password_hash: "${THVV_ADMIN_HASH}"
+      role: admin
+
+store:
+  driver: sqlite
+  sqlite:
+    path: "data:thvv.db"
+
+secrets:
+  provider: env
+  env:
+    key: "${THVV_SECRET_KEY}"
+
+paths:
+  datasets_dir: "thvv:perf/datasets_clean"
+  cache_dir: "data:cache"
+
+engines:
+  thvv:
+    enabled: true
+    kind: subprocess
+    display_name: "THVV TokenHub Vendor Verifier"
+    version: "1.0.0"
+    runtime:
+      home: "thvv:"
+      python: "bin:python"
+      evalscope: "bin:evalscope"
+      pythonpath_prepend: ["thvv:perf/scripts"]
+      check_on_startup: true
+      env:
+        HF_HOME: "data:cache/huggingface"
+        MODELSCOPE_CACHE: "data:cache/modelscope"
+    capabilities:
+      perf:
+        enabled: true
+        status: ga
+        working_dir: "thvv:perf"
+      eval:
+        enabled: false                 # 需要 thvv/eval 且单独的 venv（evalscope==1.9.0）
+        status: preview
+        working_dir: "thvv:eval"
+        script: "thvv:eval/scripts/run_eval.py"
+      functional:
+        enabled: false
+        status: planned
+        available_at: "v1.2"
+
+gates:
+  default_profile: perf-sla-v1
+
+limits:
+  max_concurrent_runs: 2
+  max_queued_runs: 16

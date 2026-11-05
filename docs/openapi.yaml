@@ -1,0 +1,1230 @@
+openapi: 3.1.0
+info:
+  title: THVV Server API
+  version: 1.0.0
+  summary: TokenHub Vendor Verifier — 供应商能力验证服务
+  description: |
+    Go 服务端（方案 A：Go 薄封装 Python `evalscope` 引擎）的 HTTP 契约。
+
+    核心流程三步：
+    1. `POST /v1/targets` 登记被测端点（地址 / 协议 / 模型 / Key / tokenizer）
+    2. `POST /v1/targets/{id}/probe` 预检（可选）
+    3. `POST /v1/runs` 提交测试（`plan.mode=single` 单档 / `matrix` 全档），
+       用 `GET /v1/runs/{id}/events` 跟踪进度，`/results` 取指标，`/artifacts` 下载报告。
+
+    `capability` 枚举 `perf`（GA）/ `eval`（preview）/ `functional`（planned）。
+    多工具接入：`tool` + `plan.tool_params` 由各工具的 JSON Schema 校验，协议不随工具变化。
+  license:
+    name: Internal
+servers:
+  - url: https://{host}/v1
+    variables:
+      host:
+        default: localhost:8080
+security:
+  - bearerAuth: []
+tags:
+  - name: system
+  - name: catalog
+  - name: targets
+  - name: runs
+  - name: artifacts
+
+paths:
+  /health:
+    get:
+      tags: [system]
+      summary: 存活探针
+      security: []
+      operationId: getHealth
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, version]
+                properties:
+                  status: {type: string, enum: [ok, degraded]}
+                  version: {type: string}
+                  uptime_sec: {type: integer}
+
+  /meta:
+    get:
+      tags: [system]
+      summary: 服务元信息与限制
+      operationId: getMeta
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Meta'}
+
+  /tools:
+    get:
+      tags: [system]
+      summary: 已注册工具及其能力（多工具接入入口）
+      operationId: listTools
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/Tool'}
+
+  /catalog/buckets:
+    get:
+      tags: [catalog]
+      summary: 输入长度档位定义与并发上限
+      operationId: listBuckets
+      parameters:
+        - {name: tool, in: query, schema: {type: string, default: thvv}}
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BucketCatalog'}
+
+  /catalog/datasets:
+    get:
+      tags: [catalog]
+      summary: 评测数据集清单（capability=eval）
+      operationId: listDatasets
+      parameters:
+        - {name: tool, in: query, schema: {type: string, default: thvv}}
+        - {name: capability, in: query, schema: {type: string, default: eval}}
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/Dataset'}
+
+  /catalog/gates:
+    get:
+      tags: [catalog]
+      summary: 内置验收阈值模板
+      operationId: listGates
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/GateProfile'}
+
+  /targets:
+    post:
+      tags: [targets]
+      summary: 登记被测端点（初始化）
+      operationId: createTarget
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TargetCreate'}
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Target'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {$ref: '#/components/responses/Conflict'}
+    get:
+      tags: [targets]
+      summary: 列出被测端点
+      operationId: listTargets
+      parameters:
+        - {name: vendor, in: query, schema: {type: string}}
+        - {name: q, in: query, schema: {type: string}}
+        - {name: limit, in: query, schema: {type: integer, default: 20, maximum: 100}}
+        - {name: cursor, in: query, schema: {type: string}}
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/Target'}
+                  next_cursor: {type: [string, 'null']}
+                  has_more: {type: boolean}
+
+  /targets/{target_id}:
+    parameters:
+      - $ref: '#/components/parameters/TargetId'
+    get:
+      tags: [targets]
+      summary: 查看被测端点
+      operationId: getTarget
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Target'}
+        '404': {$ref: '#/components/responses/NotFound'}
+    patch:
+      tags: [targets]
+      summary: 更新（含 api_key 轮换）
+      operationId: patchTarget
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TargetPatch'}
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Target'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+    delete:
+      tags: [targets]
+      summary: 软删除
+      operationId: deleteTarget
+      responses:
+        '204': {description: 已删除}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /targets/{target_id}/probe:
+    parameters:
+      - $ref: '#/components/parameters/TargetId'
+    post:
+      tags: [targets]
+      summary: 预检（连通性 / tokenizer / 数据集 / 协议）
+      operationId: probeTarget
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                checks:
+                  type: array
+                  items: {type: string, enum: [protocol, connectivity, tokenizer, datasets]}
+                timeout_sec: {type: integer, default: 30}
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProbeReport'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /runs:
+    post:
+      tags: [runs]
+      summary: 提交测试任务（单档 / 全档）
+      operationId: createRun
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RunCreate'}
+      responses:
+        '202':
+          description: 已受理
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Run'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '422': {$ref: '#/components/responses/UnprocessableEntity'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '501': {$ref: '#/components/responses/NotImplemented'}
+    get:
+      tags: [runs]
+      summary: 列出任务
+      operationId: listRuns
+      parameters:
+        - name: status
+          in: query
+          schema: {type: array, items: {$ref: '#/components/schemas/RunStatus'}}
+          style: form
+          explode: true
+        - {name: capability, in: query, schema: {type: string}}
+        - {name: tool, in: query, schema: {type: string}}
+        - {name: target_id, in: query, schema: {type: string}}
+        - {name: vendor, in: query, schema: {type: string}}
+        - {name: created_after, in: query, schema: {type: string, format: date-time}}
+        - {name: created_before, in: query, schema: {type: string, format: date-time}}
+        - {name: limit, in: query, schema: {type: integer, default: 20, maximum: 100}}
+        - {name: cursor, in: query, schema: {type: string}}
+        - {name: order, in: query, schema: {type: string, enum: [created_at, '-created_at'], default: '-created_at'}}
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/Run'}
+                  next_cursor: {type: [string, 'null']}
+                  has_more: {type: boolean}
+
+  /runs/{run_id}:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      tags: [runs]
+      summary: 查看任务
+      operationId: getRun
+      parameters:
+        - {name: include, in: query, schema: {type: string, example: steps}}
+        - {name: wait, in: query, schema: {type: boolean, default: false}}
+        - {name: timeout_sec, in: query, schema: {type: integer, default: 30, maximum: 600}}
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Run'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /runs/{run_id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    post:
+      tags: [runs]
+      summary: 取消任务（幂等）
+      operationId: cancelRun
+      responses:
+        '202':
+          description: 已请求取消
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  run_id: {type: string}
+                  status: {$ref: '#/components/schemas/RunStatus'}
+                  canceled_at: {type: string, format: date-time}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /runs/{run_id}/events:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      tags: [runs]
+      summary: SSE 进度流（支持 Last-Event-ID 续传）
+      operationId: streamRunEvents
+      parameters:
+        - {name: since, in: query, schema: {type: integer, default: 0}}
+        - name: Last-Event-ID
+          in: header
+          schema: {type: integer}
+      responses:
+        '200':
+          description: |
+            `text/event-stream`。事件：`run.snapshot` / `run.started` / `step.started` /
+            `step.progress` / `step.finished` / `run.progress` / `run.log` / `run.gate` /
+            `run.finished` / `error`。每条含 `id`（seq）；每 15s 发 `: heartbeat`。
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /runs/{run_id}/results:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      tags: [runs]
+      summary: 结构化指标 + 验收结论
+      operationId: getRunResults
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RunResults'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: 任务尚未进入 reporting/终态
+
+  /runs/{run_id}/results/failures:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      tags: [runs]
+      summary: 失败请求明细分页
+      operationId: listRunFailures
+      parameters:
+        - {name: reason, in: query, schema: {type: string}}
+        - {name: limit, in: query, schema: {type: integer, default: 50, maximum: 500}}
+        - {name: cursor, in: query, schema: {type: string}}
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/FailureItem'}
+                  next_cursor: {type: [string, 'null']}
+
+  /runs/{run_id}/artifacts:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      tags: [artifacts]
+      summary: 列出交付物
+      operationId: listRunArtifacts
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/Artifact'}
+
+  /runs/{run_id}/reports:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    post:
+      tags: [artifacts]
+      summary: 重新生成报告
+      operationId: regenerateReports
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                formats:
+                  type: array
+                  items: {type: string, enum: [html, xlsx, csv, json]}
+                client_name: {type: string}
+                title: {type: string}
+                sla_profile: {type: string}
+      responses:
+        '202':
+          description: 已受理
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  report_job_id: {type: string}
+                  run_id: {type: string}
+
+  /artifacts/{artifact_id}:
+    get:
+      tags: [artifacts]
+      summary: 下载交付物（支持 Range / ETag）
+      operationId: downloadArtifact
+      parameters:
+        - {name: artifact_id, in: path, required: true, schema: {type: string, example: art_01JB7S1}}
+      responses:
+        '200':
+          description: 文件流
+          headers:
+            ETag: {schema: {type: string}}
+            Content-Disposition: {schema: {type: string}}
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        '304': {description: 未修改（If-None-Match 命中）}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  # ----------------------------------------------------------------
+  # Web 会话（x-thvv-ui）
+  # 仅浏览器端使用：登录后下发 HttpOnly Cookie，使 EventSource 与 <a download>
+  # 无需自定义 Header。API 客户端仍可用 Bearer token，二者并存。
+  # ----------------------------------------------------------------
+  /auth/login:
+    post:
+      tags: [system]
+      summary: 登录并下发会话 Cookie（仅 Web）
+      operationId: webLogin
+      security: []
+      x-thvv-ui: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: {type: string}
+                password: {type: string, format: password}
+      responses:
+        '204':
+          description: '登录成功，下发 HttpOnly 会话 Cookie（thvv_session，SameSite=Lax，12h 过期）'
+          headers:
+            Set-Cookie: {schema: {type: string}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /auth/session:
+    get:
+      tags: [system]
+      summary: 当前会话（仅 Web；未登录返回 401）
+      operationId: webSession
+      x-thvv-ui: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Session'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /auth/logout:
+    post:
+      tags: [system]
+      summary: 注销（清除会话 Cookie）
+      operationId: webLogout
+      x-thvv-ui: true
+      responses:
+        '204': {description: 已注销}
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+
+  parameters:
+    TargetId:
+      name: target_id
+      in: path
+      required: true
+      schema: {type: string, example: tgt_01JB7QZ9}
+    RunId:
+      name: run_id
+      in: path
+      required: true
+      schema: {type: string, example: run_01JB7R2K}
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: {type: string}
+      description: 建议 UUID；24h 内同 key + 同 body 返回原对象，同 key 不同 body 返回 409。
+
+  responses:
+    Unauthorized:
+      description: 未认证或会话已过期
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    BadRequest:
+      description: 参数错误
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    UnprocessableEntity:
+      description: 语义校验失败（如端点不可达、tokenizer 不可用、数据集缺失）
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    NotFound:
+      description: 资源不存在
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Conflict:
+      description: 冲突（重名 / 幂等键参数不一致 / 事件历史已过期）
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    TooManyRequests:
+      description: 服务端并发超限
+      headers:
+        Retry-After: {schema: {type: integer}}
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    NotImplemented:
+      description: capability 尚未实现（预留位）
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+
+  schemas:
+    Session:
+      type: object
+      required: [username, roles]
+      properties:
+        username: {type: string}
+        roles:
+          type: array
+          items: {type: string, enum: [viewer, operator, admin]}
+        expires_at: {type: string, format: date-time}
+
+    Problem:
+      type: object
+      required: [type, title, status, code, detail]
+      properties:
+        type: {type: string, example: 'https://thvv.dev/errors/target_unreachable'}
+        title: {type: string, example: Target unreachable}
+        status: {type: integer, example: 422}
+        code:
+          type: string
+          enum:
+            - invalid_request
+            - validation_failed
+            - unauthorized
+            - forbidden
+            - not_found
+            - conflict
+            - not_implemented
+            - target_unreachable
+            - tokenizer_unavailable
+            - dataset_missing
+            - credential_invalid
+            - quota_exceeded
+            - upstream_rate_limited
+            - engine_failed
+            - engine_timeout
+            - event_history_gone
+            - internal_error
+        detail: {type: string}
+        instance: {type: string}
+        request_id: {type: string}
+        retryable: {type: boolean}
+        details:
+          type: array
+          items:
+            type: object
+            properties:
+              field: {type: string}
+              issue: {type: string}
+        available_at: {type: string, description: 仅 not_implemented 时给出，如 v1.2}
+
+    Meta:
+      type: object
+      properties:
+        server:
+          type: object
+          properties:
+            version: {type: string}
+            commit: {type: string}
+            started_at: {type: string, format: date-time}
+        capabilities:
+          type: array
+          items:
+            type: object
+            properties:
+              name: {type: string}
+              status: {type: string, enum: [ga, preview, planned]}
+        limits:
+          type: object
+          properties:
+            max_concurrent_runs: {type: integer}
+            max_runs_queued: {type: integer}
+            run_ttl_hours: {type: integer}
+            artifact_max_bytes: {type: integer}
+            sse_heartbeat_sec: {type: integer}
+            max_run_duration_hours: {type: integer}
+        protocols:
+          type: array
+          items: {type: string, enum: [openai, anthropic]}
+
+    Tool:
+      type: object
+      required: [name, capabilities]
+      properties:
+        name: {type: string, example: thvv}
+        display_name: {type: string}
+        version: {type: string}
+        kind: {type: string, enum: [subprocess, http, builtin]}
+        runtime:
+          type: object
+          properties:
+            python: {type: string}
+            packages:
+              type: array
+              items: {type: string}
+        capabilities:
+          type: array
+          items: {$ref: '#/components/schemas/ToolCapability'}
+
+    ToolCapability:
+      type: object
+      required: [name, status]
+      properties:
+        name: {type: string, enum: [perf, eval, functional]}
+        status: {type: string, enum: [ga, preview, planned, unavailable]}
+        description: {type: string}
+        available_at: {type: [string, 'null']}
+        plan_schema: {type: [string, 'null'], description: JSON Schema 地址，校验 plan.tool_params}
+        result_schema: {type: [string, 'null']}
+        artifacts:
+          type: array
+          items: {type: string}
+
+    BucketCatalog:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              label: {type: string, example: 64k}
+              prompt_tokens:
+                type: object
+                properties:
+                  min: {type: integer}
+                  max: {type: integer}
+              max_parallel: {type: integer}
+              built_in: {type: boolean}
+        scenarios:
+          type: array
+          items:
+            type: object
+            properties:
+              label: {type: string, example: 9k_hot}
+              bucket: {type: string}
+              note: {type: string}
+        default_ladder:
+          type: array
+          items: {type: integer}
+        number_by_parallel:
+          type: object
+          additionalProperties: {type: integer}
+
+    Dataset:
+      type: object
+      properties:
+        name: {type: string}
+        display_name: {type: string}
+        kind: {type: string, enum: [text, multimodal, agent]}
+        needs_judge: {type: boolean}
+        default_limit: {type: [integer, 'null']}
+
+    GateProfile:
+      type: object
+      properties:
+        profile: {type: string, example: perf-sla-v1}
+        capability: {type: string}
+        description: {type: string}
+        tiers:
+          type: array
+          items:
+            type: object
+            properties:
+              tier: {type: string, example: '<32K'}
+              prompt_tokens:
+                type: object
+                properties:
+                  lo: {type: integer}
+                  hi: {type: integer}
+              ttft_p50_max_sec: {type: number}
+              ttft_p90_max_sec: {type: number}
+        global:
+          type: object
+          properties:
+            min_output_tokens_per_sec: {type: number}
+            min_success_rate: {type: number}
+        params:
+          type: object
+          additionalProperties: true
+
+    TargetCreate:
+      type: object
+      required: [name, api_url, protocol, model, api_key]
+      properties:
+        name: {type: string, description: 全局唯一}
+        vendor: {type: string}
+        api_url:
+          type: string
+          format: uri
+          description: 完整请求路径，服务端不拼接。openai → .../chat/completions；anthropic → .../v1/messages
+        protocol: {type: string, enum: [openai, anthropic]}
+        model: {type: string}
+        api_key: {type: string, description: 只写，响应不返回}
+        tokenizer: {type: [string, 'null'], description: 缺省按 model 自动推断}
+        defaults:
+          $ref: '#/components/schemas/TargetDefaults'
+        labels:
+          type: object
+          additionalProperties: {type: string}
+
+    TargetDefaults:
+      type: object
+      properties:
+        temperature:
+          oneOf:
+            - {type: number}
+            - {type: string, const: auto}
+          description: auto → kimi/moonshot 取 1.0，其余 0.0
+        max_tokens: {type: integer, default: 4096}
+        connect_timeout_sec: {type: integer, default: 60}
+        read_timeout_sec: {type: integer, default: 600}
+
+    TargetPatch:
+      type: object
+      properties:
+        vendor: {type: string}
+        api_url: {type: string, format: uri}
+        protocol: {type: string, enum: [openai, anthropic]}
+        model: {type: string}
+        api_key: {type: string}
+        tokenizer: {type: [string, 'null']}
+        defaults: {$ref: '#/components/schemas/TargetDefaults'}
+        labels:
+          type: object
+          additionalProperties: {type: string}
+
+    Target:
+      type: object
+      required: [target_id, name, api_url, protocol, model, created_at]
+      properties:
+        target_id: {type: string}
+        name: {type: string}
+        vendor: {type: [string, 'null']}
+        api_url: {type: string}
+        protocol: {type: string, enum: [openai, anthropic]}
+        model: {type: string}
+        api_key_hint: {type: string, example: '••••••••xxxxxxxx'}
+        tokenizer:
+          type: object
+          properties:
+            value: {type: [string, 'null']}
+            source: {type: string, enum: [explicit, auto_detected, fallback]}
+            cached: {type: boolean}
+        defaults: {$ref: '#/components/schemas/TargetDefaults'}
+        labels:
+          type: object
+          additionalProperties: {type: string}
+        health:
+          type: object
+          properties:
+            status: {type: string, enum: [unknown, ok, warn, error]}
+            checked_at: {type: [string, 'null'], format: date-time}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+
+    ProbeReport:
+      type: object
+      properties:
+        target_id: {type: string}
+        ok: {type: boolean}
+        checked_at: {type: string, format: date-time}
+        elapsed_ms: {type: integer}
+        checks:
+          type: array
+          items:
+            type: object
+            properties:
+              name: {type: string}
+              ok: {type: boolean}
+              severity: {type: string, enum: [error, warn]}
+              detail: {type: string}
+              latency_ms: {type: integer}
+              missing:
+                type: array
+                items: {type: string}
+        engine:
+          type: object
+          properties:
+            name: {type: string}
+            version: {type: string}
+            python: {type: string}
+            evalscope: {type: string}
+
+    RunCreate:
+      type: object
+      required: [tool, capability]
+      properties:
+        tool: {type: string, default: thvv}
+        capability: {type: string, enum: [perf, eval, functional]}
+        target_id: {type: string, description: 与 target 二选一}
+        target:
+          $ref: '#/components/schemas/InlineTarget'
+        plan: {$ref: '#/components/schemas/Plan'}
+        gate: {$ref: '#/components/schemas/GateSpec'}
+        report:
+          type: object
+          properties:
+            formats:
+              type: array
+              items: {type: string, enum: [html, xlsx, csv, json]}
+            client_name: {type: string}
+            title: {type: string}
+        labels:
+          type: object
+          additionalProperties: {type: string}
+        callback:
+          type: object
+          properties:
+            url: {type: string, format: uri}
+            secret: {type: string}
+            events:
+              type: array
+              items: {type: string}
+
+    InlineTarget:
+      type: object
+      required: [api_url, protocol, model, api_key]
+      properties:
+        api_url: {type: string, format: uri}
+        protocol: {type: string, enum: [openai, anthropic]}
+        model: {type: string}
+        api_key: {type: string}
+        vendor: {type: string}
+        tokenizer: {type: [string, 'null']}
+
+    Plan:
+      type: object
+      description: |
+        `perf` 用 `mode/buckets/parallel_ladder/number/...`；
+        `eval` 用 `datasets/limit/repeats/judge/...`；
+        `functional` 用 `suites/cases/assertions/...`；
+        工具私有字段一律放 `tool_params`，由工具 JSON Schema 校验。
+      properties:
+        mode:
+          type: string
+          enum: [single, matrix, suite]
+          description: perf → single|matrix；eval → single；functional → suite
+        buckets:
+          type: array
+          items: {type: string, example: 32k}
+        parallel_ladder:
+          type: array
+          items: {type: integer}
+        number:
+          type: integer
+          description: 仅 mode=single，请求总数
+        number_by_parallel:
+          type: object
+          additionalProperties: {type: integer}
+        bucket_overrides:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              parallels:
+                type: array
+                items: {type: integer}
+              max_parallel: {type: integer}
+              number: {type: integer}
+        cooldown_sec: {type: integer, default: 120}
+        success_rate_min:
+          type: number
+          minimum: 0
+          maximum: 1
+          default: 0
+          description: 0~1 比值；>0 时低于阈值跳过该档剩余并发
+        tpm_budget:
+          type: integer
+          default: 0
+          description: tokens/min 预算，0=不限；用于裁剪并发与请求数（非硬限流）
+        stop_on_failure: {type: boolean, default: true}
+        request:
+          type: object
+          properties:
+            temperature:
+              oneOf:
+                - {type: number}
+                - {type: string, const: auto}
+            max_tokens: {type: integer, default: 4096}
+            max_turns: {type: integer, default: 1}
+            connect_timeout_sec: {type: integer, default: 60}
+            read_timeout_sec: {type: integer, default: 600}
+        dataset_dir:
+          type: string
+          enum: [auto, clean, raw]
+          default: auto
+        datasets:
+          type: array
+          items: {type: string}
+        limit: {type: [integer, 'null']}
+        repeats: {type: integer, default: 1}
+        eval_batch_size: {type: integer}
+        judge:
+          type: object
+          properties:
+            api_key: {type: string}
+            model: {type: string}
+            base_url: {type: string, format: uri}
+        provider_name: {type: string}
+        suites:
+          type: array
+          items: {type: string}
+        cases:
+          type: array
+          items: {type: object, additionalProperties: true}
+        assertions:
+          type: array
+          items: {type: string, enum: [json_schema, exact_match, regex, contains]}
+        tool_params:
+          type: object
+          additionalProperties: true
+
+    GateSpec:
+      type: object
+      properties:
+        profile: {type: string, default: perf-sla-v1}
+        mode: {type: string, enum: [report_only, enforce], default: report_only}
+        overrides:
+          type: object
+          additionalProperties: true
+        params:
+          type: object
+          properties:
+            user_tpm_quota: {type: integer, default: 5000000}
+
+    RunStatus:
+      type: string
+      enum: [queued, preparing, running, reporting, succeeded, partial, failed, canceled]
+
+    Run:
+      type: object
+      required: [run_id, status, tool, capability, created_at]
+      properties:
+        run_id: {type: string}
+        status: {$ref: '#/components/schemas/RunStatus'}
+        tool: {type: string}
+        capability: {type: string}
+        target:
+          type: object
+          additionalProperties: true
+          description: target 快照（不含 api_key）
+        plan:
+          allOf:
+            - $ref: '#/components/schemas/Plan'
+            - type: object
+              properties:
+                steps_total: {type: integer}
+        gate: {$ref: '#/components/schemas/GateSpec'}
+        progress:
+          type: object
+          properties:
+            phase: {type: string}
+            steps_total: {type: integer}
+            steps_done: {type: integer}
+            percent: {type: number}
+            current:
+              type: object
+              properties:
+                bucket: {type: string}
+                parallel: {type: integer}
+                number: {type: integer}
+            elapsed_sec: {type: integer}
+            eta_sec: {type: [integer, 'null']}
+        steps:
+          type: array
+          items: {$ref: '#/components/schemas/StepSummary'}
+        gate_result: {$ref: '#/components/schemas/GateResult'}
+        summary:
+          type: object
+          additionalProperties: true
+        artifacts:
+          type: array
+          items: {$ref: '#/components/schemas/Artifact'}
+        engine:
+          type: object
+          properties:
+            name: {type: string}
+            version: {type: string}
+            workdir: {type: string}
+            pid: {type: [integer, 'null']}
+        error: {$ref: '#/components/schemas/Problem'}
+        labels:
+          type: object
+          additionalProperties: {type: string}
+        created_at: {type: string, format: date-time}
+        started_at: {type: [string, 'null'], format: date-time}
+        finished_at: {type: [string, 'null'], format: date-time}
+        links:
+          type: object
+          additionalProperties: {type: string}
+
+    StepSummary:
+      type: object
+      properties:
+        index: {type: integer}
+        bucket: {type: string}
+        parallel: {type: integer}
+        number: {type: integer}
+        status: {type: string, enum: [pending, running, succeeded, failed, skipped]}
+        success_rate: {type: [number, 'null']}
+        ttft_p50_sec: {type: [number, 'null']}
+        output_tps: {type: [number, 'null']}
+        duration_sec: {type: [number, 'null']}
+
+    GateResult:
+      type: object
+      properties:
+        passed: {type: boolean}
+        profile: {type: string}
+        violations:
+          type: array
+          items:
+            type: object
+            properties:
+              scope: {type: string, enum: [step, global]}
+              bucket: {type: string}
+              parallel: {type: integer}
+              rule: {type: string}
+              tier: {type: string}
+              actual: {type: number}
+              threshold: {type: number}
+              message: {type: string}
+        tier_summary:
+          type: array
+          items:
+            type: object
+            properties:
+              tier: {type: string}
+              steps: {type: integer}
+              p50_max_sec: {type: number}
+              p90_max_sec: {type: number}
+              passed: {type: boolean}
+
+    RunResults:
+      type: object
+      properties:
+        run_id: {type: string}
+        capability: {type: string}
+        gate_result: {$ref: '#/components/schemas/GateResult'}
+        summary:
+          type: object
+          additionalProperties: true
+        metrics: {$ref: '#/components/schemas/PerfMetrics'}
+
+    PerfMetrics:
+      type: object
+      properties:
+        per_step:
+          type: array
+          items: {$ref: '#/components/schemas/StepMetrics'}
+        difficulty_curve:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+
+    StepMetrics:
+      type: object
+      properties:
+        step_index: {type: integer}
+        bucket: {type: string}
+        parallel: {type: integer}
+        number: {type: integer}
+        requests:
+          type: object
+          properties:
+            total: {type: integer}
+            success: {type: integer}
+            failed: {type: integer}
+            success_rate: {type: number}
+        ttft:
+          type: object
+          properties:
+            avg_sec: {type: number}
+            min_sec: {type: number}
+            max_sec: {type: number}
+            p50_sec: {type: number}
+            p90_sec: {type: number}
+            p95_sec: {type: number}
+            p99_sec: {type: number}
+        ttlt:
+          type: object
+          properties:
+            avg_sec: {type: number}
+        tpot:
+          type: object
+          description: 来源 evalscope 的 time_per_output_token，与 itl 不同口径
+          properties:
+            avg_ms: {type: number}
+        itl:
+          type: object
+          description: 来源 inter_token_latencies，按 chunk 汇总
+          properties:
+            avg_ms: {type: number}
+            p50_ms: {type: number}
+            p90_ms: {type: number}
+        throughput:
+          type: object
+          properties:
+            input_tps: {type: number}
+            output_tps: {type: number}
+            input_tpm: {type: number}
+            output_tpm: {type: number}
+            tpm: {type: number}
+            qpm: {type: number}
+        tokens:
+          type: object
+          properties:
+            prompt_sum: {type: integer}
+            completion_sum: {type: integer}
+            total_sum: {type: integer}
+        duration_sec: {type: number}
+        failures:
+          type: object
+          properties:
+            by_reason:
+              type: object
+              additionalProperties: {type: integer}
+        raw_db: {type: string}
+
+    FailureItem:
+      type: object
+      properties:
+        step_index: {type: integer}
+        bucket: {type: string}
+        parallel: {type: integer}
+        request_index: {type: integer}
+        reason: {type: string}
+        http_status: {type: [integer, 'null']}
+        error: {type: [string, 'null']}
+        request_body_excerpt: {type: string}
+        response_body_excerpt: {type: string}
+
+    Artifact:
+      type: object
+      required: [artifact_id, kind, filename, download_url]
+      properties:
+        artifact_id: {type: string}
+        kind:
+          type: string
+          enum: [html_report, xlsx_report, failure_csv, sla_json, raw_db, run_log, archive, eval_html, eval_csv]
+        filename: {type: string}
+        content_type: {type: string}
+        size_bytes: {type: integer}
+        sha256: {type: string}
+        created_at: {type: string, format: date-time}
+        download_url: {type: string}

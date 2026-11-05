@@ -1,0 +1,92 @@
+# ==============================================================================
+# 本地开发/联调配置 —— 使用内置模拟引擎（builtin），**不需要 Python 环境**
+# ------------------------------------------------------------------------------
+# 用途：调试 UI ↔ Go 服务交互、接口联调、演示。
+# 与生产配置的区别只有一处：engines.<name>.kind: builtin
+#
+# 启动:
+#   export THVV_SECRET_KEY=$(openssl rand -base64 32)
+#   go run ./cmd/thvv-server -config ./config/thvv.local.yaml
+#   打开 http://127.0.0.1:8080/ui/
+#
+# 网页登录：admin / password   （下面是公开示例 bcrypt hash，仅本地用）
+# 也可以用 Bearer: curl -H 'Authorization: Bearer dev-token' ...
+# ==============================================================================
+version: 1
+
+roots:
+  # 模拟引擎不读 thvv 目录，但 datasets 校验会用到它；指向仓库里的 thvv/ 即可
+  thvv: "${THVV_HOME:-../../thvv}"
+  data: "${THVV_DATA:-../data}"
+
+server:
+  listen: "127.0.0.1:18080"   # 本机 8080 已被 bfe 占用
+  ui:
+    enabled: true
+    # 开发时直接读磁盘（改页面不用重编译）；生产建议留空用 go:embed
+    dir: "../web"
+  cors:
+    enabled: true
+    allowed_origins: ["http://127.0.0.1:8080", "http://localhost:8080"]
+
+auth:
+  mode: both
+  session:
+    ttl: 12h
+    secure: false
+  tokens:
+    - { name: dev, token: "${THVV_DEV_TOKEN:-dev-token}", role: admin }
+  users:
+    - username: admin
+      password_hash: "${THVV_ADMIN_HASH:-$2a$10$IBU8oAPb/vYyjaHjJHAhMuaUS9nblXw3MuVZLit8R88wEZEZ.e9xC}"
+      role: admin
+
+store:
+  driver: sqlite
+  sqlite:
+    path: "data:thvv.db"
+
+secrets:
+  provider: env
+  env:
+    key: "${THVV_SECRET_KEY}"
+
+paths:
+  datasets_dir: "thvv:perf/datasets_clean"
+
+# 内置模拟引擎：无需 Python、无需 evalscope
+engines:
+  thvv:
+    enabled: true
+    kind: builtin
+    display_name: "THVV（内置模拟引擎）"
+    version: "1.0.0"
+    capabilities:
+      perf:
+        enabled: true
+        status: ga
+        description: "性能压测（模拟）：按档位缩放 TTFT/吞吐，用于 UI 联调"
+      eval:
+        enabled: false
+        status: preview
+        description: "效果评测（需 evalscope，未启用）"
+      functional:
+        enabled: false
+        status: planned
+        available_at: "v1.2"
+
+reports:
+  default_formats: [html, xlsx]
+  default_company: "本地联调"
+
+gates:
+  default_profile: perf-sla-v1
+
+limits:
+  max_concurrent_runs: 2
+  max_queued_runs: 8
+
+observability:
+  log_level: info
+  log_format: text
+  access_log: true

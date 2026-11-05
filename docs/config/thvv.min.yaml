@@ -1,0 +1,77 @@
+# ==============================================================================
+# THVV Server — 最小可跑配置
+# ------------------------------------------------------------------------------
+# 目标：本地起服务 → 打开 /ui → 填地址/Key → 跑单档压测。
+#
+# ★ 唯一需要改的地址：roots.thvv（THVV Python 工具链装在哪）
+#   Go 服务与 thvv **不需要同目录**，靠根前缀寻址：
+#       thvv:perf  →  <roots.thvv>/perf
+#       data:runs  →  <roots.data>/runs
+#       bin:python →  <roots.bin>/python
+#
+# 用法:
+#   export THVV_HOME=/opt/thvv            # 或任意位置
+#   export THVV_SECRET_KEY=$(openssl rand -base64 32)
+#   export THVV_CI_TOKEN=local-dev
+#   ./thvv-server -config ./config/thvv.min.yaml
+#   open http://127.0.0.1:8080/ui/
+#
+# 其余全部走内置默认值（= 现 run.sh 的行为：9 档 1k~1m、梯度 1/8/32/64/128、
+# 冷却 120s、tokenizer/temperature 自适应表、perf-sla-v1 阈值模板）。
+# 完整字段见 CONFIG.md，全量示例见 thvv.yaml。
+# ==============================================================================
+
+version: 1
+
+# ---- ★ 根目录：Go 服务与 thvv 的位置解耦 ----
+roots:
+  thvv: "${THVV_HOME}"              # ★ 必填：THVV 工具链根目录
+  data: "${THVV_DATA:-./data}"      # 服务端数据目录，可放在别的盘
+  bin: "thvv:.venv/bin"             # 解释器目录，默认 <thvv>/.venv/bin
+
+server:
+  listen: "127.0.0.1:8080"
+  ui:
+    enabled: true                   # 留空 dir 则用二进制内置页面
+
+auth:
+  mode: both
+  tokens:
+    - { name: local, token: "${THVV_CI_TOKEN}", role: admin }
+  users:
+    - username: admin
+      # ⚠ 公开示例 hash（对应口令 password），仅供本地冒烟；正式环境务必用
+      #   htpasswd -bnBC 10 "" '新密码' | tr -d ':\n' 生成后经 THVV_ADMIN_HASH 注入
+      password_hash: "${THVV_ADMIN_HASH:-$2a$10$IBU8oAPb/vYyjaHjJHAhMuaUS9nblXw3MuVZLit8R88wEZEZ.e9xC}"
+      role: admin
+
+store:
+  driver: sqlite
+  sqlite:
+    path: "data:thvv.db"
+
+secrets:
+  provider: env
+  env:
+    key: "${THVV_SECRET_KEY}"       # 32 字节
+
+paths:
+  datasets_dir: "thvv:perf/datasets_clean"   # 不存在时回落 thvv:perf/datasets
+
+engines:
+  thvv:
+    enabled: true
+    runtime:
+      home: "thvv:"
+      python: "bin:python"
+      evalscope: "bin:evalscope"
+      pythonpath_prepend: ["thvv:perf/scripts"]   # 让 sitecustomize.py 生效
+      env:
+        HF_HOME: "data:cache/huggingface"
+        MODELSCOPE_CACHE: "data:cache/modelscope"
+    capabilities:
+      perf:
+        enabled: true
+        working_dir: "thvv:perf"
+      eval:
+        enabled: false              # 先只跑性能；打开需额外配 judge

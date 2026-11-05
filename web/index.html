@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>THVV · 供应商能力验证</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232563eb'/%3E%3Ctext x='16' y='23' font-size='19' font-family='sans-serif' font-weight='700' fill='white' text-anchor='middle'%3ET%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">T</span>
+    <div>
+      <strong>THVV</strong>
+      <span class="sub">Subcontractor Verifier</span>
+    </div>
+  </div>
+  <nav class="nav" id="nav">
+    <a href="#/new" data-route="new">新建测试</a>
+    <a href="#/history" data-route="history">历史记录</a>
+    <a href="#/catalog" data-route="catalog">能力清单</a>
+  </nav>
+  <div class="topbar-right">
+    <span class="badge" id="server-badge" title="服务端状态">连接中…</span>
+    <button class="btn ghost sm" id="btn-logout" hidden>退出</button>
+  </div>
+</header>
+
+<main>
+
+<!-- ============================= 登录 ============================= -->
+<section id="view-login" class="view" hidden>
+  <div class="login-card">
+    <h1>登录</h1>
+    <p class="muted">THVV 供应商能力验证平台</p>
+    <form id="login-form">
+      <label>用户名<input id="login-user" autocomplete="username" required></label>
+      <label>密码<input id="login-pass" type="password" autocomplete="current-password" required></label>
+      <button class="btn primary block" type="submit">登录</button>
+    </form>
+    <p class="hint" id="login-hint"></p>
+    <p class="hint"><a href="?mock=1#/new">以演示模式进入（无需服务端）</a></p>
+  </div>
+</section>
+
+<!-- ============================= 新建测试 ============================= -->
+<section id="view-new" class="view" hidden>
+  <ol class="steps-bar" id="steps-bar">
+    <li data-step="1" class="active"><span>1</span>被测端点</li>
+    <li data-step="2"><span>2</span>测试计划</li>
+    <li data-step="3"><span>3</span>确认提交</li>
+  </ol>
+
+  <!-- ---------- 步骤 1：端点 ---------- -->
+  <div class="panel" id="panel-step-1">
+    <div class="panel-head">
+      <h2>被测端点</h2>
+      <select id="target-existing" class="inline-select">
+        <option value="">— 新建端点 —</option>
+      </select>
+    </div>
+
+    <div class="grid-2">
+      <label class="field">供应商名称
+        <input id="f-vendor" placeholder="如 zhipu / 智谱" autocomplete="off">
+        <small>用于报告署名与目录命名</small>
+      </label>
+      <label class="field">端点别名
+        <input id="f-name" placeholder="如 zhipu-glm52-prod" autocomplete="off">
+        <small>留空则自动生成</small>
+      </label>
+    </div>
+
+    <label class="field">API 地址
+      <input id="f-api-url" placeholder="https://api.example.com/v1/chat/completions" autocomplete="off" required>
+      <small id="url-hint">须为完整请求路径，服务端不做拼接</small>
+    </label>
+
+    <div class="grid-3">
+      <label class="field">协议
+        <select id="f-protocol">
+          <option value="openai">openai（Chat Completions）</option>
+          <option value="anthropic">anthropic（Messages）</option>
+        </select>
+      </label>
+      <label class="field">模型名
+        <input id="f-model" placeholder="如 glm-5.2" autocomplete="off" required>
+      </label>
+      <label class="field">API Key
+        <input id="f-api-key" type="password" placeholder="sk-..." autocomplete="new-password">
+        <small id="key-hint">只写，保存后仅显示后 4 位</small>
+      </label>
+    </div>
+
+    <div class="grid-3">
+      <label class="field">Tokenizer
+        <input id="f-tokenizer" placeholder="留空自动推断" autocomplete="off">
+        <small id="tok-hint">按模型名自动匹配</small>
+      </label>
+      <label class="field">Temperature
+        <select id="f-temperature">
+          <option value="auto">auto（按模型族自动）</option>
+          <option value="0">0.0</option>
+          <option value="1">1.0</option>
+        </select>
+      </label>
+      <label class="field">max_tokens
+        <input id="f-max-tokens" type="number" value="4096" min="1">
+      </label>
+    </div>
+
+    <div class="panel-actions">
+      <button class="btn ghost" id="btn-probe" type="button">保存并预检</button>
+      <span class="grow"></span>
+      <button class="btn primary" id="btn-to-step2" type="button">下一步：测试计划</button>
+    </div>
+
+    <div id="probe-result" class="probe" hidden></div>
+  </div>
+
+  <!-- ---------- 步骤 2：计划 ---------- -->
+  <div class="panel" id="panel-step-2" hidden>
+    <h2>测试计划</h2>
+
+    <div class="seg" id="mode-seg" role="tablist">
+      <button class="seg-item active" data-mode="single" role="tab">单档测试</button>
+      <button class="seg-item" data-mode="matrix" role="tab">全档位矩阵</button>
+    </div>
+
+    <!-- 单档 -->
+    <div id="pane-single" class="pane">
+      <div class="grid-3">
+        <label class="field">档位
+          <select id="s-bucket"></select>
+          <small id="s-bucket-hint"></small>
+        </label>
+        <label class="field">并发
+          <select id="s-parallel">
+            <option>1</option><option>8</option><option selected>10</option>
+            <option>32</option><option>64</option><option>128</option>
+          </select>
+          <small id="s-parallel-hint"></small>
+        </label>
+        <label class="field">请求总数
+          <input id="s-number" type="number" value="200" min="1" max="10000">
+        </label>
+      </div>
+    </div>
+
+    <!-- 全档 -->
+    <div id="pane-matrix" class="pane" hidden>
+      <div class="field">
+        <span>档位（点击选中）</span>
+        <div class="chips" id="m-buckets"></div>
+      </div>
+
+      <div class="grid-3">
+        <label class="field">并发梯度
+          <input id="m-ladder" value="1,8,32,64,128" autocomplete="off">
+          <small>逗号分隔；实际按各档并发上限裁剪</small>
+        </label>
+        <label class="field">档间冷却（秒）
+          <input id="m-cooldown" type="number" value="120" min="0">
+        </label>
+        <label class="field">成功率早停阈值
+          <input id="m-srmin" type="number" value="0" min="0" max="1" step="0.001">
+          <small>0=关闭；如 0.99</small>
+        </label>
+      </div>
+
+      <div class="grid-2">
+        <label class="field">TPM 预算（tokens/min）
+          <input id="m-tpm" type="number" value="0" min="0">
+          <small>0=不限；用于裁剪并发与请求数，非硬限流</small>
+        </label>
+        <label class="field">失败处理
+          <select id="m-stop">
+            <option value="true">某档失败则跳过该档剩余并发</option>
+            <option value="false">继续跑完所有档位与并发</option>
+          </select>
+        </label>
+      </div>
+
+      <details class="advanced">
+        <summary>单档覆盖（并发 / 请求数）</summary>
+        <table class="tbl compact" id="override-table">
+          <thead><tr><th>档位</th><th>上限</th><th>附加并发</th><th>请求数</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </details>
+
+      <div class="estimate" id="estimate"></div>
+    </div>
+
+    <!-- 验收门槛 -->
+    <h3 class="section-title">验收门槛</h3>
+    <div class="grid-3">
+      <label class="field">阈值模板
+        <select id="g-profile"><option value="">不判定</option></select>
+      </label>
+      <label class="field">你的 TPM 配额
+        <input id="g-tpm" type="number" value="5000000" min="0">
+      </label>
+      <label class="field">判定模式
+        <select id="g-mode">
+          <option value="report_only">仅报告（不影响状态）</option>
+          <option value="enforce">严格执行</option>
+        </select>
+      </label>
+    </div>
+
+    <!-- 报告 -->
+    <h3 class="section-title">报告</h3>
+    <div class="grid-3">
+      <label class="field">署名（写入报告）
+        <input id="r-client" placeholder="供应商名称" autocomplete="off">
+      </label>
+      <label class="field">报告标题
+        <input id="r-title" placeholder="留空自动生成" autocomplete="off">
+      </label>
+      <label class="field">产物格式
+        <div class="check-row">
+          <label><input type="checkbox" id="r-html" checked> HTML</label>
+          <label><input type="checkbox" id="r-xlsx" checked> Excel</label>
+        </div>
+      </label>
+    </div>
+
+    <div class="panel-actions">
+      <button class="btn ghost" id="btn-back-1" type="button">上一步</button>
+      <span class="grow"></span>
+      <button class="btn primary" id="btn-to-step3" type="button">下一步：确认</button>
+    </div>
+  </div>
+
+  <!-- ---------- 步骤 3：确认 ---------- -->
+  <div class="panel" id="panel-step-3" hidden>
+    <h2>确认提交</h2>
+    <div class="confirm-grid">
+      <div class="confirm-card">
+        <h4>被测端点</h4>
+        <dl id="cf-target"></dl>
+      </div>
+      <div class="confirm-card">
+        <h4>测试计划</h4>
+        <dl id="cf-plan"></dl>
+      </div>
+    </div>
+    <details class="advanced">
+      <summary>请求体预览（POST /v1/runs）</summary>
+      <pre id="cf-json" class="code"></pre>
+    </details>
+    <div class="panel-actions">
+      <button class="btn ghost" id="btn-back-2" type="button">上一步</button>
+      <span class="grow"></span>
+      <button class="btn primary lg" id="btn-submit" type="button">开始测试</button>
+    </div>
+  </div>
+</section>
+
+<!-- ============================= 运行监控 ============================= -->
+<section id="view-run" class="view" hidden>
+  <div class="run-head">
+    <div>
+      <h2 id="run-title">运行中…</h2>
+      <p class="muted" id="run-meta"></p>
+    </div>
+    <div class="run-head-actions">
+      <span class="status-pill" id="run-status">queued</span>
+      <button class="btn danger sm" id="btn-cancel">取消</button>
+      <button class="btn ghost sm" id="btn-back-new">新建测试</button>
+    </div>
+  </div>
+
+  <div class="progress-wrap">
+    <div class="progress"><div class="progress-bar" id="run-progress-bar"></div></div>
+    <div class="progress-meta">
+      <span id="run-progress-text">0 / 0 步</span>
+      <span id="run-progress-eta"></span>
+    </div>
+  </div>
+
+  <div class="kpi-row" id="run-kpis"></div>
+
+  <div class="panel">
+    <div class="panel-head"><h3>执行步骤</h3>
+      <button class="btn ghost sm" id="btn-toggle-log">显示日志</button>
+    </div>
+    <table class="tbl" id="steps-table">
+      <thead><tr>
+        <th>#</th><th>档位</th><th>并发</th><th>请求数</th><th>状态</th>
+        <th class="num">成功率</th><th class="num">TTFT P50</th><th class="num">Output tps</th><th class="num">耗时</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+    <pre class="code log" id="run-log" hidden></pre>
+  </div>
+
+  <div id="run-result" hidden>
+    <div class="panel">
+      <div class="panel-head"><h3>验收结论</h3><span id="gate-badge"></span></div>
+      <div id="gate-body"></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h3>交付物</h3></div>
+      <ul class="artifact-list" id="artifact-list"></ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============================= 历史记录 ============================= -->
+<section id="view-history" class="view" hidden>
+  <div class="panel">
+    <div class="panel-head">
+      <h2>历史记录</h2>
+      <div class="filters">
+        <select id="h-status">
+          <option value="">全部状态</option>
+          <option>succeeded</option><option>partial</option><option>failed</option><option>canceled</option>
+        </select>
+        <button class="btn ghost sm" id="btn-refresh">刷新</button>
+      </div>
+    </div>
+    <table class="tbl" id="history-table">
+      <thead><tr>
+        <th>创建时间</th><th>模型</th><th>类型</th><th>状态</th>
+        <th class="num">步数</th><th class="num">成功率</th><th>结论</th><th></th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="panel-actions"><button class="btn ghost" id="btn-more">加载更多</button></div>
+  </div>
+</section>
+
+<!-- ============================= 能力清单 ============================= -->
+<section id="view-catalog" class="view" hidden>
+  <div class="panel">
+    <h2>工具与能力</h2>
+    <div id="catalog-tools" class="tool-cards"></div>
+  </div>
+  <div class="panel">
+    <h2>输入长度档位</h2>
+    <table class="tbl" id="catalog-buckets">
+      <thead><tr><th>档位</th><th class="num">token 区间</th><th class="num">并发上限</th><th>数据集</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <div class="panel">
+    <h2>验收阈值模板</h2>
+    <table class="tbl" id="catalog-gates">
+      <thead><tr><th>档位</th><th class="num">TTFT P50 ≤</th><th class="num">TTFT P90 ≤</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</section>
+
+</main>
+
+<div class="toasts" id="toasts"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
