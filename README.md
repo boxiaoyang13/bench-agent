@@ -1,11 +1,11 @@
 # THVV Server
 
-THVV（TokenHub Vendor Verifier）的服务端：把现有的 Python 工具链（`../thvv/`）封装成
+THVV（TokenHub Vendor Verifier）的服务端：把现有的 Python 压测工具链（evalscope）封装成
 **HTTP 服务 + Web 页面**，外部客户端填表即可发起性能压测，实时看进度并下载报告。
 
-- 协议规范：[`../thvv/docs/API.md`](../thvv/docs/API.md) · 契约 [`../thvv/docs/openapi.yaml`](../thvv/docs/openapi.yaml)
-- 设计文档：[`../thvv/docs/DESIGN.md`](../thvv/docs/DESIGN.md) · 配置规范 [`../thvv/docs/CONFIG.md`](../thvv/docs/CONFIG.md)
-- 前端与交互：[`../thvv/docs/WEB-UI.md`](../thvv/docs/WEB-UI.md)
+- 协议规范：[`docs/API.md`](docs/API.md) · 契约 [`docs/openapi.yaml`](docs/openapi.yaml)
+- 设计文档：[`docs/DESIGN.md`](docs/DESIGN.md) · 配置规范 [`docs/CONFIG.md`](docs/CONFIG.md)
+- 前端与交互：[`docs/WEB-UI.md`](docs/WEB-UI.md)
 
 ## 30 秒跑起来（不需要 Python）
 
@@ -39,22 +39,34 @@ make run   CONFIG=./config/thvv.example.yaml
 ## 目录结构
 
 ```
-server/
-├── cmd/thvv-server/main.go      入口：flag / -check / -print-roots / 优雅关闭
-├── internal/
-│   ├── config/                  YAML 加载、根与路径解析（前缀寻址）、默认值、校验
-│   ├── domain/                  领域模型 + computeSteps（与前端逐行等价）
-│   ├── store/                   SQLite 持久化（targets/runs/steps/artifacts/events/audit）
-│   ├── engine/                  引擎抽象 + fake(builtin) + subprocess(evalscope)
-│   ├── runmgr/                  Run 状态机、队列、SSE 广播、产物生成
-│   ├── report/                  benchmark_data.db → 指标 / SLA 判定 / HTML / xlsx / CSV
-│   ├── httpapi/                 路由、鉴权（Cookie+Bearer）、problem+json、SSE、静态页面
-│   └── secret/                  Target 凭据的 AES-GCM 加解密
-├── web/                         前端（原生 JS，无构建；go:embed 打包）
-├── config/
-│   ├── thvv.local.yaml          本地联调（builtin 模拟引擎）
-│   └── thvv.example.yaml        生产示例（subprocess 引擎）
-└── Makefile
+.                                 仓库根
+├── README.md                     本文档
+├── docs/                         协议与设计文档
+│   ├── API.md / openapi.yaml     HTTP 协议规范 + 接口契约
+│   ├── DESIGN.md / CONFIG.md     设计文档（§9.1 双跑对账）/ 配置规范
+│   ├── WEB-UI.md                 前端与交互（含实现记录）
+│   └── config/                   Python 侧配置样例（thvv.yaml、path_resolver_reference.py）
+└── server/                       Go 服务端
+    ├── cmd/thvv-server/main.go   入口：flag / -check / -print-roots / 优雅关闭
+    ├── internal/
+    │   ├── config/               YAML 加载、根与路径解析（前缀寻址）、默认值、校验
+    │   ├── domain/               领域模型 + computeSteps（与前端逐行等价）
+    │   ├── store/                SQLite 持久化（targets/runs/steps/artifacts/events/audit）
+    │   ├── engine/               引擎抽象 + fake(builtin) + subprocess(evalscope)、进程组取消
+    │   ├── runmgr/               Run 状态机、队列、SSE 事件广播、产物生成
+    │   ├── report/               benchmark_data.db → 指标 / SLA 判定 / 失败明细 / HTML / xlsx / CSV
+    │   ├── httpapi/              路由、鉴权（Cookie+Bearer）、problem+json、SSE、静态页面
+    │   └── secret/               Target 凭据的 AES-GCM 加解密
+    ├── web/                      前端：原生 JS SPA，无构建；go:embed 打包进二进制
+    │   ├── index.html / app.js / styles.css
+    │   └── embed.go              //go:embed → web.Assets
+    ├── config/
+    │   ├── thvv.local.yaml       本地联调（builtin 模拟引擎）
+    │   └── thvv.example.yaml     生产示例（subprocess 引擎）
+    ├── go.mod / go.sum           模块 github.com/apexcloud/thvv/server
+    ├── Makefile                  dev / run / check / test / test-race
+    ├── bin/                      构建产物（gitignore）
+    └── data/                     运行时数据：SQLite 库 + runs 产物（gitignore）
 ```
 
 ## 已实现 / 未实现
@@ -76,7 +88,7 @@ server/
 
 > **subprocess 引擎说明**：代码完整实现了 `evalscope perf` 的 argv 构造、进程组取消、
 > stdout 解析与产物回读，但**未在真实 Python 环境做端到端调试**（按当前阶段要求）。
-> 上线前需按 `../thvv/docs/DESIGN.md` §9.1 做一次「双跑对账」：
+> 上线前需按 [`docs/DESIGN.md`](docs/DESIGN.md) §9.1 做一次「双跑对账」：
 > 同一 target/数据集下，Go 侧指标与 `bash run.sh bench` 的 xlsx **逐格一致**。
 
 ## 测试
