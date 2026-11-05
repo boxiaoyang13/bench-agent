@@ -54,10 +54,10 @@ func (c *Config) Check() []Issue {
 	}
 
 	// 1. roots
-	if c.Roots.Thvv == "" && c.perfEnabled() {
+	if c.Roots.Thvv == "" && c.needsTHVV() {
 		errf("roots.thvv", "必填（或用 -thvv-home / THVV_ROOTS__THVV 提供）")
 	}
-	if v, ok := c.Resolved["roots.thvv"]; ok && c.perfEnabled() {
+	if v, ok := c.Resolved["roots.thvv"]; ok && c.needsTHVV() {
 		if st, err := os.Stat(v); err != nil || !st.IsDir() {
 			errf("roots.thvv", "%s 不存在或不是目录", v)
 		} else {
@@ -263,15 +263,20 @@ func (c *Config) Check() []Issue {
 	}
 
 	// 9. datasets
+	//   - 需要 fork Python 时必须真实存在（引擎要按 token 区间过滤样本）
+	//   - builtin 模拟引擎不读数据集，缺了只 warn，便于「无需 Python」的本地联调
 	if c.perfEnabled() {
 		if v, ok := c.Resolved["paths.datasets_dir"]; ok {
 			if !exists(v) {
 				fallback := filepath.Join(filepath.Dir(v), "datasets")
-				if exists(fallback) {
+				switch {
+				case exists(fallback):
 					warnf("paths.datasets_dir", "%s 不存在，回落到 %s", v, fallback)
 					c.Paths.DatasetsDir = Path(fallback)
-				} else {
+				case c.needsTHVV():
 					errf("paths.datasets_dir", "%s 与回落目录均不存在", v)
+				default:
+					warnf("paths.datasets_dir", "%s 不存在（builtin 模拟引擎不读数据集，可忽略）", v)
 				}
 			}
 		}
@@ -331,6 +336,22 @@ func checkPerf(engine string, cap *Capability, errf, warnf func(string, string, 
 			}
 		}
 	}
+}
+
+// needsTHVV 判断是否真的需要 THVV Python 工具链（只有 fork evalscope 才需要）。
+// builtin（内置模拟引擎）与 http（外部工具）都不需要。
+func (c *Config) needsTHVV() bool {
+	for _, e := range c.Engines {
+		if e == nil || !e.Enabled || e.Kind != "subprocess" {
+			continue
+		}
+		for _, cap := range e.Capabilities {
+			if cap != nil && cap.Enabled {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (c *Config) perfEnabled() bool {

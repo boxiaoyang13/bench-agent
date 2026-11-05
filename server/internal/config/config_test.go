@@ -203,13 +203,15 @@ func TestEnvOverrides(t *testing.T) {
 }
 
 // TestFingerprintValidation 目录存在但不是 THVV 根 → 报错。
+// 指纹校验只在 fork Python（kind=subprocess）时才做。
 func TestFingerprintValidation(t *testing.T) {
 	base := t.TempDir()
 	notTHVV := filepath.Join(base, "whatever")
 	if err := os.MkdirAll(notTHVV, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	p := writeCfg(t, base, "fp.yaml", replaceAll(minimalYAML, "%THVV%", notTHVV))
+	subproc := replaceAll(minimalYAML, "kind: builtin", "kind: subprocess\n    runtime: {python: /bin/sh, evalscope: /bin/sh}")
+	p := writeCfg(t, base, "fp.yaml", replaceAll(subproc, "%THVV%", notTHVV))
 	_, err := Load(LoadOptions{Path: p})
 	if err == nil {
 		t.Fatal("期望指纹校验失败")
@@ -332,4 +334,21 @@ func readFile(t *testing.T, p string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// TestBuiltinEngineNeedsNoTHVV builtin 模拟引擎不需要 THVV 工具链（本地联调开箱即用）。
+func TestBuiltinEngineNeedsNoTHVV(t *testing.T) {
+	base := t.TempDir()
+	// thvv 根故意指向不存在的目录
+	p := writeCfg(t, base, "nothvv.yaml", replaceAll(minimalYAML, "%THVV%", filepath.Join(base, "missing-thvv")))
+	cfg, err := Load(LoadOptions{Path: p})
+	if err != nil {
+		t.Fatalf("builtin 引擎不应要求 THVV 根目录: %v", err)
+	}
+	// 有 warn（数据集缺失），但不能有 error
+	for _, is := range cfg.Check() {
+		if is.Level == "error" {
+			t.Fatalf("不应出现 error: %s", is)
+		}
+	}
 }

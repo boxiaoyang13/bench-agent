@@ -15,7 +15,8 @@
 version: 1
 
 roots:
-  # 模拟引擎不读 thvv 目录，但 datasets 校验会用到它；指向仓库里的 thvv/ 即可
+  # 内置模拟引擎**不需要** Python 工具链：thvv 根仅用于 datasets 存在性提示，
+  # 指错了也只是 warn（真实压测请用 kind=subprocess + thvv.example.yaml）
   thvv: "${THVV_HOME:-../../thvv}"
   data: "${THVV_DATA:-../data}"
 
