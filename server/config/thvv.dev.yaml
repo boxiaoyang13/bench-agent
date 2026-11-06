@@ -1,0 +1,125 @@
+# ==============================================================================
+# THVV Server — 本机联调配置（真实 subprocess 引擎，接本地 thvv Python 工具链）
+# ------------------------------------------------------------------------------
+# 与 thvv.example.yaml 的区别只有：roots 用本机绝对路径（可用环境变量覆盖）。
+#
+# 启动:
+#   export THVV_SECRET_KEY=$(openssl rand -base64 32)
+#   ./bin/thvv-server -config ./config/thvv.dev.yaml -check
+#   ./bin/thvv-server -config ./config/thvv.dev.yaml
+#   open http://127.0.0.1:18080/ui/
+#
+# 说明:
+#   * Python 工具链在 <repo>/thvv（含 perf/ eval/ configs/ quickstart.sh）
+#   * venv 在 <repo>/.venv（不在 thvv/ 下），所以 roots.bin 走自定义根 venv
+#   * 如需换机器：THVV_HOME / THVV_VENV 覆盖即可，YAML 不用改
+# ==============================================================================
+version: 1
+
+roots:
+  thvv: "${THVV_HOME:-/infer-data/bench/TokenHub-Vendor-Verifier/thvv}"
+  data: "${THVV_DATA:-../data}"
+  venv: "${THVV_VENV:-/infer-data/bench/TokenHub-Vendor-Verifier/.venv}"
+  bin: "venv:bin"
+
+server:
+  listen: "0.0.0.0:18080"   # 对外监听；仅本机用可改回 127.0.0.1:18080
+  base_path: "/v1"
+  read_timeout: 0s
+  write_timeout: 0s                    # SSE 必需
+  ui:
+    enabled: true
+  cors:
+    enabled: true
+    allowed_origins: ["http://127.0.0.1:18080", "http://localhost:18080"]
+
+auth:
+  mode: both
+  session:
+    ttl: 12h
+    secure: false
+    signing_key: "${THVV_SESSION_KEY:-dev-only-change-me}"
+  tokens:
+    - { name: dev, token: "${THVV_DEV_TOKEN:-dev-token}", role: admin }
+  users:
+    - username: admin
+      password_hash: "${THVV_ADMIN_HASH:-$2y$10$PD.2SBpyhJ242eegpFO82OoiwiDgV/4jy65DxNQxeU08LuC6PTfVi}"
+      role: admin
+
+store:
+  driver: sqlite
+  sqlite:
+    path: "data:thvv.db"
+    wal: true
+    busy_timeout: 5s
+    max_open_conns: 4
+
+secrets:
+  provider: env
+  env:
+    key: "${THVV_SECRET_KEY}"
+
+paths:
+  datasets_dir: "thvv:perf/datasets_clean"
+  cache_dir: "data:cache"
+
+engines:
+  thvv:
+    enabled: true
+    kind: subprocess
+    display_name: "THVV TokenHub Vendor Verifier"
+    version: "1.0.0"
+    runtime:
+      home: "thvv:"
+      python: "bin:python"
+      evalscope: "bin:evalscope"
+      # thvv 的 sitecustomize 兼容补丁（transformers 5.x token 计数 / chat_template 兜底）
+      pythonpath_prepend: ["thvv:perf/scripts"]
+      check_on_startup: true
+      env:
+        HF_HOME: "data:cache/huggingface"
+        MODELSCOPE_CACHE: "data:cache/modelscope"
+        PYTHONUNBUFFERED: "1"
+    capabilities:
+      perf:
+        enabled: true
+        status: ga
+        working_dir: "thvv:perf"
+        # 与 thvv/perf/run.sh 的 bucket_range / bucket_max_parallel 对齐；
+        # 本机 datasets_clean/ 已含 512k、1m，故标 dataset_built_in=true。
+        buckets:
+          - {label: "1k",   min: 870,    max: 1228,    max_parallel: 128}
+          - {label: "9k",   min: 8000,   max: 11000,   max_parallel: 128}
+          - {label: "16k",  min: 14000,  max: 18000,   max_parallel: 128}
+          - {label: "32k",  min: 28000,  max: 36000,   max_parallel: 128}
+          - {label: "64k",  min: 56000,  max: 72000,   max_parallel: 128}
+          - {label: "128k", min: 112000, max: 144000,  max_parallel: 64}
+          - {label: "200k", min: 180000, max: 220000,  max_parallel: 64}
+          - {label: "512k", min: 500000, max: 540000,  max_parallel: 32, dataset_built_in: true}
+          - {label: "1m",   min: 980000, max: 1030000, max_parallel: 8,  dataset_built_in: true}
+      eval:
+        enabled: false                    # eval 需要 evalscope==1.9.0（当前 venv 满足，验证后打开）
+        status: preview
+        working_dir: "thvv:eval"
+        script: "thvv:eval/scripts/run_eval.py"
+      functional:
+        enabled: false
+        status: planned
+        available_at: "v1.2"
+
+reports:
+  default_formats: [html, xlsx]
+  default_company: "本地联调"
+
+gates:
+  default_profile: perf-sla-v1
+
+limits:
+  max_concurrent_runs: 2
+  max_queued_runs: 16
+  max_parallel_runs_per_target: 1
+
+observability:
+  log_level: debug
+  log_format: text
+  access_log: true
