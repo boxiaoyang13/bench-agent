@@ -4,7 +4,7 @@
 > 本文定义：**页面结构**、**每个页面动作调用的 HTTP 接口**、**浏览器侧的特殊约束**（Cookie 会话 / SSE / 文件下载）。
 >
 > 前端实现：[`../../server/web/index.html`](../../server/web/index.html) · [`app.js`](../../server/web/app.js) · [`styles.css`](../../server/web/styles.css)
-> （无构建、无依赖；`?mock=1` 为纯前端演示模式，不需要服务端）
+> （无构建、无依赖；页面只连真实服务端，无前端 Mock/演示模式）
 >
 > **实现状态**：Go 服务端与前端均已落地（`server/`），接口与本文一致；
 > 差异见 §12「实现记录」。
@@ -338,14 +338,11 @@ mux.Handle("GET /", http.RedirectHandler("/ui/", http.StatusFound))
   ```
 - 静态资源带 `Cache-Control: public, max-age=3600` + 内容哈希查询参数（`app.js?v=<build>`）即可。
 
-### 8.1 Mock 模式（`?mock=1`）
+### 8.1 无前端 Mock（已移除）
 
-`app.js` 内置 `mockApi()`：在内存里实现 targets / runs / probe / results / artifacts，并用定时器模拟 SSE 事件流。
-用途：
-1. UI 评审与产品验收（不需要 Python 环境、不需要服务端）；
-2. 与服务端并行开发时的**契约对齐工具**——mock 的响应结构照抄 `openapi.yaml`，任一侧改字段另一侧立刻能发现。
-
-> Mock 不是"假数据壳子"：它按真实的状态机（`queued → running → partial → …`）、真实的档位表与 `computeSteps` 跑，因此能验证进度条、早停、档位跳过等交互。
+v1.1 起页面只连同源 Go 服务（Cookie 会话 + SSE），不再提供 `?mock=1` 纯前端演示模式：
+接口返回什么，页面就渲染什么，避免"演示数据看起来正常、真实链路不可用"的假阳性。
+离线演示请用 `config/thvv.local.yaml` 的 `builtin` 引擎起一个真实服务端。
 
 ---
 
@@ -398,7 +395,7 @@ mux.Handle("GET /", http.RedirectHandler("/ui/", http.StatusFound))
 |---|---|---|
 | `docs/web/` | `server/web/` | 移入 Go 模块以便 `go:embed`；本目录不再保留副本 |
 | 首屏 4 个并行 GET | 同 | 但改为**登录后**才发起（未登录时这些接口是 401） |
-| — | `?mock=1` 保留 | 前端仍在无服务端时可用，便于 UI 评审 |
+| 设计稿的 `?mock=1` 演示模式 | 已移除 | 页面只连真实服务端；离线演示改用 `config/thvv.local.yaml`（builtin 引擎） |
 | — | 新增 `GET /v1/auth/session` 返回 `kind`/`expires_at` | 便于前端展示会话状态 |
 
 实现期发现并修掉的两个交互缺陷（都已回归覆盖）：

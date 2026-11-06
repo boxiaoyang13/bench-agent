@@ -1,13 +1,11 @@
 /* ============================================================================
  * THVV Web — 前端（无构建、无依赖）
  *
- * 与 Go 服务的交互全部经过 api()，Mock 模式下由 mockApi() 接管，
- * 因此页面可在没有服务端时完整走通（?mock=1）。
+ * 所有请求都打到同源的 Go 服务（cookie 会话），无前端 Mock。
  * 契约见 ../API.md 与 ../WEB-UI.md。
  * ========================================================================== */
 'use strict';
 
-const MOCK = new URLSearchParams(location.search).has('mock');
 const API_BASE = '/v1';
 
 /* ---------------------------------------------------------------- 状态 */
@@ -81,8 +79,6 @@ class ApiError extends Error {
 }
 
 async function api(method, path, body, opts = {}) {
-  if (MOCK) return mockApi(method, path, body);
-
   const headers = { 'Accept': 'application/json' };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   if (opts.idempotencyKey) headers['Idempotency-Key'] = opts.idempotencyKey;
@@ -107,16 +103,15 @@ async function api(method, path, body, opts = {}) {
   return data;
 }
 
-/* SSE：真实模式用 EventSource（cookie 会自动携带），Mock 模式用定时器模拟 */
+/* SSE：EventSource 自动携带 cookie 会话 */
 const SSE_EVENTS = [
   'run.snapshot', 'run.started', 'step.started', 'step.progress',
   'step.finished', 'run.progress', 'run.log', 'run.gate', 'run.finished', 'error',
 ];
 
 function subscribeRun(runId, onEvent, onError) {
-  if (MOCK) return mockSubscribe(runId, onEvent);
-
   const es = new EventSource(`${API_BASE}/runs/${runId}/events?since=0`, { withCredentials: true });
+  let closed = false;
   SSE_EVENTS.forEach(type => {
     es.addEventListener(type, ev => {
       let data = {};
@@ -124,8 +119,14 @@ function subscribeRun(runId, onEvent, onError) {
       onEvent(type, data);
     });
   });
-  es.onerror = () => { onError && onError(); };
-  return () => es.close();
+  // 主动 close：否则浏览器会按 SSE 规范自动重连，与下面的重连逻辑叠加成"不停重试"
+  es.onerror = () => {
+    if (closed) return;
+    closed = true;
+    es.close();
+    onError && onError();
+  };
+  return () => { closed = true; es.close(); };
 }
 
 /* ---------------------------------------------------------------- 档位/计划计算 */
@@ -177,8 +178,7 @@ function parseHash() {
 async function router() {
   const { name, params } = parseHash();
 
-  if (name === 'login' || (!MOCK && !state.user)) {
-    if (MOCK) { location.hash = '#/new'; return; }
+  if (name === 'login' || !state.user) {
     showView('login'); return;
   }
   // 离开运行页时关闭 SSE，避免后台长连接
@@ -222,15 +222,10 @@ async function loadReferenceData() {
 }
 
 async function boot() {
-  if (!MOCK) {
-    try {
-      state.user = await api('GET', '/auth/session');
-    } catch (e) {
-      state.user = null;
-    }
-  } else {
-    state.user = { username: 'demo', roles: ['operator'] };
-    $('#login-hint').textContent = '演示模式：所有请求由前端 Mock 处理';
+  try {
+    state.user = await api('GET', '/auth/session');
+  } catch (e) {
+    state.user = null;
   }
 
   // 已登录才拉业务数据（未登录时这些请求会 401）
@@ -249,7 +244,7 @@ function setServerBadge(ok, meta) {
   el.hidden = false;
   if (ok) {
     el.className = 'badge ok';
-    el.textContent = `服务正常 · v${meta?.server?.version || '1.0.0'}${MOCK ? ' (演示)' : ''}`;
+    el.textContent = `服务正常 · v${meta?.server?.version || '1.0.0'}`;
   } else {
     el.className = 'badge err';
     el.textContent = '服务不可用';
@@ -443,6 +438,7 @@ function autoName() {
 
 function validateTargetForm(p) {
   const errs = [];
+  if (!p.vendor) errs.push('测试名称必填');
   if (!/^https?:\/\//.test(p.api_url)) errs.push('API 地址必须以 http(s):// 开头');
   if (!p.model) errs.push('模型名必填');
   if (!state.target && !p.api_key) errs.push('新建端点时必须填写 API Key');
@@ -656,7 +652,7 @@ function buildSubmitPayload() {
 function renderConfirm() {
   const t = state.target || {};
   $('#cf-target').innerHTML = [
-    ['名称', t.name], ['供应商', t.vendor || '—'], ['模型', t.model],
+    ['名称', t.name], ['测试名称', t.vendor || '—'], ['模型', t.model],
     ['协议', t.protocol], ['地址', t.api_url],
     ['Key', t.api_key_hint || '—'],
     ['Tokenizer', t.tokenizer?.value ? `${t.tokenizer.value}（${t.tokenizer.source}）` : '自动'],
@@ -717,7 +713,7 @@ async function openRun(runId) {
   setRunTitle(null);
 
   try {
-    const run = await api('GET', `/runs/${runId}`);
+    const run = await api('GET', `/runs/${runId}?include=steps`);
     state.run = run;
     renderRun(run);
   } catch (err) {
@@ -727,9 +723,19 @@ async function openRun(runId) {
   }
 
   if (!TERMINAL.includes(state.run.status)) {
-    state.unsub = subscribeRun(runId, handleEvent, () => {
+    state.unsub = subscribeRun(runId, handleEvent, async () => {
+      // 断线后先确认 run 是否已结束：终态就直接拉结果，不再重连
+      try {
+        const r = await api('GET', `/runs/${runId}?include=steps`);
+        if (TERMINAL.includes(r.status)) {
+          state.run = r;
+          renderRun(r);
+          await loadRunResult(runId);
+          return;
+        }
+      } catch (_) { /* 网络仍不可用时继续重试 */ }
       toast('事件流断开，正在尝试重连…', 'err');
-      setTimeout(() => openRun(runId), 3000);
+      setTimeout(() => { if ((location.hash || '').includes(runId)) openRun(runId); }, 5000);
     });
   } else {
     await loadRunResult(runId);
@@ -789,7 +795,7 @@ function renderSteps(steps) {
 }
 
 function stepBadge(status) {
-  const map = { pending: ['', '待执行'], running: ['info', '运行中'], succeeded: ['ok', '成功'], failed: ['err', '失败'], skipped: ['warn', '跳过'] };
+  const map = { pending: ['', '待执行'], running: ['info', '运行中'], succeeded: ['ok', '成功'], failed: ['err', '失败'], skipped: ['warn', '跳过'], canceled: ['warn', '已取消'] };
   const [cls, text] = map[status] || ['', status];
   return `<span class="badge ${cls}">${text}</span>`;
 }
@@ -824,9 +830,11 @@ function handleEvent(type, d) {
     case 'step.progress': {
       const tr = $(`#steps-table tbody tr[data-step="${d.step_index}"]`);
       if (tr) {
-        $('.sr', tr).textContent = d.success_rate != null ? fmtPct(d.success_rate) : '—';
-        $('.ttft', tr).textContent = d.ttft_p50_sec != null ? fmtNum(d.ttft_p50_sec) + 's' : '—';
-        $('.st', tr).innerHTML = `<span class="badge info">${d.completed}/${d.total}</span>`;
+        const total = Number(d.total) || 0;
+        const done = Math.max(0, Math.min(Number(d.completed) || 0, total));
+        $('.st', tr).innerHTML = total > 0
+          ? `<span class="badge info">运行中 ${done}/${total}</span>`
+          : '<span class="badge info">运行中</span>';
       }
       break;
     }
@@ -865,7 +873,10 @@ function handleEvent(type, d) {
       renderRun(run);
       appendLog(`■ 任务结束：${statusText(d.status)}`);
       if (state.unsub) { state.unsub(); state.unsub = null; }
-      loadRunResult(run.run_id);
+      api('GET', `/runs/${run.run_id}?include=steps`)
+        .then(fresh => { if (state.run?.run_id === run.run_id) { state.run = fresh; renderRun(fresh); } })
+        .catch(() => { })
+        .finally(() => loadRunResult(run.run_id));
       break;
 
     case 'error':
@@ -1029,298 +1040,6 @@ function renderCatalog() {
       <td class="num">${fmtNum(t.ttft_p50_max_sec)}s</td>
       <td class="num">${fmtNum(t.ttft_p90_max_sec)}s</td></tr>`).join('')
     : '<tr><td colspan="3" class="muted">无阈值模板</td></tr>';
-}
-
-/* ================================================================
- * Mock（?mock=1）— 仅用于无服务端时演示 / 联调前对齐
- * ============================================================== */
-const mock = {
-  targets: [],
-  runs: {},
-  seq: 1,
-};
-
-const MOCK_BUCKETS = {
-  items: [
-    { label: '1k', prompt_tokens: { min: 870, max: 1228 }, max_parallel: 128, built_in: true },
-    { label: '9k', prompt_tokens: { min: 8000, max: 11000 }, max_parallel: 128, built_in: true },
-    { label: '16k', prompt_tokens: { min: 14000, max: 18000 }, max_parallel: 128, built_in: true },
-    { label: '32k', prompt_tokens: { min: 28000, max: 36000 }, max_parallel: 128, built_in: true },
-    { label: '64k', prompt_tokens: { min: 56000, max: 72000 }, max_parallel: 64, built_in: true },
-    { label: '128k', prompt_tokens: { min: 112000, max: 144000 }, max_parallel: 32, built_in: true },
-    { label: '200k', prompt_tokens: { min: 180000, max: 220000 }, max_parallel: 16, built_in: true },
-    { label: '512k', prompt_tokens: { min: 500000, max: 540000 }, max_parallel: 8, built_in: false },
-    { label: '1m', prompt_tokens: { min: 980000, max: 1030000 }, max_parallel: 8, built_in: false },
-  ],
-  scenarios: [
-    { label: '9k_cold', bucket: '9k', note: '前缀缓存冷启动' },
-    { label: '9k_hot', bucket: '9k', note: '前缀缓存热命中' },
-    { label: '9k_mix50', bucket: '9k', note: '50% 前缀缓存混合' },
-  ],
-  default_ladder: [1, 8, 32, 64, 128],
-  number_by_parallel: { 1: 20, 4: 40, 8: 60, 16: 80, 32: 120, 64: 200, 128: 400 },
-};
-
-const MOCK_GATES = [{
-  profile: 'perf-sla-v1', capability: 'perf',
-  description: '按平均输入长度分档的 TTFT P50/P90 阈值 + 吞吐下限',
-  tiers: [
-    { tier: '<4K', prompt_tokens: { lo: 1000, hi: 4000 }, ttft_p50_max_sec: 2, ttft_p90_max_sec: 5 },
-    { tier: '<8K', prompt_tokens: { lo: 4000, hi: 8000 }, ttft_p50_max_sec: 2.5, ttft_p90_max_sec: 5 },
-    { tier: '<32K', prompt_tokens: { lo: 8000, hi: 32000 }, ttft_p50_max_sec: 4, ttft_p90_max_sec: 8 },
-    { tier: '<64K', prompt_tokens: { lo: 32000, hi: 64000 }, ttft_p50_max_sec: 8, ttft_p90_max_sec: 15 },
-    { tier: '<128K', prompt_tokens: { lo: 64000, hi: 128000 }, ttft_p50_max_sec: 15, ttft_p90_max_sec: 35 },
-    { tier: '<256K', prompt_tokens: { lo: 128000, hi: 256000 }, ttft_p50_max_sec: 30, ttft_p90_max_sec: 70 },
-  ],
-  global: { min_output_tokens_per_sec: 30, min_success_rate: 0.99 },
-}];
-
-const MOCK_TOOLS = [{
-  name: 'thvv', display_name: 'THVV TokenHub Vendor Verifier', version: '1.0.0', kind: 'subprocess',
-  capabilities: [
-    { name: 'perf', status: 'ga', description: '性能压测 1k~1m 档位 × 并发梯度' },
-    { name: 'eval', status: 'preview', description: '效果评测（LLM Judge + 多数据集）' },
-    { name: 'functional', status: 'planned', description: '功能测试（工具调用/长上下文）', available_at: 'v1.2' },
-  ],
-}];
-
-async function mockApi(method, path, body) {
-  await new Promise(r => setTimeout(r, 180 + Math.random() * 260));
-  const [p, qs] = path.split('?');
-  const parts = p.split('/').filter(Boolean);
-
-  if (method === 'GET' && p === '/auth/session') return { username: 'demo', roles: ['operator'] };
-  if (method === 'POST' && p === '/auth/login') return null;
-  if (method === 'POST' && p === '/auth/logout') return null;
-  if (method === 'GET' && p === '/meta') {
-    return {
-      server: { version: '1.0.0-mock', commit: 'mock', started_at: nowISO() },
-      capabilities: MOCK_TOOLS[0].capabilities.map(c => ({ name: c.name, status: c.status })),
-      limits: { max_concurrent_runs: 4, max_runs_queued: 32, run_ttl_hours: 720, sse_heartbeat_sec: 15 },
-    };
-  }
-  if (method === 'GET' && p === '/tools') return { items: MOCK_TOOLS };
-  if (method === 'GET' && p === '/catalog/buckets') return MOCK_BUCKETS;
-  if (method === 'GET' && p === '/catalog/gates') return { items: MOCK_GATES };
-  if (method === 'GET' && p === '/catalog/datasets') return { items: [{ name: 'aime26', display_name: 'AIME 2026', kind: 'text', needs_judge: false }] };
-
-  if (method === 'GET' && p === '/targets') return { items: mock.targets, has_more: false, next_cursor: null };
-  if (method === 'POST' && p === '/targets') {
-    const tok = body.tokenizer || guessTokenizer(body.model);
-    const t = {
-      target_id: 'tgt_' + (mock.seq++).toString().padStart(6, '0'),
-      ...body,
-      api_key: undefined,
-      api_key_hint: '••••••••' + String(body.api_key || '').slice(-4),
-      tokenizer: { value: tok, source: body.tokenizer ? 'explicit' : (tok ? 'auto_detected' : 'fallback'), cached: !!tok },
-      health: { status: 'unknown', checked_at: null },
-      created_at: nowISO(), updated_at: nowISO(),
-    };
-    if (mock.targets.some(x => x.name === t.name)) {
-      throw new ApiError({ title: 'Conflict', code: 'conflict', detail: '端点名称已存在：' + t.name }, 409);
-    }
-    mock.targets.unshift(t);
-    return t;
-  }
-  if (method === 'POST' && parts[0] === 'targets' && parts[2] === 'probe') {
-    const t = mock.targets.find(x => x.target_id === parts[1]);
-    const lat = 180 + Math.round(Math.random() * 400);
-    return {
-      target_id: parts[1], ok: false, checked_at: nowISO(), elapsed_ms: lat + 380,
-      checks: [
-        { name: 'protocol', ok: true, detail: t?.protocol || 'openai' },
-        { name: 'connectivity', ok: true, detail: `HTTP 200, first token ${lat}ms`, latency_ms: lat },
-        { name: 'tokenizer', ok: true, detail: `${t?.tokenizer?.value || 'auto'} cached` },
-        { name: 'datasets', ok: false, severity: 'warn', detail: '512k/1m 未构建（perf_zh_512k.jsonl 缺失）', missing: ['512k', '1m'] },
-      ],
-      engine: { name: 'thvv', version: '1.0.0-mock', python: '3.11.9', evalscope: '0.13.2' },
-    };
-  }
-
-  if (method === 'POST' && p === '/runs') {
-    const t = mock.targets.find(x => x.target_id === body.target_id) || {};
-    const { perStep } = computeSteps(body.plan);
-    const runId = 'run_' + (mock.seq++).toString().padStart(6, '0');
-    const run = {
-      run_id: runId, status: 'queued', tool: body.tool, capability: body.capability,
-      target: { target_id: t.target_id, model: t.model, vendor: t.vendor, protocol: t.protocol, api_url: t.api_url },
-      plan: { ...body.plan, steps_total: perStep.length },
-      gate: body.gate || null, report: body.report || {},
-      progress: { phase: 'queued', steps_total: perStep.length, steps_done: 0, percent: 0, elapsed_sec: 0, eta_sec: null },
-      steps: perStep.map((s, i) => ({ index: i, bucket: s.bucket, parallel: s.parallel, number: s.number, status: 'pending' })),
-      artifacts: [], created_at: nowISO(), started_at: null, finished_at: null,
-      labels: body.labels || {},
-    };
-    mock.runs[runId] = { run, perStep, canceled: false, listeners: [] };
-    setTimeout(() => driveMockRun(mock.runs[runId]), 500);
-    return run;
-  }
-
-  if (method === 'GET' && parts[0] === 'runs' && parts.length === 2) {
-    const entry = mock.runs[parts[1]];
-    if (!entry) throw new ApiError({ title: 'Not Found', code: 'not_found', detail: 'run 不存在' }, 404);
-    const run = entry.run;
-    return { ...run, progress: { ...run.progress, elapsed_sec: entry.startedAt ? Math.round((Date.now() - entry.startedAt) / 1000) : 0 } };
-  }
-  if (method === 'POST' && parts[0] === 'runs' && parts[2] === 'cancel') {
-    const entry = mock.runs[parts[1]];
-    if (entry) {
-      entry.canceled = true;
-      entry.run.status = 'canceled';
-      entry.run.finished_at = nowISO();
-      emitMock(entry, 'run.finished', { status: 'canceled', finished_at: entry.run.finished_at });
-    }
-    return { run_id: parts[1], status: 'canceled', canceled_at: nowISO() };
-  }
-  if (method === 'GET' && parts[0] === 'runs' && parts[2] === 'results') {
-    const entry = mock.runs[parts[1]];
-    if (!entry?.results) throw new ApiError({ title: 'Not ready', code: 'conflict', detail: '结果未就绪' }, 409);
-    return entry.results;
-  }
-  if (method === 'GET' && parts[0] === 'runs' && parts[2] === 'artifacts') {
-    const entry = mock.runs[parts[1]];
-    return { items: entry?.run.artifacts || [] };
-  }
-  if (method === 'GET' && p === '/runs') {
-    const items = Object.values(mock.runs).map(e => e.run).reverse();
-    const filtered = qs && new URLSearchParams(qs).get('status')
-      ? items.filter(r => r.status === new URLSearchParams(qs).get('status')) : items;
-    return { items: filtered, has_more: false, next_cursor: null };
-  }
-  throw new ApiError({ title: 'Not Found', code: 'not_found', detail: 'mock 未实现：' + method + ' ' + path }, 404);
-}
-
-function guessTokenizer(model) {
-  const m = String(model || '').toLowerCase();
-  const map = [
-    [/glm|chatglm/, 'zai-org/GLM-4.6'], [/deepseek/, 'deepseek-ai/DeepSeek-V3'],
-    [/minimax/, 'MiniMaxAI/MiniMax-M2'], [/kimi|moonshot/, 'moonshotai/Kimi-K2-Thinking'],
-    [/qwen|tongyi/, 'Qwen/Qwen3-235B-A22B'], [/llama/, 'meta-llama/Llama-3.1-8B-Instruct'],
-    [/claude|anthropic/, 'Xenova/gpt-4o'], [/gpt|openai/, 'Xenova/gpt-4o'],
-  ];
-  for (const [re, v] of map) if (re.test(m)) return v;
-  return null;
-}
-
-function emitMock(entry, type, data) {
-  entry.listeners.forEach(fn => fn(type, data));
-}
-
-function mockSubscribe(runId, onEvent) {
-  const entry = mock.runs[runId];
-  if (!entry) return () => { };
-  entry.listeners.push(onEvent);
-  onEvent('run.snapshot', entry.run);
-  return () => { entry.listeners = entry.listeners.filter(f => f !== onEvent); };
-}
-
-function driveMockRun(entry) {
-  const run = entry.run;
-  entry.startedAt = Date.now();
-  run.status = 'running';
-  emitMock(entry, 'run.started', { phase: 'preparing', at: nowISO(), engine: { pid: 48213 } });
-
-  const steps = entry.perStep;
-  let i = 0, tick = 0;
-
-  const next = () => {
-    if (entry.canceled) return;
-    if (i >= steps.length) return finalizeMock(entry);
-
-    const s = steps[i];
-    const info = bucketInfo(s.bucket) || { prompt_tokens: { max: 1000 } };
-    const scale = info.prompt_tokens.max / 1200;
-    const ttft = Math.round((0.28 * Math.pow(scale, 0.55)) * 100) / 100;
-    const tps = Math.round((42 / Math.pow(scale, 0.35)) * 10) / 10;
-    const dur = Math.round(6 + Math.pow(scale, 0.4) * 3 + Math.random() * 4);
-
-    if (tick === 0) {
-      emitMock(entry, 'step.started', { step_index: i, bucket: s.bucket, parallel: s.parallel, number: s.number });
-    }
-    tick++;
-    if (tick < 3) {
-      emitMock(entry, 'step.progress', {
-        step_index: i, completed: Math.round(s.number * tick / 3), total: s.number,
-        success_rate: 1, ttft_p50_sec: ttft,
-      });
-      return setTimeout(next, 320);
-    }
-
-    const successRate = Math.random() < 0.08 ? 0.9721 : 1;
-    const step = run.steps[i];
-    Object.assign(step, {
-      status: successRate < 1 ? 'failed' : 'succeeded',
-      success_rate: successRate, ttft_p50_sec: ttft, output_tps: tps, duration_sec: dur,
-    });
-    emitMock(entry, 'step.finished', {
-      step_index: i, status: step.status, success_rate: successRate,
-      output_tps: tps, duration_sec: dur, ttft_p50_sec: ttft,
-    });
-    emitMock(entry, 'run.log', { line: `[${new Date().toLocaleTimeString()}] bucket=${s.bucket} parallel=${s.parallel} success_rate=${(successRate * 100).toFixed(2)}%` });
-
-    run.progress.steps_done = i + 1;
-    run.progress.current = null;
-    run.progress.percent = Math.round((i + 1) / steps.length * 100);
-    run.progress.elapsed_sec = Math.round((Date.now() - entry.startedAt) / 1000);
-    run.progress.eta_sec = Math.round(run.progress.elapsed_sec / (i + 1) * (steps.length - i - 1));
-    emitMock(entry, 'run.progress', run.progress);
-
-    i++; tick = 0;
-    setTimeout(next, 200);
-  };
-  setTimeout(next, 400);
-}
-
-function finalizeMock(entry) {
-  const run = entry.run;
-  const ok = run.steps.filter(s => s.status === 'succeeded').length;
-  const failed = run.steps.length - ok;
-  run.status = failed ? 'partial' : 'succeeded';
-  run.finished_at = nowISO();
-  run.artifacts = [
-    { artifact_id: 'art_' + (mock.seq++), kind: 'html_report', filename: '性能测试报告.html', size_bytes: 482113, download_url: '#/run/' + run.run_id },
-    { artifact_id: 'art_' + (mock.seq++), kind: 'xlsx_report', filename: '性能测试报告.xlsx', size_bytes: 31240, download_url: '#/run/' + run.run_id },
-    { artifact_id: 'art_' + (mock.seq++), kind: 'raw_db', filename: 'benchmark_data.db', size_bytes: 2411230, download_url: '#/run/' + run.run_id },
-  ];
-
-  const steps = run.steps;
-  const ttfts = steps.map(s => s.ttft_p50_sec).filter(Boolean).sort((a, b) => a - b);
-  const pct = (arr, p) => arr.length ? arr[Math.min(arr.length - 1, Math.floor(arr.length * p))] : null;
-
-  const gateResult = run.gate ? {
-    passed: failed === 0,
-    profile: run.gate.profile,
-    violations: failed ? [{ scope: 'step', bucket: steps.find(s => s.status === 'failed')?.bucket, rule: 'min_success_rate', actual: 0.9721, threshold: 0.99, message: '成功率 97.21% < 99%' }] : [],
-    tier_summary: MOCK_GATES[0].tiers.slice(0, 4).map((t, idx) => ({
-      tier: t.tier, steps: Math.max(1, Math.round(steps.length / 4)),
-      p50_max_sec: Number((0.4 + idx * 1.6).toFixed(2)),
-      p90_max_sec: Number((1.1 + idx * 4.2).toFixed(2)),
-      passed: idx < 3,
-    })),
-  } : null;
-
-  entry.results = {
-    run_id: run.run_id, capability: 'perf',
-    gate_result: gateResult,
-    summary: {
-      steps_total: steps.length, steps_succeeded: ok, steps_failed: failed,
-      success_rate: steps.reduce((a, s) => a + (s.success_rate || 0), 0) / steps.length,
-      peak_output_tps: Math.max(...steps.map(s => s.output_tps || 0)),
-      tpm_peak: 6120000,
-      ttft_p50_sec: pct(ttfts, 0.5), ttft_p90_sec: pct(ttfts, 0.9), tpot_ms: 18.7,
-      verdict: failed ? 'conditional_pass' : 'pass',
-    },
-    metrics: { per_step: steps.map((s, i) => ({
-      step_index: i, bucket: s.bucket, parallel: s.parallel, number: s.number,
-      requests: { total: s.number, success: Math.round(s.number * (s.success_rate || 1)), failed: 0, success_rate: s.success_rate },
-      ttft: { avg_sec: s.ttft_p50_sec, p50_sec: s.ttft_p50_sec, p90_sec: (s.ttft_p50_sec || 0) * 1.4 },
-      throughput: { output_tps: s.output_tps, tpm: Math.round((s.output_tps || 0) * 1200) },
-      duration_sec: s.duration_sec,
-    })) },
-  };
-
-  if (gateResult) emitMock(entry, 'run.gate', gateResult);
-  emitMock(entry, 'run.finished', { status: run.status, finished_at: run.finished_at, artifacts: run.artifacts });
 }
 
 /* ---------------------------------------------------------------- 启动 */

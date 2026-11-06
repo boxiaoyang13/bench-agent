@@ -36,6 +36,15 @@ make run   CONFIG=./config/thvv.example.yaml
 `config/thvv.example.yaml` 里所有路径都用根前缀（`thvv:perf`、`data:runs`、`bin:python`），
 **THVV 换位置只改 `roots.thvv` 一处**，或直接用 `-thvv-home /path`。
 
+本机联调可用 `config/thvv.dev.yaml`（venv 不在 `thvv/` 下的布局，用自定义根 `venv:`）：
+
+```bash
+cd server
+export THVV_SECRET_KEY=$(openssl rand -base64 32)
+make check CONFIG=./config/thvv.dev.yaml
+make run   CONFIG=./config/thvv.dev.yaml     # http://127.0.0.1:18080/ui/
+```
+
 ## 目录结构
 
 ```
@@ -62,6 +71,7 @@ make run   CONFIG=./config/thvv.example.yaml
     │   └── embed.go              //go:embed → web.Assets
     ├── config/
     │   ├── thvv.local.yaml       本地联调（builtin 模拟引擎）
+    │   ├── thvv.dev.yaml         本地联调（subprocess 真实引擎，venv 在仓库根）
     │   └── thvv.example.yaml     生产示例（subprocess 引擎）
     ├── go.mod / go.sum           模块 github.com/apexcloud/thvv/server
     ├── Makefile                  dev / run / check / test / test-race
@@ -81,15 +91,16 @@ make run   CONFIG=./config/thvv.example.yaml
 | SSE 进度流（`Last-Event-ID` 断点续传 + 心跳） | ✅ |
 | 报告：HTML / 45 列 xlsx / 失败 CSV / SLA json | ✅ |
 | Web 页面（登录、三步向导、运行监控、结果、历史、能力清单） | ✅ |
-| 引擎：`builtin` 模拟 / `subprocess` evalscope | ✅（subprocess 未做端到端联调，见下） |
+| 引擎：`builtin` 模拟 / `subprocess` evalscope | ✅（subprocess 已端到端联调，见下） |
 | `capability=eval` / `functional` | ⏳ 预留（返回 `501 not_implemented` + `available_at`） |
 | `kind: http` 外部工具代理 | ⏳ v1.1 |
 | `POST /v1/runs/{id}/reports` 重新生成 | ⚠️ 占位返回 202（v1 复用跑完时的产物） |
 
-> **subprocess 引擎说明**：代码完整实现了 `evalscope perf` 的 argv 构造、进程组取消、
-> stdout 解析与产物回读，但**未在真实 Python 环境做端到端调试**（按当前阶段要求）。
-> 上线前需按 [`docs/DESIGN.md`](docs/DESIGN.md) §9.1 做一次「双跑对账」：
-> 同一 target/数据集下，Go 侧指标与 `bash run.sh bench` 的 xlsx **逐格一致**。
+> **subprocess 引擎说明**：已按 [`docs/DESIGN.md`](docs/DESIGN.md) §9.1 做过「双跑对账」：
+> 同一 `benchmark_data.db` 下，Go 侧 `/results.metrics` 与
+> `perf/scripts/gen_report_from_db.py` 生成的 xlsx 数值列相对误差 < 1e-6。
+> 已知限制：evalscope 1.9.x 的 `result` 表不写 `error`/`status_code`，失败明细只能
+> 给出兜底说明（与 Python 报告同源）；需要精确失败原因请升级/回退到落这两列的 evalscope 版本。
 
 ## 测试
 

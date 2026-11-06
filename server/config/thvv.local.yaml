@@ -39,7 +39,7 @@ auth:
     - { name: dev, token: "${THVV_DEV_TOKEN:-dev-token}", role: admin }
   users:
     - username: admin
-      password_hash: "${THVV_ADMIN_HASH:-$2a$10$IBU8oAPb/vYyjaHjJHAhMuaUS9nblXw3MuVZLit8R88wEZEZ.e9xC}"
+      password_hash: "${THVV_ADMIN_HASH:-$2y$10$PD.2SBpyhJ242eegpFO82OoiwiDgV/4jy65DxNQxeU08LuC6PTfVi}"
       role: admin
 
 store:

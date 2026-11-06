@@ -327,7 +327,8 @@ const (
 	StepRunning   StepStatus = "running"
 	StepSucceeded StepStatus = "succeeded"
 	StepFailed    StepStatus = "failed"
-	StepSkipped   StepStatus = "skipped"
+	StepSkipped   StepStatus = "skipped"  // 未开始就结束（取消/前序失败）
+	StepCanceled  StepStatus = "canceled" // 已开始的被中断
 )
 
 type Step struct {
@@ -510,8 +511,14 @@ type TTFTStats struct {
 type Scalar struct {
 	AvgSec float64 `json:"avg_sec,omitempty"`
 	AvgMs  float64 `json:"avg_ms,omitempty"`
+	P50Sec float64 `json:"p50_sec,omitempty"`
+	P90Sec float64 `json:"p90_sec,omitempty"`
+	P95Sec float64 `json:"p95_sec,omitempty"`
+	P99Sec float64 `json:"p99_sec,omitempty"`
 	P50Ms  float64 `json:"p50_ms,omitempty"`
 	P90Ms  float64 `json:"p90_ms,omitempty"`
+	P95Ms  float64 `json:"p95_ms,omitempty"`
+	P99Ms  float64 `json:"p99_ms,omitempty"`
 }
 
 type Throughput struct {
@@ -544,6 +551,7 @@ type StepMetrics struct {
 	Throughput   Throughput     `json:"throughput"`
 	Tokens       TokenSums      `json:"tokens"`
 	TokenRateAvg float64        `json:"token_rate_avg"`
+	TokenRate    Scalar         `json:"token_rate,omitempty"` // 逐请求输出速率的分位数（t/s）
 	DurationSec  float64        `json:"duration_sec"`
 	Failures     map[string]int `json:"failures,omitempty"`
 	RawDB        string         `json:"raw_db,omitempty"`
@@ -555,15 +563,18 @@ type PerfMetrics struct {
 }
 
 type FailureItem struct {
-	StepIndex           int    `json:"step_index"`
-	Bucket              string `json:"bucket"`
-	Parallel            int    `json:"parallel"`
-	RequestIndex        int    `json:"request_index"`
-	Reason              string `json:"reason"`
-	HTTPStatus          *int   `json:"http_status"`
-	Error               string `json:"error,omitempty"`
-	RequestBodyExcerpt  string `json:"request_body_excerpt,omitempty"`
-	ResponseBodyExcerpt string `json:"response_body_excerpt,omitempty"`
+	StepIndex           int      `json:"step_index"`
+	Bucket              string   `json:"bucket"`
+	Parallel            int      `json:"parallel"`
+	RequestIndex        int      `json:"request_index"`
+	Reason              string   `json:"reason"`
+	HTTPStatus          *int     `json:"http_status"`
+	Error               string   `json:"error,omitempty"`
+	Detail              string   `json:"detail,omitempty"`   // 错误摘要（140 字符内，写入报告「详细说明」）
+	TTFTSec             *float64 `json:"ttft_sec,omitempty"` // 失败请求若已收到首包
+	TTLTSec             *float64 `json:"ttlt_sec,omitempty"` // 失败请求的总耗时
+	RequestBodyExcerpt  string   `json:"request_body_excerpt,omitempty"`
+	ResponseBodyExcerpt string   `json:"response_body_excerpt,omitempty"`
 }
 
 // RunResults 是 GET /v1/runs/{id}/results 的响应体。

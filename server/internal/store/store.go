@@ -518,6 +518,25 @@ func (s *Store) AddArtifact(ctx context.Context, runID string, a domain.Artifact
 	return err
 }
 
+// PutArtifact 幂等写入产物：同 run + kind + filename 已存在时原地更新（保留 artifact_id，
+// 下载链接不变），供「重新生成报告」复用。
+func (s *Store) PutArtifact(ctx context.Context, runID string, a domain.Artifact) error {
+	var id string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT artifact_id FROM artifacts WHERE run_id=? AND kind=? AND filename=?`,
+		runID, string(a.Kind), a.Filename).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return s.AddArtifact(ctx, runID, a)
+	}
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE artifacts SET content_type=?,size_bytes=?,sha256=?,path=?,created_at=?
+		WHERE artifact_id=?`,
+		a.ContentType, a.SizeBytes, a.SHA256, a.Path, ts(a.CreatedAt), id)
+	return err
+}
+
 func (s *Store) ListArtifacts(ctx context.Context, runID string) ([]domain.Artifact, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT artifact_id,kind,filename,content_type,size_bytes,sha256,path,created_at
 		FROM artifacts WHERE run_id=? ORDER BY created_at`, runID)

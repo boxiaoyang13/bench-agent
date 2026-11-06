@@ -41,7 +41,6 @@
       <button class="btn primary block" type="submit">登录</button>
     </form>
     <p class="hint" id="login-hint"></p>
-    <p class="hint"><a href="?mock=1#/new">以演示模式进入（无需服务端）</a></p>
   </div>
 </section>
 
@@ -63,9 +62,9 @@
     </div>
 
     <div class="grid-2">
-      <label class="field">供应商名称
-        <input id="f-vendor" placeholder="如 zhipu / 智谱" autocomplete="off">
-        <small>用于报告署名与目录命名</small>
+      <label class="field"><span class="field-label">测试名称 <span class="req">*</span></span>
+        <input id="f-vendor" placeholder="如 zhipu / 智谱" autocomplete="off" required>
+        <small>必填：用于报告署名与目录命名</small>
       </label>
       <label class="field">端点别名
         <input id="f-name" placeholder="如 zhipu-glm52-prod" autocomplete="off">
@@ -215,7 +214,7 @@
     <h3 class="section-title">报告</h3>
     <div class="grid-3">
       <label class="field">署名（写入报告）
-        <input id="r-client" placeholder="供应商名称" autocomplete="off">
+        <input id="r-client" placeholder="测试名称" autocomplete="off">
       </label>
       <label class="field">报告标题
         <input id="r-title" placeholder="留空自动生成" autocomplete="off">

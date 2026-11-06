@@ -104,6 +104,10 @@ label{display:block}
 
 .field{display:flex;flex-direction:column;gap:5px;margin-bottom:14px;font-size:13px;font-weight:500;color:var(--ink-2)}
 .field small{font-weight:400;color:var(--muted);font-size:11.5px}
+.field .req{color:var(--err);font-weight:600}
+/* 标题必须包在单个元素里：.field 是 flex 容器，裸文本 + <span> 会各自成为 flex item，
+   导致「*」独占一行、下面的输入框比同排字段低一行（与端点别名不对齐）。 */
+.field > .field-label{display:block}
 .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:0 16px}
 .grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:0 16px}
 @media (max-width:760px){.grid-2,.grid-3{grid-template-columns:1fr}}

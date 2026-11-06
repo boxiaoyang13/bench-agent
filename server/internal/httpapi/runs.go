@@ -380,33 +380,24 @@ func (s *Server) handleRunArtifacts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"items": arts})
 }
 
-// handleRegenerateReports 重新生成报告（异步，不改 run 状态）。
+// handleRegenerateReports 从已落库的 benchmark_data.db 重新生成报告产物（不重跑压测）。
 func (s *Server) handleRegenerateReports(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("run_id")
-	run, err := s.mgr.Get(r.Context(), runID, true)
-	if err != nil {
-		writeProblem(w, r, errProblem(err))
-		return
-	}
 	var body domain.ReportSpec
 	if r.ContentLength > 0 {
 		if !s.decode(w, r, &body) {
 			return
 		}
 	}
-	if len(body.Formats) == 0 {
-		body.Formats = run.Report.Formats
+	// 只接受报告相关字段；未指定格式则沿用 run 的配置
+	arts, err := s.mgr.RegenerateReports(r.Context(), runID, body.Formats)
+	if err != nil {
+		writeProblem(w, r, errProblem(err))
+		return
 	}
-	if len(body.Formats) == 0 {
-		body.Formats = s.cfg.Reports.DefaultFormats
-	}
-	jobID := newID("rpt")
-	go func() {
-		// 简化实现：同步重算一次产物（v1 不排队）
-		_, _ = run, body
-	}()
-	writeJSON(w, http.StatusAccepted, map[string]any{"report_job_id": jobID, "run_id": runID,
-		"note": "v1 会复用 run 结束时的产物；如需重新生成请重跑任务"})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"run_id": runID, "artifacts": arts, "note": "已基于原始 benchmark_data.db 重新生成",
+	})
 }
 
 // handleDownloadArtifact 流式下载交付物。

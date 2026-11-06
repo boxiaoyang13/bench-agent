@@ -369,7 +369,7 @@ func (m *Manager) execute(ctx context.Context, runID string) {
 		Target: engine.ResolvedTarget{
 			TargetID: run.Target.TargetID, Vendor: run.Target.Vendor, Model: run.Target.Model,
 			APIURL: run.Target.APIURL, Protocol: run.Target.Protocol, APIKey: apiKey,
-			Tokenizer: m.tokenizerOf(run), MaxTokens: m.maxTokensOf(run),
+			Tokenizer: m.tokenizerOf(runCtx, run), MaxTokens: m.maxTokensOf(run),
 			ConnectTimeout: 60 * time.Second, ReadTimeout: 600 * time.Second,
 		},
 		Plan:        run.Plan,
@@ -377,12 +377,24 @@ func (m *Manager) execute(ctx context.Context, runID string) {
 		WorkDir:     filepath.Join(string(m.cfg.Paths.RunsDir), runID),
 		DatasetsDir: string(m.cfg.Paths.DatasetsDir),
 	}
-	for _, b := range m.buckets() {
-		if !b.BuiltIn {
-			if spec.LongBuckets == nil {
-				spec.LongBuckets = map[string]bool{}
+	// 长档位（512k/1m）的 token 计数必须用数据集构建时的分词器（对齐 run.sh 的
+	// DATASET_TOKENIZER），显式配置 long_buckets 优先；未配置时回退为
+	// dataset_built_in=false 的档位（历史行为）。
+	if perf := m.perfCapability(run.Tool); perf != nil {
+		spec.DatasetTokenizer = perf.DatasetTokenizer
+		if len(perf.LongBuckets) > 0 {
+			spec.LongBuckets = map[string]bool{}
+			for _, label := range perf.LongBuckets {
+				spec.LongBuckets[label] = true
 			}
-			spec.LongBuckets[b.Label] = true
+		}
+	}
+	if spec.LongBuckets == nil {
+		for _, b := range m.buckets() {
+			if !b.BuiltIn {
+				spec.LongBuckets = map[string]bool{}
+				spec.LongBuckets[b.Label] = true
+			}
 		}
 	}
 	if err := os.MkdirAll(filepath.Join(spec.WorkDir, "logs"), 0o755); err != nil {
@@ -396,18 +408,28 @@ func (m *Manager) execute(ctx context.Context, runID string) {
 		m.onEngineEvent(runCtx, lr, ev)
 	})
 
+	// 引擎返回的 step 结果更权威（含最终状态与 benchmark_data.db 路径）：
+	// 事件流只带聚合指标，不合并的话 db_path 会永远为空，导致
+	// /results/failures 与失败请求明细表取不到任何数据。
+	for _, st := range res.Steps {
+		m.updateStep(runCtx, lr, st.Index, func(dst *domain.Step) { *dst = st })
+	}
+
 	// 3) 结果处理
 	switch {
 	case errors.Is(runErr, context.Canceled):
+		m.settleUnfinishedSteps(runCtx, lr)
 		m.setStatus(runCtx, lr, domain.StatusCanceled)
 		m.report(runCtx, lr, res)
 		m.finish(runCtx, lr, domain.StatusCanceled, nil)
 		return
 	case errors.Is(runCtx.Err(), context.DeadlineExceeded):
+		m.settleUnfinishedSteps(runCtx, lr)
 		m.report(runCtx, lr, res)
 		m.finish(runCtx, lr, domain.StatusFailed, domain.NewProblem(504, "engine_timeout", "超过单次运行时长上限"))
 		return
 	case runErr != nil:
+		m.settleUnfinishedSteps(runCtx, lr)
 		m.report(runCtx, lr, res)
 		m.finish(runCtx, lr, domain.StatusFailed, domain.NewProblem(500, "engine_failed", runErr.Error()))
 		return
@@ -540,6 +562,7 @@ func (m *Manager) report(ctx context.Context, lr *liveRun, res engine.Result) {
 				}
 			}
 			if mm, _, err := report.LoadStepMetrics(res.DBPaths[i], st); err == nil {
+				mm.RawDB = res.DBPaths[i]
 				metrics = append(metrics, mm)
 			}
 		}
@@ -581,11 +604,144 @@ func (m *Manager) report(ctx context.Context, lr *liveRun, res engine.Result) {
 	}
 
 	// 产物
+	failures := collectFailures(res, steps, m.cfg.Reports.FailureExcerptChars)
+	formats := run.Report.Formats
+	if len(formats) == 0 {
+		formats = m.cfg.Reports.DefaultFormats
+	}
+	m.writeReportArtifacts(ctx, run, steps, metrics, gate, failures, formats)
+
+	// 原始 db 与日志（仅在首次跑完时归档）
+	artDir := filepath.Join(string(m.cfg.Paths.RunsDir), run.ID, "artifacts")
+	for _, p := range res.DBPaths {
+		if b, err := os.ReadFile(p); err == nil {
+			m.addArtifact(ctx, run.ID, "benchmark_data.db", domain.ArtRawDB, "application/x-sqlite3", b, artDir)
+			break
+		}
+	}
+	if res.LogPath != "" {
+		if b, err := os.ReadFile(res.LogPath); err == nil {
+			m.addArtifact(ctx, run.ID, "run.log", domain.ArtRunLog, "text/plain; charset=utf-8", b, artDir)
+		}
+	}
+}
+
+// findStepDB 在 run 目录里按档位找回 benchmark_data.db（历史 run 的 db_path 可能为空）。
+func findStepDB(runDir, bucket string) string {
+	var anyDB string
+	_ = filepath.Walk(runDir, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info == nil {
+			return nil
+		}
+		if info.IsDir() {
+			if info.Name() == "artifacts" || info.Name() == "logs" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if info.Name() != "benchmark_data.db" {
+			return nil
+		}
+		if anyDB == "" {
+			anyDB = p
+		}
+		if bucket != "" && strings.Contains(p, string(filepath.Separator)+"perf-"+bucket+"-") {
+			anyDB = p
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return anyDB
+}
+
+// RegenerateReports 用已落库的 steps 与 benchmark_data.db 重新生成交付物。
+// 不重跑压测、不改 run 状态，用于报告模板/口径修正后补生成历史 run。
+func (m *Manager) RegenerateReports(ctx context.Context, runID string, formats []string) ([]domain.Artifact, error) {
+	run, err := m.st.GetRun(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	steps, err := m.st.ListSteps(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+
+	runDir := filepath.Join(string(m.cfg.Paths.RunsDir), runID)
+	metrics := make([]domain.StepMetrics, 0, len(steps))
+	repaired := make([]domain.Step, 0, len(steps))
+	for _, st := range steps {
+		if st.DBPath == "" {
+			// 历史 run 可能没把 db_path 落库（修复前创建的），按档位目录名回找一次
+			st.DBPath = findStepDB(runDir, st.Bucket)
+			repaired = append(repaired, st)
+		}
+		if st.DBPath == "" {
+			continue
+		}
+		if mm, _, e := report.LoadStepMetrics(st.DBPath, st); e == nil {
+			mm.RawDB = st.DBPath
+			metrics = append(metrics, mm)
+		}
+	}
+	for _, st := range repaired {
+		if st.DBPath != "" {
+			_ = m.st.UpsertStep(ctx, runID, st)
+		}
+	}
+	if len(metrics) == 0 { // 回落到 run 结束时落盘的 metrics.json
+		p := filepath.Join(runDir, "metrics.json")
+		if b, e := os.ReadFile(p); e == nil {
+			_ = json.Unmarshal(b, &metrics)
+		}
+	}
+
+	var gate *domain.GateResult
+	if run.Gate != nil && run.Gate.Profile != "" {
+		gate = report.EvaluateGate(m.cfg.Gates.Profiles[run.Gate.Profile], metrics)
+		if gate != nil {
+			gate.Profile = run.Gate.Profile
+		}
+	}
+	summary := report.BuildSummary(steps, metrics, gate)
+
+	dctx, dcancel := detached(ctx)
+	_ = m.st.UpdateRun(dctx, runID, store.RunState{
+		Status: run.Status, StepsTotal: len(steps), StepsDone: countDone(steps),
+		GateResult: gate, Summary: summary, Error: run.Error, Engine: run.Engine,
+		StartedAt: run.StartedAt, FinishedAt: run.FinishedAt,
+	})
+	dcancel()
+	run.GateResult, run.Summary = gate, summary
+
+	var failures []domain.FailureItem
+	for _, st := range steps {
+		if st.DBPath == "" {
+			continue
+		}
+		if items, e := report.LoadFailures(st.DBPath, st, m.cfg.Reports.FailureExcerptChars); e == nil {
+			failures = append(failures, items...)
+		}
+	}
+
+	if len(formats) == 0 {
+		formats = run.Report.Formats
+	}
+	if len(formats) == 0 {
+		formats = m.cfg.Reports.DefaultFormats
+	}
+	m.writeReportArtifacts(ctx, run, steps, metrics, gate, failures, formats)
+	return m.st.ListArtifacts(ctx, runID)
+}
+
+// writeReportArtifacts 生成/覆盖 HTML、xlsx、失败 CSV、SLA json。
+// 首次跑完与 POST /runs/{id}/reports 重新生成共用这一段，保证口径一致。
+func (m *Manager) writeReportArtifacts(ctx context.Context, run *domain.Run, steps []domain.Step,
+	metrics []domain.StepMetrics, gate *domain.GateResult, failures []domain.FailureItem, formats []string) {
+
 	artDir := filepath.Join(string(m.cfg.Paths.RunsDir), run.ID, "artifacts")
 	_ = os.MkdirAll(artDir, 0o755)
 
-	failures := collectFailures(res, steps, m.cfg.Reports.FailureExcerptChars)
-
+	summary := report.BuildSummary(steps, metrics, gate)
 	htmlIn := report.HTMLInput{
 		Title:       m.reportTitle(run, steps),
 		Model:       run.Target.Model,
@@ -601,11 +757,6 @@ func (m *Manager) report(ctx context.Context, lr *liveRun, res engine.Result) {
 		Steps:       steps,
 		Metrics:     metrics,
 		Failures:    failures,
-	}
-
-	formats := run.Report.Formats
-	if len(formats) == 0 {
-		formats = m.cfg.Reports.DefaultFormats
 	}
 	for _, f := range formats {
 		switch f {
@@ -625,6 +776,7 @@ func (m *Manager) report(ctx context.Context, lr *liveRun, res engine.Result) {
 				Company:       run.Report.ClientName,
 				GeneratedAt:   time.Now().UTC(),
 				Gate:          gate,
+				APIURL:        run.Target.APIURL,
 				Metrics:       metrics,
 				Failures:      failures,
 			}); err == nil {
@@ -641,22 +793,9 @@ func (m *Manager) report(ctx context.Context, lr *liveRun, res engine.Result) {
 			}
 		}
 	}
-	// SLA json
 	if gate != nil {
 		if b, err := json.MarshalIndent(gate, "", "  "); err == nil {
 			m.addArtifact(ctx, run.ID, "sla_evaluation.json", domain.ArtSLAJSON, "application/json", b, artDir)
-		}
-	}
-	// 原始 db 与日志
-	for _, p := range res.DBPaths {
-		if b, err := os.ReadFile(p); err == nil {
-			m.addArtifact(ctx, run.ID, "benchmark_data.db", domain.ArtRawDB, "application/x-sqlite3", b, artDir)
-			break
-		}
-	}
-	if res.LogPath != "" {
-		if b, err := os.ReadFile(res.LogPath); err == nil {
-			m.addArtifact(ctx, run.ID, "run.log", domain.ArtRunLog, "text/plain; charset=utf-8", b, artDir)
 		}
 	}
 }
@@ -674,7 +813,7 @@ func (m *Manager) addArtifact(ctx context.Context, runID, filename string, kind 
 		Path: p, DownloadURL: "",
 	}
 	dctx, dcancel := detached(ctx)
-	err := m.st.AddArtifact(dctx, runID, a)
+	err := m.st.PutArtifact(dctx, runID, a)
 	dcancel()
 	if err != nil {
 		m.log.Warn("记录产物失败", "err", err)
@@ -690,16 +829,38 @@ func (m *Manager) addArtifact(ctx context.Context, runID, filename string, kind 
 }
 
 // finish 落终态并广播。
+// settleUnfinishedSteps 把「运行中」标成 canceled、「待执行」标成 skipped，
+// 避免取消/超时后步骤永远停在 running/pending。
+func (m *Manager) settleUnfinishedSteps(ctx context.Context, lr *liveRun) {
+	lr.mu.Lock()
+	var updates []domain.Step
+	for i := range lr.run.Steps {
+		switch lr.run.Steps[i].Status {
+		case domain.StepRunning:
+			lr.run.Steps[i].Status = domain.StepCanceled
+			updates = append(updates, lr.run.Steps[i])
+		case domain.StepPending:
+			lr.run.Steps[i].Status = domain.StepSkipped
+			updates = append(updates, lr.run.Steps[i])
+		}
+	}
+	lr.mu.Unlock()
+	dctx, dcancel := detached(ctx)
+	defer dcancel()
+	for _, st := range updates {
+		_ = m.st.UpsertStep(dctx, lr.run.ID, st)
+	}
+}
+
 func (m *Manager) finish(ctx context.Context, lr *liveRun, status domain.RunStatus, prob *domain.Problem) {
 	now := time.Now().UTC()
 	lr.mu.Lock()
 	lr.run.Status = status
 	lr.run.FinishedAt = &now
 	lr.run.Error = prob
-	if status == domain.StatusSucceeded || status == domain.StatusPartial {
-		lr.run.Progress.Percent = 100
-		lr.run.Progress.StepsDone = countDone(lr.run.Steps)
-	}
+	// 任何终态都应收口：进度 100%，StepsDone 只统计真正结束的 step
+	lr.run.Progress.Percent = 100
+	lr.run.Progress.StepsDone = countDone(lr.run.Steps)
 	arts := lr.run.Artifacts
 	summary := lr.run.Summary
 	gate := lr.run.GateResult
@@ -802,7 +963,14 @@ func (m *Manager) targetKey(ctx context.Context, run *domain.Run) (string, error
 	return m.box.Decrypt(t.APIKeyEnc)
 }
 
-func (m *Manager) tokenizerOf(run *domain.Run) string {
+func (m *Manager) tokenizerOf(ctx context.Context, run *domain.Run) string {
+	// 优先用 Target 上已固定下来的 tokenizer（创建时解析：显式指定或自动推断）。
+	// 不能每次按 model 名重推，否则显式设置的 tokenizer 会被忽略（如 GLM-5.3 被推成 GLM-4.6）。
+	if run.Target.TargetID != "" {
+		if t, err := m.st.GetTarget(ctx, run.Target.TargetID); err == nil && t.Tokenizer != nil && t.Tokenizer.Value != "" {
+			return t.Tokenizer.Value
+		}
+	}
 	perf := m.perfCapability(run.Tool)
 	if perf == nil {
 		return ""
@@ -823,6 +991,14 @@ func (m *Manager) maxTokensOf(run *domain.Run) int {
 		return perf.Defaults.MaxTokens
 	}
 	return 4096
+}
+
+// profileOf 返回该 run 使用的 SLA 阈值档（供报告逐行回填）。
+func (m *Manager) profileOf(run *domain.Run) *config.GateProfile {
+	if run.Gate == nil || run.Gate.Profile == "" {
+		return m.cfg.Gates.Profiles[m.cfg.Gates.DefaultProfile]
+	}
+	return m.cfg.Gates.Profiles[run.Gate.Profile]
 }
 
 func (m *Manager) perfCapability(tool string) *config.Capability {
@@ -1021,10 +1197,11 @@ func hasFailedStep(lr *liveRun) bool {
 	return false
 }
 
+// countDone 统计「真正执行过」的 step：skipped（未开始）不计入。
 func countDone(steps []domain.Step) int {
 	n := 0
 	for _, s := range steps {
-		if s.Status == domain.StepSucceeded || s.Status == domain.StepFailed || s.Status == domain.StepSkipped {
+		if s.Status == domain.StepSucceeded || s.Status == domain.StepFailed || s.Status == domain.StepCanceled {
 			n++
 		}
 	}

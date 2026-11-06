@@ -237,7 +237,7 @@ func TestDefaults(t *testing.T) {
 	if len(perf.Buckets) != 9 {
 		t.Fatalf("默认档位数应为 9，实际 %d", len(perf.Buckets))
 	}
-	if perf.Buckets[6].Label != "200k" || perf.Buckets[6].MaxParallel != 16 {
+	if perf.Buckets[6].Label != "200k" || perf.Buckets[6].MaxParallel != 64 {
 		t.Fatalf("200k 档位默认值错误: %+v", perf.Buckets[6])
 	}
 	if perf.Buckets[8].DatasetBuiltIn == nil || *perf.Buckets[8].DatasetBuiltIn {

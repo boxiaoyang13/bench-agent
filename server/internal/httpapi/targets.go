@@ -135,9 +135,12 @@ func (s *Server) tokenizerCached(name string) bool {
 	}
 	candidates := []string{
 		base + "/huggingface/hub/models--" + strings.ReplaceAll(name, "/", "--"),
+		base + "/huggingface/" + name,
+		// ModelScope 1.38+ 的落盘布局：<cache>/models/<org>--<model>
+		base + "/modelscope/models/" + strings.ReplaceAll(name, "/", "--"),
+		base + "/modelscope/hub/models/" + strings.ReplaceAll(name, "/", "--"),
 		base + "/modelscope/hub/" + name,
 		base + "/modelscope/" + name,
-		base + "/huggingface/" + name,
 	}
 	for _, c := range candidates {
 		if _, err := statDir(c); err == nil {

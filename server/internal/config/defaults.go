@@ -247,10 +247,10 @@ func defaultBuckets() []BucketCfg {
 		{Label: "9k", Min: 8000, Max: 11000, MaxParallel: 128},
 		{Label: "16k", Min: 14000, Max: 18000, MaxParallel: 128},
 		{Label: "32k", Min: 28000, Max: 36000, MaxParallel: 128},
-		{Label: "64k", Min: 56000, Max: 72000, MaxParallel: 64},
-		{Label: "128k", Min: 112000, Max: 144000, MaxParallel: 32},
-		{Label: "200k", Min: 180000, Max: 220000, MaxParallel: 16},
-		{Label: "512k", Min: 500000, Max: 540000, MaxParallel: 8, DatasetBuiltIn: boolPtr(false)},
+		{Label: "64k", Min: 56000, Max: 72000, MaxParallel: 128},
+		{Label: "128k", Min: 112000, Max: 144000, MaxParallel: 64},
+		{Label: "200k", Min: 180000, Max: 220000, MaxParallel: 64},
+		{Label: "512k", Min: 500000, Max: 540000, MaxParallel: 32, DatasetBuiltIn: boolPtr(false)},
 		{Label: "1m", Min: 980000, Max: 1030000, MaxParallel: 8, DatasetBuiltIn: boolPtr(false)},
 	}
 }

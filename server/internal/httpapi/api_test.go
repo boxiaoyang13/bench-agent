@@ -386,6 +386,32 @@ func TestFullFlow(t *testing.T) {
 		t.Fatal("缺少 ETag")
 	}
 
+	// 重新生成报告：应原地更新（artifact_id 不变），并返回 200
+	oldIDs := map[string]string{}
+	for _, a := range arts.Items {
+		oldIDs[a.Kind] = a.ID
+	}
+	resp, body = h.do("POST", "/runs/"+runID+"/reports", map[string]any{"formats": []string{"html", "xlsx"}}, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("/reports: %d %s", resp.StatusCode, body)
+	}
+	var re struct {
+		Artifacts []struct {
+			ID   string `json:"artifact_id"`
+			Kind string `json:"kind"`
+		} `json:"artifacts"`
+	}
+	mustJSON(t, body, &re)
+	seen := map[string]string{}
+	for _, a := range re.Artifacts {
+		seen[a.Kind] = a.ID
+	}
+	for _, k := range []string{"html_report", "xlsx_report"} {
+		if seen[k] == "" || seen[k] != oldIDs[k] {
+			t.Fatalf("重新生成应复用 artifact_id: %s old=%s new=%s", k, oldIDs[k], seen[k])
+		}
+	}
+
 	// 历史列表
 	resp, body = h.do("GET", "/runs?limit=10", nil, nil)
 	if resp.StatusCode != 200 {

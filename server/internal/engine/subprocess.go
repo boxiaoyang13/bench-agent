@@ -112,7 +112,9 @@ func (s *Subprocess) Probe(ctx context.Context, t ResolvedTarget) ProbeReport {
 	rep.Checks = append(rep.Checks, CheckItem{Name: "protocol", OK: true, Detail: string(t.Protocol)})
 
 	// evalscope 版本
-	if out, err := exec.CommandContext(ctx, s.evalscope, "--version").CombinedOutput(); err == nil {
+	verCmd := exec.CommandContext(ctx, s.evalscope, "--version")
+	verCmd.Env = s.childEnv(Spec{})
+	if out, err := verCmd.CombinedOutput(); err == nil {
 		rep.Engine["evalscope_version"] = strings.TrimSpace(string(out))
 		rep.Checks = append(rep.Checks, CheckItem{Name: "engine", OK: true, Detail: strings.TrimSpace(string(out))})
 	} else {
@@ -134,7 +136,11 @@ func (s *Subprocess) Probe(ctx context.Context, t ResolvedTarget) ProbeReport {
 	} else {
 		args := []string{"-c",
 			"from transformers import AutoTokenizer;AutoTokenizer.from_pretrained('" + t.Tokenizer + "',local_files_only=True)"}
-		if _, err := exec.CommandContext(ctx, s.python, args...).CombinedOutput(); err == nil {
+		tokCmd := exec.CommandContext(ctx, s.python, args...)
+		// 必须注入 runtime.env（HF_HOME / MODELSCOPE_CACHE），否则探测的缓存目录与压测子进程不一致，
+		// 会把「已缓存」误报为「未缓存」。
+		tokCmd.Env = s.childEnv(Spec{})
+		if _, err := tokCmd.CombinedOutput(); err == nil {
 			rep.Checks = append(rep.Checks, CheckItem{Name: "tokenizer", OK: true, Detail: t.Tokenizer + " 已缓存"})
 		} else {
 			rep.Checks = append(rep.Checks, CheckItem{Name: "tokenizer", OK: false, Severity: "warn",
@@ -192,7 +198,13 @@ func (s *Subprocess) ping(ctx context.Context, t ResolvedTarget) (int64, error) 
 	return lat, nil
 }
 
-var progressRe = regexp.MustCompile(`(\d+)\s*/\s*(\d+)`)
+// progressRe 只匹配 evalscope 的逐 step 进度行，例如：
+//
+//	Processing[parallel_64_number_200]:  12%|██  | 24/200 [00:35<04:10,  1.4s/it]
+//
+// 之前用宽泛的 (\d+)/(\d+) 会命中 "Running[perf]: 0/1"、吞吐统计里的 "429/..." 等
+// 无关数字，导致 step.progress 事件乱序（total 在 1/7/200 之间跳），页面看起来像在不停重试。
+var progressRe = regexp.MustCompile(`Processing\[[^\]]*\]:\s*\d+%\|[^|]*\|\s*(\d+)/(\d+)`)
 
 // Run 逐 step 执行 evalscope perf。
 func (s *Subprocess) Run(ctx context.Context, spec Spec, emit func(Event)) (Result, error) {
@@ -236,8 +248,10 @@ func (s *Subprocess) Run(ctx context.Context, spec Spec, emit func(Event)) (Resu
 				"code": "engine_failed", "detail": err.Error()}})
 			return res, err
 		}
-		fmt.Fprintf(logFile, "\n=== step %d: %s ===\n$ %s %s\n", i, st.Bucket, s.evalscope, strings.Join(args, " "))
+		// 命令回显入日志前必须脱敏：run.log 会作为 artifact 对外下载。
+		fmt.Fprintf(logFile, "\n=== step %d: %s ===\n$ %s %s\n", i, st.Bucket, s.evalscope, strings.Join(redactArgs(args), " "))
 
+		lastDone := -1
 		var wg sync.WaitGroup
 		wg.Add(1)
 		go func() {
@@ -245,13 +259,17 @@ func (s *Subprocess) Run(ctx context.Context, spec Spec, emit func(Event)) (Resu
 			sc := bufio.NewScanner(stdout)
 			sc.Buffer(make([]byte, 64*1024), 1024*1024)
 			for sc.Scan() {
-				line := sc.Text()
+				// evalscope 启动时会把自己的完整配置（含 Authorization header / api_key）
+				// 打到 stdout，这些行会进入 run.log 与 SSE，必须先脱敏。
+				line := redactSecret(sc.Text(), spec.Target.APIKey)
 				fmt.Fprintln(logFile, line)
 				emit(Event{Kind: EvLog, At: time.Now().UTC(), Data: map[string]any{"line": line}})
 				if m := progressRe.FindStringSubmatch(line); m != nil {
 					done, _ := strconv.Atoi(m[1])
 					all, _ := strconv.Atoi(m[2])
-					if all > 0 && done <= all {
+					// 只在 completed 真正推进时上报，避免同一数值刷屏
+					if all > 0 && done <= all && done != lastDone {
+						lastDone = done
 						emit(Event{Kind: EvStepProgress, At: time.Now().UTC(), Data: map[string]any{
 							"step_index": i, "completed": done, "total": all,
 						}})
@@ -283,13 +301,15 @@ func (s *Subprocess) Run(ctx context.Context, spec Spec, emit func(Event)) (Resu
 			}
 		}
 
-		// 汇总该 step 的产物
+		// 汇总该 step 的产物（先抹掉 evalscope 落盘的明文凭据，再计算指标/归档）
+		sanitizeRunDir(outDir, spec.Target.APIKey)
 		dbPath := findBenchmarkDB(outDir)
 		if dbPath != "" {
 			res.DBPaths[i] = dbPath
 			step := domain.Step{Index: i, Bucket: st.Bucket, Parallel: st.Parallel, Number: st.Number, DBPath: dbPath}
 			m, _, err := report.LoadStepMetrics(dbPath, step)
 			if err == nil {
+				m.RawDB = dbPath
 				status := domain.StepSucceeded
 				if m.Requests.SuccessRate < 1 {
 					status = domain.StepFailed
@@ -310,7 +330,7 @@ func (s *Subprocess) Run(ctx context.Context, spec Spec, emit func(Event)) (Resu
 		sr := 0.0
 		res.Steps = append(res.Steps, domain.Step{
 			Index: i, Bucket: st.Bucket, Parallel: st.Parallel, Number: st.Number,
-			Status: domain.StepFailed, SuccessRate: &sr,
+			Status: domain.StepFailed, SuccessRate: &sr, DBPath: dbPath,
 		})
 		emit(Event{Kind: EvStepFinished, At: time.Now().UTC(), Data: map[string]any{
 			"step_index": i, "status": string(domain.StepFailed), "success_rate": 0.0,
@@ -330,11 +350,18 @@ func (s *Subprocess) perfArgs(spec Spec, st domain.StepSpec, outDir string) []st
 	if v, ok := t.Temperature.(float64); ok {
 		temp = strconv.FormatFloat(v, 'f', 1, 64)
 	}
+	// 512k/1m 数据集是用 dataset_tokenizer（默认 GLM-4.6）构建并按固定 token 区间过滤的，
+	// 若改用被测模型的 tokenizer 计数，中文样本会整体落到区间外被全部过滤，
+	// 最终报 "produced no conversations"。对齐 run.sh 的 bucket_tokenizer().
+	tok := t.Tokenizer
+	if spec.LongBuckets[st.Bucket] && spec.DatasetTokenizer != "" {
+		tok = spec.DatasetTokenizer
+	}
 	args := []string{
 		"perf",
 		"--model", t.Model,
 		"--api", string(t.Protocol),
-		"--tokenizer-path", t.Tokenizer,
+		"--tokenizer-path", tok,
 		"--url", t.APIURL,
 		"--api-key", t.APIKey,
 		"--temperature", temp,
@@ -372,6 +399,48 @@ func nonZero(v, def int) int {
 		return v
 	}
 	return def
+}
+
+// redactArgs 把敏感参数的值替换为 ***（用于日志回显）。
+func redactArgs(args []string) []string {
+	out := append([]string(nil), args...)
+	for i := 0; i < len(out)-1; i++ {
+		switch out[i] {
+		case "--api-key", "--api_key", "-k", "--token", "--password":
+			out[i+1] = "***"
+		}
+	}
+	return out
+}
+
+// redactSecret 把字符串中的明文凭据替换为 ***。
+func redactSecret(s, secret string) string {
+	if secret == "" {
+		return s
+	}
+	return strings.ReplaceAll(s, secret, "***")
+}
+
+// sanitizeRunDir 去掉 evalscope 产物中落盘的明文凭据。
+//
+// evalscope 会把整份 argv / 请求头写进 benchmark_args.json 与 benchmark.log，
+// 而 run 目录与 run.log 都属于可下载产物，因此这里统一替换为 ***。
+func sanitizeRunDir(root, apiKey string) {
+	if apiKey == "" {
+		return
+	}
+	textExt := map[string]bool{".json": true, ".log": true, ".txt": true, ".yaml": true, ".yml": true, ".csv": true}
+	_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() || !textExt[strings.ToLower(filepath.Ext(p))] {
+			return nil
+		}
+		b, err := os.ReadFile(p)
+		if err != nil || !strings.Contains(string(b), apiKey) {
+			return nil
+		}
+		_ = os.WriteFile(p, []byte(strings.ReplaceAll(string(b), apiKey, "***")), 0o644)
+		return nil
+	})
 }
 
 func exitCode(err error) int {

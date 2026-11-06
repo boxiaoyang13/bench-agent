@@ -1,6 +1,7 @@
 package report
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"os"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/apexcloud/thvv/server/internal/config"
 	"github.com/apexcloud/thvv/server/internal/domain"
+
+	"github.com/xuri/excelize/v2"
 
 	_ "modernc.org/sqlite"
 )
@@ -127,6 +130,13 @@ func TestLoadStepMetrics(t *testing.T) {
 	// ITL 按 chunk 汇总（9 个值 0.01..0.05），与 TPOT 不同口径
 	if diff(m.ITL.AvgMs, 30) > 1e-6 {
 		t.Fatalf("itl avg 错误: %v", m.ITL.AvgMs)
+	}
+	// ITL 分位数按毫秒口径：9 个值 [0.01..0.05]s → p50=0.03s=30ms，p90=0.042s=42ms
+	if diff(m.ITL.P50Ms, 30) > 1e-6 {
+		t.Fatalf("itl p50 期望 30ms，实际 %v", m.ITL.P50Ms)
+	}
+	if diff(m.ITL.P90Ms, 42) > 1e-6 {
+		t.Fatalf("itl p90 期望 42ms，实际 %v", m.ITL.P90Ms)
 	}
 	if m.ITL.P50Ms == m.TPOT.AvgMs && m.ITL.P90Ms == m.TPOT.AvgMs {
 		t.Fatal("ITL 与 TPOT 不应完全同源")
@@ -311,3 +321,118 @@ func indexOfBytes(h, n string) int {
 }
 
 var _ = os.Getenv
+
+// TestLoadFailuresLegacySchema evalscope 1.9.x 的 result 表没有 error/http_status 列，
+// 失败行也必须能被导出（给出兜底说明），否则失败明细会整体丢失。
+func TestLoadFailuresLegacySchema(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "benchmark_data.db")
+	db, err := sql.Open("sqlite", "file:"+p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE result (
+		request TEXT, start_time REAL, inter_token_latencies TEXT, success INTEGER,
+		response_messages TEXT, completed_time REAL, latency REAL, first_chunk_latency REAL,
+		prompt_tokens INTEGER, completion_tokens INTEGER, max_gpu_memory_cost REAL,
+		time_per_output_token REAL)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO result VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		`{"model":"m"}`, 1000.0, "[]", 0, "", 1001.0, nil, nil, nil, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	items, err := LoadFailures(p, domain.Step{Index: 0, Bucket: "1k", Parallel: 1}, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("失败条数期望 1，实际 %d", len(items))
+	}
+	if items[0].Error == "" {
+		t.Fatal("失败项应有兜底说明，不能为空")
+	}
+	if items[0].RequestBodyExcerpt == "" {
+		t.Fatal("失败项应带上请求摘要")
+	}
+}
+
+// TestXLSXReportShape 「性能指标」45 列与 thvv 平台版逐字一致；失败详情 14 列。
+func TestXLSXReportShape(t *testing.T) {
+	m := domain.StepMetrics{
+		Bucket: "1k", Parallel: 1, Number: 2,
+		Requests:     domain.RequestCounts{Total: 2, Success: 2, SuccessRate: 1},
+		TTFT:         domain.TTFTStats{AvgSec: 0.6, MinSec: 0.4, MaxSec: 0.8, P50Sec: 0.6, P90Sec: 0.75, P95Sec: 0.78, P99Sec: 0.79},
+		TTLT:         domain.Scalar{AvgSec: 2.5, P50Sec: 2.4, P90Sec: 3.0, P95Sec: 3.1, P99Sec: 3.2},
+		TPOT:         domain.Scalar{AvgSec: 0.007, P50Sec: 0.007, P90Sec: 0.008, P95Sec: 0.008, P99Sec: 0.009},
+		ITL:          domain.Scalar{AvgSec: 0.02, P50Sec: 0.0000087, P90Sec: 0.04, P95Sec: 0.05, P99Sec: 0.06},
+		TokenRateAvg: 50, TokenRate: domain.Scalar{AvgSec: 50, P50Sec: 49, P90Sec: 60, P95Sec: 61, P99Sec: 62},
+		Tokens:     domain.TokenSums{PromptSum: 2400, CompletionSum: 600, TotalSum: 3000},
+		Throughput: domain.Throughput{OutputTPS: 40, OutputTPM: 2400, InputTPM: 9000, TPM: 11400},
+		RawDB:      "/data/runs/run_x/results/perf-1k-20260101-0101/m/parallel_1_number_2/benchmark_data.db",
+	}
+	ttft, ttlt := 0.5, 1.2
+	data, err := RenderXLSX(XLSXInput{
+		Model: "m", Vendor: "turbo", Company: "本地联调", GeneratedAt: time.Now(),
+		APIURL:  "https://api.example.com/v1/chat/completions?key=secret",
+		Metrics: []domain.StepMetrics{m},
+		Failures: []domain.FailureItem{{
+			Bucket: "1k", Parallel: 1, RequestIndex: 1, Reason: "other", Detail: "boom",
+			TTFTSec: &ttft, TTLTSec: &ttlt, RequestBodyExcerpt: `{"messages":[]}`,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := excelize.OpenReader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	rows, _ := f.GetRows("性能指标")
+	if len(rows) != 2 || len(rows[0]) != 45 {
+		t.Fatalf("性能指标应为 2 行 x 45 列，实际 %d x %d", len(rows), len(rows[0]))
+	}
+	wantHeaders := []string{"客户端", "后端网路链接", "数据集", "并发数", "总请求数", "成功数", "失败数", "成功率",
+		"Avg TTFT(s)", "Min TTFT(s)", "Max TTFT(s)", "P50 TTFT(s)", "P90 TTFT(s)", "P95 TTFT(s)", "P99 TTFT(s)",
+		"Avg TTLT(s)", "P50 TTLT(s)", "P90 TTLT(s)", "P95 TTLT(s)", "P99 TTLT(s)",
+		"Avg Rate(t/s)", "P50 Rate(t/s)", "P90 Rate(t/s)", "P95 Rate(t/s)", "P99 Rate(t/s)",
+		"Avg ITL(s)", "P50 ITL(s)", "P90 ITL(s)", "P95 ITL(s)", "P99 ITL(s)",
+		"Avg TPOT(s)", "P50 TPOT(s)", "P90 TPOT(s)", "P95 TPOT(s)", "P99 TPOT(s)",
+		"Avg Prompt Tokens", "Avg Completion Tokens", "Total Tokens", "Avg Cached Tokens", "Avg Cache Hit Ratio",
+		"Avg Total Time(ms)", "Output TPM", "Output TPS", "Input TPM", "TPM"}
+	for i, h := range wantHeaders {
+		if rows[0][i] != h {
+			t.Fatalf("第 %d 列表头期望 %q，实际 %q", i+1, h, rows[0][i])
+		}
+	}
+	idx := map[string]int{}
+	for i, h := range rows[0] {
+		idx[h] = i
+	}
+	if rows[1][idx["数据集"]] != "1k (perf-1k-20260101-0101)" {
+		t.Errorf("数据集列异常: %q", rows[1][idx["数据集"]])
+	}
+	if rows[1][idx["客户端"]] != "本地联调" || rows[1][idx["后端网路链接"]] != "turbo" {
+		t.Errorf("客户端/后端列异常: %v %v", rows[1][idx["客户端"]], rows[1][idx["后端网路链接"]])
+	}
+
+	fail, _ := f.GetRows("失败请求详情")
+	if len(fail) != 2 || len(fail[0]) != 14 {
+		t.Fatalf("失败请求详情应为 2 行 x 14 列，实际 %d x %d", len(fail), len(fail[0]))
+	}
+	fh := map[string]int{}
+	for i, h := range fail[0] {
+		fh[h] = i
+	}
+	if got := fail[1][fh["请求URL"]]; got != "https://api.example.com/v1/chat/completions" {
+		t.Errorf("请求URL 未去掉 query: %q", got)
+	}
+	if fail[1][fh["请求方法"]] != "POST" || fail[1][fh["详细说明"]] != "boom" {
+		t.Errorf("失败明细字段异常: %v", fail[1])
+	}
+}

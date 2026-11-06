@@ -60,6 +60,32 @@ func minmax(v []float64) (float64, float64) {
 	return mn, mx
 }
 
+// secScalar 以秒为单位算 Avg/P50/P90/P95/P99，同时填好毫秒镜像字段。
+// 与 gen_report_from_db.py 的 calc_stats 一一对应。
+func secScalar(v []float64, digits int) domain.Scalar {
+	out := domain.Scalar{}
+	if a, ok := avg(v); ok {
+		out.AvgSec = round(a, digits)
+		out.AvgMs = round(a*1000, 9)
+	}
+	for _, p := range []struct {
+		p  float64
+		sp *float64
+		mp *float64
+	}{
+		{50, &out.P50Sec, &out.P50Ms},
+		{90, &out.P90Sec, &out.P90Ms},
+		{95, &out.P95Sec, &out.P95Ms},
+		{99, &out.P99Sec, &out.P99Ms},
+	} {
+		if x, ok := Percentile(v, p.p); ok {
+			*p.sp = round(x, digits)
+			*p.mp = round(x*1000, 9)
+		}
+	}
+	return out
+}
+
 func round(v float64, digits int) float64 {
 	if math.IsInf(v, 0) || math.IsNaN(v) {
 		return 0
@@ -216,21 +242,26 @@ func LoadStepMetrics(dbPath string, step domain.Step) (domain.StepMetrics, []dom
 	if v, ok := avg(ttfts); ok {
 		mn, mx := minmax(ttfts)
 		m.TTFT = domain.TTFTStats{
-			AvgSec: round(v, 4), MinSec: round(mn, 4), MaxSec: round(mx, 4),
+			AvgSec: round(v, 6), MinSec: round(mn, 6), MaxSec: round(mx, 6),
 			P50Sec: pct(ttfts, 50), P90Sec: pct(ttfts, 90), P95Sec: pct(ttfts, 95), P99Sec: pct(ttfts, 99),
 		}
 	}
 	if v, ok := avg(rates); ok {
-		m.TokenRateAvg = round(v, 3)
+		m.TokenRateAvg = round(v, 6)
+		m.TokenRate = secScalar(rates, 6)
 	}
 	if v, ok := avg(ttlts); ok {
-		m.TTLT = domain.Scalar{AvgSec: round(v, 4)}
+		m.TTLT = secScalar(ttlts, 6)
+		_ = v
 	}
 	if v, ok := avg(tpots); ok {
-		m.TPOT = domain.Scalar{AvgMs: round(v*1000, 3)}
+		// TPOT / ITL 是「秒」级的细小值，统一保留 9 位小数（纳秒）避免分位数被抹平。
+		m.TPOT = secScalar(tpots, 12)
+		_ = v
 	}
 	if v, ok := avg(itls); ok {
-		m.ITL = domain.Scalar{AvgMs: round(v*1000, 3), P50Ms: round(pct(itls, 50)/1000*1000, 3), P90Ms: round(pct(itls, 90)/1000*1000, 3)}
+		m.ITL = secScalar(itls, 12)
+		_ = v
 	}
 	var promptSum, completionSum float64
 	for _, x := range promptTokens {
@@ -250,10 +281,10 @@ func LoadStepMetrics(dbPath string, step domain.Step) (domain.StepMetrics, []dom
 			outTPS := completionSum / span
 			inTPS := promptSum / span
 			m.Throughput = domain.Throughput{
-				InputTPS: round(inTPS, 2), OutputTPS: round(outTPS, 2),
-				InputTPM: round(inTPS*60, 1), OutputTPM: round(outTPS*60, 1),
-				TPM: round((inTPS+outTPS)*60, 1),
-				QPM: round(float64(m.Requests.Success)/span*60, 1),
+				InputTPS: round(inTPS, 6), OutputTPS: round(outTPS, 6),
+				InputTPM: round(inTPS*60, 6), OutputTPM: round(outTPS*60, 6),
+				TPM: round((inTPS+outTPS)*60, 6),
+				QPM: round(float64(m.Requests.Success)/span*60, 6),
 			}
 		}
 	}
@@ -262,7 +293,7 @@ func LoadStepMetrics(dbPath string, step domain.Step) (domain.StepMetrics, []dom
 
 func pct(v []float64, p float64) float64 {
 	if x, ok := Percentile(v, p); ok {
-		return round(x, 4)
+		return round(x, 6)
 	}
 	return 0
 }
