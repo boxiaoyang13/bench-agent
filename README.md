@@ -23,6 +23,66 @@ open http://127.0.0.1:18080/ui/
 
 > 本机 8080 若被占用，`config/thvv.local.yaml` 默认用 **18080**。
 
+## 工具安装（三种能力各自的 Python 环境）
+
+服务端编排三类测试，各自依赖独立的 Python 工具链（互不影响，安装位置任意，
+在配置里用根前缀寻址即可）：
+
+| 能力 | 工具 | 安装位置（本机参考） |
+|---|---|---|
+| `perf` 性能压测 | evalscope[perf] + transformers（随 thvv 仓库） | `<repo>/.venv` |
+| `eval` 效果评测 | evalscope==1.9.0 + modelscope 等（随 thvv 仓库） | `<repo>/.venv` |
+| `cache` 缓存测试 | **lmcache** + openai（独立 venv） | `/infer-data/bench/bench-cache/.venv` |
+
+### 安装 lmcache（缓存测试）
+
+```bash
+mkdir -p /infer-data/bench/bench-cache && cd /infer-data/bench/bench-cache
+python3 -m venv .venv
+source .venv/bin/activate
+pip install lmcache openai      # openai 是 bench engine 的可选依赖（AsyncOpenAI 客户端），必装
+```
+
+- 版本要求：LMCache **v0.5.7+**（`lmcache --help` 出现 `bench` 子命令即可）
+- CLI 入口：`/infer-data/bench/bench-cache/.venv/bin/lmcache`
+- 冒烟自检：
+
+```bash
+lmcache bench engine --help                                # 子命令可用
+lmcache bench engine --workload multi-round-chat \
+  --engine-url https://your-endpoint/v1 --model your-model \
+  --tokens-per-gb-kvcache 65536 --export-config /tmp/c.json  # 参数组合合法
+```
+
+### 在服务端配置中引用
+
+`server/config/thvv.dev.yaml`（路径换成你的实际安装位置）：
+
+```yaml
+roots:
+  bench-cache: "/infer-data/bench/bench-cache"   # lmcache 安装根
+
+engines:
+  lmcache:
+    enabled: true
+    kind: subprocess
+    runtime:
+      python: "bench-cache:.venv/bin/python"
+      evalscope: "bench-cache:.venv/bin/lmcache"   # 复用字段：此处表示 lmcache CLI 入口
+    capabilities:
+      cache:
+        enabled: true
+        status: ga
+        working_dir: "bench-cache:"
+        script: "bench-cache:.venv/bin/lmcache"
+```
+
+要点：
+
+- 凭据只经 **`OPENAI_API_KEY` 环境变量**注入子进程（lmcache 不认 argv key），服务端自动完成
+- `--engine-url` 会传剥掉 `/chat/completions` 后的 base（lmcache 会给非 `/v1` 结尾的 URL 追加 `/v1`）
+- 缓存测试的设计与产物见 [`docs/CACHE.md`](docs/CACHE.md)
+
 ## 接真实引擎（fork evalscope）
 
 ```bash
