@@ -168,7 +168,9 @@ func (s *Server) handleCatalogDatasets(w http.ResponseWriter, r *http.Request) {
 			items = append(items, map[string]any{
 				"name": d.Name, "display_name": orDefault(d.DisplayName, d.Name),
 				"kind": orDefault(d.Kind, "text"), "needs_judge": d.NeedsJudge,
-				"default_limit": d.DefaultLimit, "excluded_from_all": d.ExcludedFromAll,
+				"needs_docker": d.NeedsDocker, "default_limit": d.DefaultLimit,
+				"default_repeats": d.DefaultRepeats, "default_eval_batch_size": d.DefaultEvalBatch,
+				"excluded_from_all": d.ExcludedFromAll,
 			})
 		}
 		break

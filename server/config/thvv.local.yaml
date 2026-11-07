@@ -68,9 +68,9 @@ engines:
         status: ga
         description: "性能压测（模拟）：按档位缩放 TTFT/吞吐，用于 UI 联调"
       eval:
-        enabled: false
-        status: preview
-        description: "效果评测（需 evalscope，未启用）"
+        enabled: true
+        status: ga
+        description: "效果评测（17 个数据集，模拟引擎用）"
       functional:
         enabled: false
         status: planned

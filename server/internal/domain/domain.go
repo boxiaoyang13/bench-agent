@@ -106,6 +106,13 @@ type BucketOverride struct {
 	Number      int   `json:"number,omitempty"`
 }
 
+// JudgeSpec 是评测用 LLM Judge 的凭据（只在该 run 内存在，不落 Target）。
+type JudgeSpec struct {
+	Model   string `json:"model,omitempty"`
+	BaseURL string `json:"base_url,omitempty"`
+	APIKey  string `json:"api_key,omitempty"`
+}
+
 type RequestDefaults struct {
 	Temperature       any `json:"temperature,omitempty"`
 	MaxTokens         int `json:"max_tokens,omitempty"`
@@ -129,6 +136,16 @@ type Plan struct {
 	DatasetDir       string                    `json:"dataset_dir,omitempty"`
 	StepsTotal       int                       `json:"steps_total,omitempty"`
 
+	// eval（capability=eval）
+	Datasets      []string   `json:"datasets,omitempty"`
+	Limit         int        `json:"limit,omitempty"`
+	Repeats       int        `json:"repeats,omitempty"`
+	EvalBatchSize int        `json:"eval_batch_size,omitempty"`
+	Judge         *JudgeSpec `json:"judge,omitempty"`
+	ProviderName  string     `json:"provider_name,omitempty"`
+	Thinking      *bool      `json:"thinking,omitempty"`
+	ThinkingType  string     `json:"thinking_type,omitempty"`
+
 	// 工具私有字段透传
 	ToolParams json.RawMessage `json:"tool_params,omitempty"`
 }
@@ -141,6 +158,7 @@ type StepSpec struct {
 	Bucket   string `json:"bucket"`
 	Parallel int    `json:"parallel"`
 	Number   int    `json:"number"`
+	Repeats  int    `json:"repeats,omitempty"` // eval：重复次数
 	MinLen   int    `json:"min_prompt_len"`
 	MaxLen   int    `json:"max_prompt_len"`
 }
@@ -436,13 +454,17 @@ type Run struct {
 type ArtifactKind string
 
 const (
-	ArtHTMLReport ArtifactKind = "html_report"
-	ArtXLSXReport ArtifactKind = "xlsx_report"
-	ArtFailureCSV ArtifactKind = "failure_csv"
-	ArtSLAJSON    ArtifactKind = "sla_json"
-	ArtRawDB      ArtifactKind = "raw_db"
-	ArtRunLog     ArtifactKind = "run_log"
-	ArtArchive    ArtifactKind = "archive"
+	ArtHTMLReport  ArtifactKind = "html_report"
+	ArtXLSXReport  ArtifactKind = "xlsx_report"
+	ArtFailureCSV  ArtifactKind = "failure_csv"
+	ArtSLAJSON     ArtifactKind = "sla_json"
+	ArtRawDB       ArtifactKind = "raw_db"
+	ArtRunLog      ArtifactKind = "run_log"
+	ArtEvalReport  ArtifactKind = "eval_report"
+	ArtEvalSummary ArtifactKind = "eval_summary"
+	ArtEvalSamples ArtifactKind = "eval_samples"
+	ArtEvalArchive ArtifactKind = "eval_archive"
+	ArtArchive     ArtifactKind = "archive"
 )
 
 type Artifact struct {
@@ -581,7 +603,38 @@ type FailureItem struct {
 type RunResults struct {
 	RunID      string         `json:"run_id"`
 	Capability Capability     `json:"capability"`
-	GateResult *GateResult    `json:"gate_result"`
+	GateResult *GateResult    `json:"gate_result,omitempty"`
 	Summary    map[string]any `json:"summary"`
 	Metrics    PerfMetrics    `json:"metrics"`
+	Eval       *EvalMetrics   `json:"eval,omitempty"`
+}
+
+// EvalDatasetResult 是单个数据集的评测结果（来自 eval_summary.json）。
+type EvalDatasetResult struct {
+	Dataset      string   `json:"dataset"`
+	Label        string   `json:"label,omitempty"`
+	Success      bool     `json:"success"`
+	Score        float64  `json:"score"`
+	Metric       string   `json:"metric,omitempty"`
+	NumSamples   int      `json:"num_samples,omitempty"`
+	Limit        int      `json:"limit,omitempty"`
+	Repeats      int      `json:"repeats,omitempty"`
+	EvalBatch    int      `json:"eval_batch_size,omitempty"`
+	RetriesUsed  int      `json:"retries_used,omitempty"`
+	RateLimited  bool     `json:"rate_limited,omitempty"`
+	ElapsedSec   float64  `json:"elapsed_sec,omitempty"`
+	Skipped      int      `json:"skipped,omitempty"`
+	CacheHitRate *float64 `json:"cache_hit_rate,omitempty"`
+	Error        string   `json:"error,omitempty"`
+	Artifacts    []string `json:"artifacts,omitempty"`
+}
+
+// SubitemOf 返回子项名（当前恒为空，留给 tau2_bench 的领域、longbench 子集等场景）。
+func (d EvalDatasetResult) SubitemOf() string { return "" }
+
+// EvalMetrics 是一次 eval run 的全部数据集结果。
+type EvalMetrics struct {
+	Model    string              `json:"model,omitempty"`
+	Provider string              `json:"provider,omitempty"`
+	Datasets []EvalDatasetResult `json:"datasets"`
 }

@@ -267,12 +267,15 @@ type ScenarioCfg struct {
 }
 
 type Dataset struct {
-	Name            string `yaml:"name"`
-	DisplayName     string `yaml:"display_name"`
-	Kind            string `yaml:"kind"`
-	NeedsJudge      bool   `yaml:"needs_judge"`
-	DefaultLimit    *int   `yaml:"default_limit"`
-	ExcludedFromAll bool   `yaml:"excluded_from_all"`
+	Name             string `yaml:"name"`
+	DisplayName      string `yaml:"display_name"`
+	Kind             string `yaml:"kind"` // text | agent | video | image
+	NeedsJudge       bool   `yaml:"needs_judge"`
+	NeedsDocker      bool   `yaml:"needs_docker"`
+	DefaultLimit     *int   `yaml:"default_limit"`
+	DefaultRepeats   *int   `yaml:"default_repeats"`
+	DefaultEvalBatch *int   `yaml:"default_eval_batch_size"`
+	ExcludedFromAll  bool   `yaml:"excluded_from_all"`
 }
 
 type Judge struct {
@@ -312,6 +315,17 @@ type GateProfile struct {
 	Tiers         []GateTier     `yaml:"tiers"`
 	Global        GateGlobal     `yaml:"global"`
 	DefaultParams map[string]any `yaml:"default_params"`
+
+	// eval：按数据集的分数下限（0~1）。
+	// 与《效果验收标准.xlsx》对齐：基线可按 target.model 配置覆盖，未命中用 default。
+	EvalTiers []EvalGateTier `yaml:"eval_tiers,omitempty"`
+}
+
+type EvalGateTier struct {
+	Dataset    string             `yaml:"dataset"`               // 数据集名（aime26 / hle / ...）
+	Subitem    string             `yaml:"subitem,omitempty"`     // 子项（tau2_bench 的领域、longbench 子集等），空 = 整体
+	MinScore   float64            `yaml:"min_score"`             // 分数下限（0~1）
+	BaselineBy map[string]float64 `yaml:"baseline_by,omitempty"` // 可选：模型名（小写包含匹配）→ 基线，未命中用 MinScore
 }
 
 type GateTier struct {

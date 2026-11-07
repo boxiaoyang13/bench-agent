@@ -283,6 +283,19 @@ engines:
 
 ---
 
+### 3.6 `capabilities.eval`
+
+| 字段 | 说明 |
+|---|---|
+| `enabled` / `status` | 是否对外提供 `capability=eval`（`ga` / `preview`） |
+| `working_dir` | `run_eval.py` 的工作目录（一般 `thvv:eval`） |
+| `script` | 评测入口，`thvv:eval/scripts/run_eval.py` |
+| `datasets[]` | 数据集表；不写则用内置 17 个。字段：`name` / `display_name` / `kind`(`text|agent|video|image`) / `needs_judge` / `needs_docker` / `default_limit` / `default_repeats` / `default_eval_batch_size` / `excluded_from_all` |
+| `judge` | 默认 Judge：`model`（默认 `deepseek-v4-pro`）、`base_url`、`api_key`（建议 `${THVV_JUDGE_API_KEY:-}`） |
+| `runtime` | 可选，覆盖引擎级 runtime（例如 eval 单独一套 venv） |
+
+执行模型见 [`EVAL.md`](./EVAL.md)：**一个数据集一个子进程**，Step = 数据集。
+
 ## 4. 类型约定
 
 | 类型 | 写法 | 示例 |

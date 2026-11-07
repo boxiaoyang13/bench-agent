@@ -143,20 +143,35 @@ func (m *Manager) Submit(ctx context.Context, req SubmitRequest) (*domain.Run, e
 	}
 	m.mu.Unlock()
 
-	norm, err := m.normalizer(req.Tool, req.Capability)
-	if err != nil {
-		return nil, err
-	}
-	plan, err := m.normalizePlan(req.Plan, norm)
-	if err != nil {
-		return nil, err
-	}
-	steps, skipped := domain.ComputeSteps(plan, norm)
-	for _, s := range skipped {
-		m.log.Warn("档位跳过", "run", req.Target.Name, "bucket", s.Bucket, "reason", s.Reason, "detail", s.Detail)
+	var (
+		plan  domain.Plan
+		steps []domain.StepSpec
+		err   error
+	)
+	switch req.Capability {
+	case domain.CapEval:
+		plan, steps, err = m.normalizeEvalPlan(req.Tool, req.Target, req.Plan)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		var norm domain.Normalizer
+		norm, err = m.normalizer(req.Tool, req.Capability)
+		if err != nil {
+			return nil, err
+		}
+		plan, err = m.normalizePlan(req.Plan, norm)
+		if err != nil {
+			return nil, err
+		}
+		var skipped []domain.Skip
+		steps, skipped = domain.ComputeSteps(plan, norm)
+		for _, s := range skipped {
+			m.log.Warn("档位跳过", "run", req.Target.Name, "bucket", s.Bucket, "reason", s.Reason, "detail", s.Detail)
+		}
 	}
 	if len(steps) == 0 {
-		return nil, fmt.Errorf("没有可执行的步骤（档位/并发都被裁剪，或数据集未构建）")
+		return nil, fmt.Errorf("没有可执行的步骤")
 	}
 	plan.StepsTotal = len(steps)
 
@@ -437,7 +452,15 @@ func (m *Manager) execute(ctx context.Context, runID string) {
 
 	m.report(runCtx, lr, res)
 	status := domain.StatusSucceeded
-	if hasFailedStep(lr) {
+	if lr.run.Capability == domain.CapEval {
+		ok, total := evalSuccessCount(res.Eval)
+		switch {
+		case ok == 0 && total > 0:
+			status = domain.StatusFailed
+		case ok < total:
+			status = domain.StatusPartial
+		}
+	} else if hasFailedStep(lr) {
 		status = domain.StatusPartial
 	}
 	m.finish(runCtx, lr, status, nil)
@@ -539,6 +562,10 @@ func (m *Manager) updateStep(ctx context.Context, lr *liveRun, idx int, mut func
 // ---------------- 结果与产物 ----------------
 
 func (m *Manager) report(ctx context.Context, lr *liveRun, res engine.Result) {
+	if lr.run.Capability == domain.CapEval {
+		m.reportEval(ctx, lr, res)
+		return
+	}
 	m.setStatus(ctx, lr, domain.StatusReporting)
 	lr.mu.Lock()
 	run := lr.run

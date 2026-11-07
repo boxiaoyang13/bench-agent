@@ -3,10 +3,7 @@ package engine
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -160,50 +157,9 @@ func (s *Subprocess) Probe(ctx context.Context, t ResolvedTarget) ProbeReport {
 
 // ping 发一条最小 completion 请求，返回 TTFT 毫秒。
 func (s *Subprocess) ping(ctx context.Context, t ResolvedTarget) (int64, error) {
-	var body []byte
-	hdr := map[string]string{"Content-Type": "application/json"}
-	switch t.Protocol {
-	case domain.ProtocolAnthropic:
-		hdr["x-api-key"] = t.APIKey
-		hdr["anthropic-version"] = "2023-06-01"
-		body, _ = json.Marshal(map[string]any{
-			"model": t.Model, "max_tokens": 1, "stream": true,
-			"messages": []map[string]any{{"role": "user", "content": "hi"}},
-		})
-	default:
-		hdr["Authorization"] = "Bearer " + t.APIKey
-		body, _ = json.Marshal(map[string]any{
-			"model": t.Model, "max_tokens": 1, "stream": true,
-			"messages": []map[string]any{{"role": "user", "content": "hi"}},
-		})
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.APIURL, strings.NewReader(string(body)))
-	if err != nil {
-		return 0, err
-	}
-	for k, v := range hdr {
-		req.Header.Set(k, v)
-	}
-	start := time.Now()
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-	_, _ = io.CopyN(io.Discard, resp.Body, 64)
-	lat := time.Since(start).Milliseconds()
-	if resp.StatusCode >= 300 {
-		return lat, fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	return lat, nil
+	return pingTarget(ctx, t)
 }
 
-// progressRe 只匹配 evalscope 的逐 step 进度行，例如：
-//
-//	Processing[parallel_64_number_200]:  12%|██  | 24/200 [00:35<04:10,  1.4s/it]
-//
-// 之前用宽泛的 (\d+)/(\d+) 会命中 "Running[perf]: 0/1"、吞吐统计里的 "429/..." 等
-// 无关数字，导致 step.progress 事件乱序（total 在 1/7/200 之间跳），页面看起来像在不停重试。
 var progressRe = regexp.MustCompile(`Processing\[[^\]]*\]:\s*\d+%\|[^|]*\|\s*(\d+)/(\d+)`)
 
 // Run 逐 step 执行 evalscope perf。
@@ -406,7 +362,7 @@ func redactArgs(args []string) []string {
 	out := append([]string(nil), args...)
 	for i := 0; i < len(out)-1; i++ {
 		switch out[i] {
-		case "--api-key", "--api_key", "-k", "--token", "--password":
+		case "--api-key", "--api_key", "--judge_api_key", "--judge-key", "-k", "--token", "--password":
 			out[i+1] = "***"
 		}
 	}

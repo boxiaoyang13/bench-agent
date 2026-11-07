@@ -102,6 +102,9 @@ func (f *Fake) Probe(ctx context.Context, t ResolvedTarget) ProbeReport {
 }
 
 func (f *Fake) Run(ctx context.Context, spec Spec, emit func(Event)) (Result, error) {
+	if spec.Capability == domain.CapEval {
+		return f.runEval(ctx, spec, emit)
+	}
 	res := Result{DBPaths: map[int]string{}}
 	total := len(spec.Steps)
 	perStep := time.Duration(f.StepMS) * time.Millisecond
@@ -213,3 +216,57 @@ func roundTo(v float64, digits int) float64 {
 }
 
 func fp(v float64) *float64 { return &v }
+
+// runEval 是 eval 能力的模拟实现：按数据集产出随机分数，便于 UI 与集成测试。
+func (f *Fake) runEval(ctx context.Context, spec Spec, emit func(Event)) (Result, error) {
+	res := Result{DBPaths: map[int]string{}, Eval: &domain.EvalMetrics{
+		Model: spec.Target.Model, Provider: evalProvider(spec),
+	}}
+	for i, st := range spec.Steps {
+		if err := ctx.Err(); err != nil {
+			return res, err
+		}
+		emit(Event{Kind: EvStepStarted, At: time.Now().UTC(), Data: map[string]any{
+			"step_index": i, "bucket": st.Bucket, "parallel": st.Parallel, "number": st.Number,
+		}})
+		steps := 5
+		for p := 1; p <= steps; p++ {
+			select {
+			case <-ctx.Done():
+				return res, ctx.Err()
+			case <-time.After(time.Duration(f.StepMS/steps) * time.Millisecond):
+			}
+			emit(Event{Kind: EvStepProgress, At: time.Now().UTC(), Data: map[string]any{
+				"step_index": i, "completed": p * 100 / steps, "total": 100,
+			}})
+		}
+		ok := rand.Float64() >= f.FailRate
+		score := 0.4 + rand.Float64()*0.55
+		if !ok {
+			score = 0
+		}
+		sr := 0.0
+		if ok {
+			sr = 1
+		}
+		dur := float64(f.StepMS) / 1000
+		status := domain.StepFailed
+		if ok {
+			status = domain.StepSucceeded
+		}
+		res.Steps = append(res.Steps, domain.Step{
+			Index: i, Bucket: st.Bucket, Parallel: st.Parallel, Number: st.Number,
+			Status: status, SuccessRate: &sr, DurationSec: &dur,
+		})
+		res.Eval.Datasets = append(res.Eval.Datasets, domain.EvalDatasetResult{
+			Dataset: st.Bucket, Label: st.Bucket, Success: ok, Score: math.Round(score*1000) / 1000,
+			Metric: "mean_acc", NumSamples: st.Number, Limit: st.Number,
+			Repeats: st.Repeats, EvalBatch: st.Parallel, ElapsedSec: dur,
+		})
+		emit(Event{Kind: EvStepFinished, At: time.Now().UTC(), Data: map[string]any{
+			"step_index": i, "status": string(status), "success_rate": sr,
+			"score": score, "duration_sec": dur,
+		}})
+	}
+	return res, nil
+}

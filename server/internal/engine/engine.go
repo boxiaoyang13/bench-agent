@@ -11,6 +11,10 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/apexcloud/thvv/server/internal/domain"
@@ -66,9 +70,19 @@ type Spec struct {
 type Result struct {
 	Steps    []domain.Step
 	Metrics  []domain.StepMetrics
-	DBPaths  map[int]string // stepIndex → benchmark_data.db
+	DBPaths  map[int]string      // stepIndex → benchmark_data.db（perf）
+	Eval     *domain.EvalMetrics // eval 能力的结果
+	Files    []FileArtifact      // 需要归档的产物（eval）
 	LogPath  string
 	ExitCode int
+}
+
+// FileArtifact 是引擎产出的单个可下载文件。
+type FileArtifact struct {
+	Kind        domain.ArtifactKind
+	Filename    string // 归档后的文件名（已带数据集前缀，避免重名）
+	Path        string // 源文件绝对路径
+	ContentType string
 }
 
 // Description 用于 GET /v1/tools。
@@ -136,4 +150,45 @@ func jsonRaw(b json.RawMessage, dst any) error {
 		return nil
 	}
 	return json.Unmarshal(b, dst)
+}
+
+// pingTarget 向被测端点发一条最小流式请求，返回首包耗时（毫秒）。
+// perf / eval 两个引擎共用，保证 probe 口径一致。
+func pingTarget(ctx context.Context, t ResolvedTarget) (int64, error) {
+	hdr := map[string]string{"Content-Type": "application/json"}
+	var body []byte
+	switch t.Protocol {
+	case domain.ProtocolAnthropic:
+		hdr["x-api-key"] = t.APIKey
+		hdr["anthropic-version"] = "2023-06-01"
+		body, _ = json.Marshal(map[string]any{
+			"model": t.Model, "max_tokens": 1, "stream": true,
+			"messages": []map[string]any{{"role": "user", "content": "hi"}},
+		})
+	default:
+		hdr["Authorization"] = "Bearer " + t.APIKey
+		body, _ = json.Marshal(map[string]any{
+			"model": t.Model, "max_tokens": 1, "stream": true,
+			"messages": []map[string]any{{"role": "user", "content": "hi"}},
+		})
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.APIURL, strings.NewReader(string(body)))
+	if err != nil {
+		return 0, err
+	}
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
+	start := time.Now()
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.CopyN(io.Discard, resp.Body, 64)
+	lat := time.Since(start).Milliseconds()
+	if resp.StatusCode >= 300 {
+		return lat, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return lat, nil
 }

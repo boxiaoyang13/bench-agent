@@ -80,6 +80,7 @@ engines:
     kind: builtin
     capabilities:
       perf: { enabled: true, status: ga }
+      eval: { enabled: true, status: ga }
       functional: { enabled: false, status: planned, available_at: "v1.2" }
 observability:
   log_level: error
@@ -566,5 +567,216 @@ func mustWrite(t *testing.T, p, content string) {
 	}
 	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestEvalFlow 验证 capability=eval 的全链路：提交 → 步骤 → 结果 → 产物。
+func TestEvalFlow(t *testing.T) {
+	t.Setenv("THVV_FAKE_STEP_MS", "20")
+	t.Setenv("THVV_FAKE_FAIL_RATE", "0")
+	h := newHarness(t)
+	h.login()
+
+	resp, body := h.do("POST", "/targets", map[string]any{
+		"name": "eval-target", "vendor": "zhipu",
+		"api_url":  "https://api.example.com/v1/chat/completions",
+		"protocol": "openai", "model": "glm-5.2", "api_key": "sk-secret-1234",
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("建端点: %d %s", resp.StatusCode, body)
+	}
+	var target map[string]any
+	mustJSON(t, body, &target)
+	targetID, _ := target["target_id"].(string)
+
+	resp, body = h.do("POST", "/runs", map[string]any{
+		"tool": "thvv", "capability": "eval", "target_id": targetID,
+		"plan": map[string]any{
+			"datasets": []string{"aime26", "gpqa_diamond"},
+			"limit":    4, "repeats": 1, "eval_batch_size": 4,
+		},
+	}, map[string]string{"Idempotency-Key": "eval-1"})
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("提交评测: %d %s", resp.StatusCode, body)
+	}
+	var run map[string]any
+	mustJSON(t, body, &run)
+	runID, _ := run["run_id"].(string)
+	if runID == "" {
+		t.Fatal("缺少 run_id")
+	}
+	plan := run["plan"].(map[string]any)
+	if int(plan["steps_total"].(float64)) != 2 {
+		t.Fatalf("steps_total 期望 2，实际 %v", plan["steps_total"])
+	}
+
+	final := h.waitTerminal(runID, 20*time.Second)
+	if final["status"] != "succeeded" {
+		t.Fatalf("评测未成功: %v (%v)", final["status"], final["error"])
+	}
+
+	resp, body = h.do("GET", "/runs/"+runID+"/results", nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("/results: %d %s", resp.StatusCode, body)
+	}
+	var res struct {
+		Capability string `json:"capability"`
+		Summary    map[string]any
+		Eval       struct {
+			Datasets []struct {
+				Dataset string  `json:"dataset"`
+				Success bool    `json:"success"`
+				Score   float64 `json:"score"`
+			} `json:"datasets"`
+		} `json:"eval"`
+	}
+	mustJSON(t, body, &res)
+	if res.Capability != "eval" || len(res.Eval.Datasets) != 2 {
+		t.Fatalf("eval 结果异常: %+v", res)
+	}
+	for _, d := range res.Eval.Datasets {
+		if !d.Success || d.Score <= 0 {
+			t.Fatalf("数据集结果异常: %+v", d)
+		}
+	}
+	if res.Summary["verdict"] != "pass" {
+		t.Fatalf("verdict 期望 pass，实际 %v", res.Summary["verdict"])
+	}
+
+	resp, body = h.do("GET", "/runs/"+runID+"/artifacts", nil, nil)
+	var arts struct {
+		Items []struct {
+			Kind string `json:"kind"`
+		} `json:"items"`
+	}
+	mustJSON(t, body, &arts)
+	found := false
+	for _, a := range arts.Items {
+		if a.Kind == "eval_summary" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("缺少 eval_summary 产物: %+v", arts.Items)
+	}
+}
+
+// TestEvalValidation 数据集未知 / 缺 Judge key / 未知 capability 的校验。
+func TestEvalValidation(t *testing.T) {
+	t.Setenv("THVV_FAKE_STEP_MS", "10")
+	h := newHarness(t)
+	h.login()
+
+	resp, body := h.do("POST", "/targets", map[string]any{
+		"name": "eval-v", "vendor": "zhipu",
+		"api_url":  "https://api.example.com/v1/chat/completions",
+		"protocol": "openai", "model": "glm-5.2", "api_key": "sk-x",
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("建端点: %d %s", resp.StatusCode, body)
+	}
+	var target map[string]any
+	mustJSON(t, body, &target)
+	tid, _ := target["target_id"].(string)
+
+	cases := []struct {
+		name string
+		plan map[string]any
+		code int
+	}{
+		{"未知数据集", map[string]any{"datasets": []string{"no_such_ds"}}, http.StatusBadRequest},
+		{"空数据集", map[string]any{"datasets": []string{}}, http.StatusBadRequest},
+		{"缺 Judge key", map[string]any{"datasets": []string{"hle"}}, http.StatusBadRequest},
+		{"repeats 超限", map[string]any{"datasets": []string{"aime26"}, "repeats": 999}, http.StatusBadRequest},
+	}
+	for _, c := range cases {
+		resp, body := h.do("POST", "/runs", map[string]any{
+			"tool": "thvv", "capability": "eval", "target_id": tid, "plan": c.plan,
+		}, map[string]string{"Idempotency-Key": uuidForTest(c.name)})
+		if resp.StatusCode != c.code {
+			t.Fatalf("%s: 期望 %d，实际 %d %s", c.name, c.code, resp.StatusCode, body)
+		}
+	}
+}
+
+func uuidForTest(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r < 128 {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// TestEvalGate 内置 eval-sla-v1 模板：builtin 引擎的模拟分数会触发 gate_result。
+func TestEvalGate(t *testing.T) {
+	t.Setenv("THVV_FAKE_STEP_MS", "10")
+	t.Setenv("THVV_FAKE_FAIL_RATE", "0")
+	h := newHarness(t)
+	h.login()
+
+	resp, body := h.do("POST", "/targets", map[string]any{
+		"name": "eval-gate", "vendor": "zhipu",
+		"api_url":  "https://api.example.com/v1/chat/completions",
+		"protocol": "openai", "model": "glm-5.2", "api_key": "sk-x",
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("建端点: %d %s", resp.StatusCode, body)
+	}
+	var target map[string]any
+	mustJSON(t, body, &target)
+	tid, _ := target["target_id"].(string)
+
+	resp, body = h.do("POST", "/runs", map[string]any{
+		"tool": "thvv", "capability": "eval", "target_id": tid,
+		"plan": map[string]any{"datasets": []string{"aime26"}, "limit": 4},
+	}, nil)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("提交: %d %s", resp.StatusCode, body)
+	}
+	var run map[string]any
+	mustJSON(t, body, &run)
+	runID, _ := run["run_id"].(string)
+
+	final := h.waitTerminal(runID, 20*time.Second)
+	if final["status"] != "succeeded" {
+		t.Fatalf("run 未成功: %v", final["error"])
+	}
+
+	resp, body = h.do("GET", "/runs/"+runID+"/results", nil, nil)
+	var res struct {
+		Summary map[string]any `json:"summary"`
+		Eval    struct {
+			Datasets []struct {
+				Dataset string  `json:"dataset"`
+				Score   float64 `json:"score"`
+			} `json:"datasets"`
+		} `json:"eval"`
+	}
+	mustJSON(t, body, &res)
+	if len(res.Eval.Datasets) != 1 {
+		t.Fatalf("数据集结果数异常: %+v", res.Eval)
+	}
+	// builtin 模拟分数 0.4~0.95，低于 aime26 默认下限 0.8912，gate 应为 false 且带 violation
+	resp, body = h.do("GET", "/runs/"+runID, nil, nil)
+	var runFull struct {
+		GateResult *struct {
+			Passed     bool `json:"passed"`
+			Profile    string
+			Violations []struct {
+				Rule string `json:"rule"`
+			} `json:"violations"`
+		} `json:"gate_result"`
+	}
+	mustJSON(t, body, &runFull)
+	if runFull.GateResult == nil {
+		t.Fatal("eval run 应有 gate_result")
+	}
+	if runFull.GateResult.Profile != "eval-sla-v1" {
+		t.Fatalf("gate profile 期望 eval-sla-v1，实际 %q", runFull.GateResult.Profile)
+	}
+	if runFull.GateResult.Passed && res.Eval.Datasets[0].Score < 0.8912 {
+		t.Fatal("分数低于下限却判通过")
 	}
 }

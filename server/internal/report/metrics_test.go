@@ -436,3 +436,53 @@ func TestXLSXReportShape(t *testing.T) {
 		t.Errorf("失败明细字段异常: %v", fail[1])
 	}
 }
+
+// TestEvaluateEvalGate 分数验收：低于下限/失败数据集/未配阈值/baseline_by 覆盖。
+func TestEvaluateEvalGate(t *testing.T) {
+	profile := &config.GateProfile{
+		Capability: "eval",
+		EvalTiers: []config.EvalGateTier{
+			{Dataset: "aime26", MinScore: 0.89},
+			{Dataset: "hle", MinScore: 0.36, BaselineBy: map[string]float64{"glm-5.3": 0.40, "kimi": 0.42}},
+			{Dataset: "tau2_bench", Subitem: "retail", MinScore: 0.70},
+		},
+	}
+	results := []domain.EvalDatasetResult{
+		{Dataset: "aime26", Success: true, Score: 0.93},          // 达标
+		{Dataset: "hle", Success: true, Score: 0.39},             // glm-5.3 → 0.40，未达标
+		{Dataset: "gpqa_diamond", Success: true, Score: 0.10},    // 未配阈值 → 不判定
+		{Dataset: "longbench_v2", Success: false, Error: "boom"}, // 失败
+	}
+
+	res := EvaluateEvalGate(profile, "GLM-5.3-test", results)
+	if res.Passed {
+		t.Fatal("应判定不通过")
+	}
+	rules := map[string]int{}
+	for _, v := range res.Violations {
+		rules[v.Rule+"/"+v.Bucket]++
+	}
+	if rules["min_score/hle"] != 1 {
+		t.Fatalf("hle 分数违规未识别: %+v", res.Violations)
+	}
+	if rules["eval_success/longbench_v2"] != 1 {
+		t.Fatalf("失败数据集未记违规: %+v", res.Violations)
+	}
+	if _, ok := rules["min_score/gpqa_diamond"]; ok {
+		t.Fatal("未配阈值的数据集不应判定")
+	}
+	// aime26 达标：不应出现在违规里
+	for _, v := range res.Violations {
+		if v.Bucket == "aime26" {
+			t.Fatal("aime26 达标却记了违规")
+		}
+	}
+
+	// baseline_by：kimi 模型命中 0.42，0.43 应通过
+	res2 := EvaluateEvalGate(profile, "kimi-k3", []domain.EvalDatasetResult{
+		{Dataset: "hle", Success: true, Score: 0.43},
+	})
+	if !res2.Passed {
+		t.Fatalf("kimi 基线 0.42，得分 0.43 应通过: %+v", res2.Violations)
+	}
+}

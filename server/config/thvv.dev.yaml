@@ -98,10 +98,15 @@ engines:
           - {label: "512k", min: 500000, max: 540000,  max_parallel: 32, dataset_built_in: true}
           - {label: "1m",   min: 980000, max: 1030000, max_parallel: 8,  dataset_built_in: true}
       eval:
-        enabled: false                    # eval 需要 evalscope==1.9.0（当前 venv 满足，验证后打开）
-        status: preview
+        enabled: true
+        status: ga
         working_dir: "thvv:eval"
         script: "thvv:eval/scripts/run_eval.py"
+        # 数据集不写则用内置 17 个（与 thvv/eval/scripts/run_eval.py 对齐）
+        judge:
+          model: "deepseek-v4-pro"
+          base_url: "https://api.deepseek.com/v1"
+          api_key: "${THVV_JUDGE_API_KEY:-}"
       functional:
         enabled: false
         status: planned

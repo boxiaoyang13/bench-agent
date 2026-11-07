@@ -96,7 +96,11 @@ func NewRegistry(cfg *config.Config) *Registry {
 				} else if v, ok := cfg.Resolved["roots.thvv"]; ok {
 					home = v
 				}
-				e.byCap[cap] = NewSubprocess(name, eng, capCfg, home)
+				if cap == domain.CapEval {
+					e.byCap[cap] = NewEval(name, eng, capCfg, home)
+				} else {
+					e.byCap[cap] = NewSubprocess(name, eng, capCfg, home)
+				}
 				e.status[cap] = orDefault(capCfg.Status, "ga")
 			case "http":
 				e.status[cap] = "unavailable"

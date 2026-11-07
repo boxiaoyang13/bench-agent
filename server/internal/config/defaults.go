@@ -120,6 +120,9 @@ func (c *Config) applyDefaults() {
 	if _, ok := c.Gates.Profiles["perf-sla-v1"]; !ok {
 		c.Gates.Profiles["perf-sla-v1"] = defaultSLAProfile()
 	}
+	if _, ok := c.Gates.Profiles["eval-sla-v1"]; !ok {
+		c.Gates.Profiles["eval-sla-v1"] = defaultEvalSLAProfile()
+	}
 	d(&c.Gates.DefaultProfile, "perf-sla-v1")
 
 	// engines: 每个 capability 的默认值
@@ -134,6 +137,9 @@ func (c *Config) applyDefaults() {
 		if perf := eng.Capabilities["perf"]; perf != nil {
 			applyPerfDefaults(perf)
 		}
+		if ev := eng.Capabilities["eval"]; ev != nil {
+			applyEvalDefaults(ev)
+		}
 		for _, cap := range eng.Capabilities {
 			if cap == nil {
 				continue
@@ -145,6 +151,46 @@ func (c *Config) applyDefaults() {
 				cap.Status = "unavailable"
 			}
 		}
+	}
+}
+
+func applyEvalDefaults(c *Capability) {
+	if len(c.Datasets) == 0 {
+		c.Datasets = defaultEvalDatasets()
+	}
+	if c.Judge == nil {
+		c.Judge = &Judge{}
+	}
+	if c.Judge.Model == "" {
+		c.Judge.Model = "deepseek-v4-pro"
+	}
+	if c.Judge.BaseURL == "" {
+		c.Judge.BaseURL = "https://api.deepseek.com/v1"
+	}
+}
+
+func intPtrConfig(v int) *int { return &v }
+
+// defaultEvalDatasets 与 thvv/eval/scripts/run_eval.py 的 SUPPORTED_DATASETS 对齐。
+func defaultEvalDatasets() []Dataset {
+	return []Dataset{
+		{Name: "aime25", DisplayName: "AIME25", Kind: "text", DefaultRepeats: intPtrConfig(16), DefaultEvalBatch: intPtrConfig(30), ExcludedFromAll: true},
+		{Name: "aime26", DisplayName: "AIME 2026", Kind: "text", DefaultRepeats: intPtrConfig(16), DefaultEvalBatch: intPtrConfig(30)},
+		{Name: "gpqa_diamond", DisplayName: "GPQA-Diamond", Kind: "text", DefaultRepeats: intPtrConfig(3), DefaultEvalBatch: intPtrConfig(20)},
+		{Name: "hle", DisplayName: "Humanity's Last Exam", Kind: "text", NeedsJudge: true, DefaultRepeats: intPtrConfig(1), DefaultEvalBatch: intPtrConfig(30), DefaultLimit: intPtrConfig(30)},
+		{Name: "simple_qa", DisplayName: "SimpleQA", Kind: "text", NeedsJudge: true, DefaultRepeats: intPtrConfig(1), DefaultEvalBatch: intPtrConfig(10)},
+		{Name: "mmlu_pro", DisplayName: "MMLU-Pro", Kind: "text", DefaultRepeats: intPtrConfig(1), DefaultEvalBatch: intPtrConfig(10)},
+		{Name: "longbench_v2", DisplayName: "LongBench v2", Kind: "text", DefaultRepeats: intPtrConfig(1), DefaultEvalBatch: intPtrConfig(5)},
+		{Name: "tau2_bench", DisplayName: "tau2-bench", Kind: "agent", DefaultRepeats: intPtrConfig(5), DefaultEvalBatch: intPtrConfig(5)},
+		{Name: "live_code_bench", DisplayName: "LiveCodeBench", Kind: "text", NeedsDocker: true, DefaultRepeats: intPtrConfig(1), DefaultEvalBatch: intPtrConfig(5)},
+		{Name: "swe_bench_verified_mini_agentic", DisplayName: "SWE-Bench Verified (agentic)", Kind: "agent", NeedsDocker: true, DefaultRepeats: intPtrConfig(1), DefaultEvalBatch: intPtrConfig(2)},
+		{Name: "swe_bench_pro", DisplayName: "SWE-Bench Pro", Kind: "agent", NeedsDocker: true, DefaultRepeats: intPtrConfig(1), DefaultEvalBatch: intPtrConfig(2), ExcludedFromAll: true},
+		{Name: "msr_vtt", DisplayName: "MSR-VTT（视频）", Kind: "video", DefaultRepeats: intPtrConfig(1), DefaultEvalBatch: intPtrConfig(4)},
+		{Name: "mvbench", DisplayName: "MVBench（视频）", Kind: "video", DefaultRepeats: intPtrConfig(1), DefaultEvalBatch: intPtrConfig(4)},
+		{Name: "tvbench", DisplayName: "TVBench（视频）", Kind: "video", DefaultRepeats: intPtrConfig(1), DefaultEvalBatch: intPtrConfig(4)},
+		{Name: "videomme_v2", DisplayName: "Video-MME-v2（视频）", Kind: "video", DefaultRepeats: intPtrConfig(1), DefaultEvalBatch: intPtrConfig(4)},
+		{Name: "math_vision", DisplayName: "MathVision（图像）", Kind: "image", DefaultRepeats: intPtrConfig(1), DefaultEvalBatch: intPtrConfig(4)},
+		{Name: "hallusion_bench", DisplayName: "HallusionBench（图像）", Kind: "image", DefaultRepeats: intPtrConfig(1), DefaultEvalBatch: intPtrConfig(4)},
 	}
 }
 
@@ -252,6 +298,28 @@ func defaultBuckets() []BucketCfg {
 		{Label: "200k", Min: 180000, Max: 220000, MaxParallel: 64},
 		{Label: "512k", Min: 500000, Max: 540000, MaxParallel: 32, DatasetBuiltIn: boolPtr(false)},
 		{Label: "1m", Min: 980000, Max: 1030000, MaxParallel: 8, DatasetBuiltIn: boolPtr(false)},
+	}
+}
+
+// defaultEvalSLAProfile 与 thvv/eval/效果验收标准.xlsx 的基线对齐
+// （取 glm-5.3 列为默认基线，允许 ±2-4% 浮动已折算进 min_score）。
+// 模型差异大的场景建议在 YAML 里用 baseline_by 按模型覆盖。
+func defaultEvalSLAProfile() *GateProfile {
+	lo := func(base float64) float64 { return base/100 - 0.04 } // 基线 -4% 浮动下限
+	return &GateProfile{
+		Capability:  "eval",
+		Description: "效果评测分数下限（对齐《效果验收标准.xlsx》，基线 -4% 浮动）",
+		EvalTiers: []EvalGateTier{
+			{Dataset: "aime26", MinScore: lo(93.12)},
+			{Dataset: "hle", MinScore: lo(40.18)},
+			{Dataset: "mmlu_pro", MinScore: lo(85.96)},
+			{Dataset: "simple_qa", MinScore: lo(33.7)},
+			{Dataset: "gpqa_diamond", MinScore: lo(91.08)},
+			{Dataset: "longbench_v2", MinScore: lo(67.58)},
+			{Dataset: "live_code_bench", MinScore: lo(91.28)},
+			{Dataset: "swe_bench_verified_mini_agentic", MinScore: lo(88)},
+			{Dataset: "tau2_bench", MinScore: lo(87.2)}, // OVERALL
+		},
 	}
 }
 

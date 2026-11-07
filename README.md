@@ -52,6 +52,7 @@ make run   CONFIG=./config/thvv.dev.yaml     # http://127.0.0.1:18080/ui/
 ├── README.md                     本文档
 ├── docs/                         协议与设计文档
 │   ├── API.md / openapi.yaml     HTTP 协议规范 + 接口契约
+│   ├── EVAL.md                   效果评测接入设计（Step=数据集 / 产物 / 限制）
 │   ├── DESIGN.md / CONFIG.md     设计文档（§9.1 双跑对账）/ 配置规范
 │   ├── WEB-UI.md                 前端与交互（含实现记录）
 │   └── config/                   Python 侧配置样例（thvv.yaml、path_resolver_reference.py）
@@ -90,9 +91,11 @@ make run   CONFIG=./config/thvv.dev.yaml     # http://127.0.0.1:18080/ui/
 | `GET /v1/runs/{id}` / `results` / `results/failures` / `artifacts` / `artifacts/{id}` | ✅ |
 | SSE 进度流（`Last-Event-ID` 断点续传 + 心跳） | ✅ |
 | 报告：HTML / 45 列 xlsx / 失败 CSV / SLA json | ✅ |
+| `capability=eval` 效果评测（17 数据集，Step=数据集，产物 eval_report_v2.html/CSV/JSON/tar.gz） | ✅ |
+| eval 分数验收 `eval-sla-v1`（对齐《效果验收标准.xlsx》，支持 `baseline_by` 按模型覆盖） | ✅ |
 | Web 页面（登录、三步向导、运行监控、结果、历史、能力清单） | ✅ |
 | 引擎：`builtin` 模拟 / `subprocess` evalscope | ✅（subprocess 已端到端联调，见下） |
-| `capability=eval` / `functional` | ⏳ 预留（返回 `501 not_implemented` + `available_at`） |
+| `capability=functional` | ⏳ 预留（返回 `501 not_implemented` + `available_at`） |
 | `kind: http` 外部工具代理 | ⏳ v1.1 |
 | `POST /v1/runs/{id}/reports` 重新生成 | ⚠️ 占位返回 202（v1 复用跑完时的产物） |
 

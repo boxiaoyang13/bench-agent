@@ -123,6 +123,12 @@
   <div class="panel" id="panel-step-2" hidden>
     <h2>测试计划</h2>
 
+    <div class="seg" id="cap-seg" role="tablist">
+      <button class="seg-item active" data-cap="perf" role="tab">性能压测</button>
+      <button class="seg-item" data-cap="eval" role="tab">效果评测</button>
+    </div>
+
+    <div class="pane" id="pane-perf">
     <div class="seg" id="mode-seg" role="tablist">
       <button class="seg-item active" data-mode="single" role="tab">单档测试</button>
       <button class="seg-item" data-mode="matrix" role="tab">全档位矩阵</button>
@@ -210,6 +216,59 @@
       </label>
     </div>
 
+    </div><!-- /pane-perf -->
+
+    <!-- 效果评测 -->
+    <div class="pane" id="pane-eval" hidden>
+      <div class="field">
+        <span>数据集（可多选）</span>
+        <div class="chips" id="e-datasets"></div>
+        <small>带「Judge」的数据集需填下面的 Judge Key；带「Docker」的需要宿主安装 Docker</small>
+      </div>
+
+      <div class="grid-3">
+        <label class="field">每个数据集条数（limit）
+          <input id="e-limit" type="number" min="0" placeholder="0 = 全量">
+        </label>
+        <label class="field">repeats
+          <input id="e-repeats" type="number" min="0" placeholder="0 = 数据集默认">
+        </label>
+        <label class="field">并发（eval_batch_size）
+          <input id="e-batch" type="number" min="0" placeholder="0 = 数据集默认">
+        </label>
+      </div>
+
+      <div class="grid-3">
+        <label class="field">思考模式
+          <select id="e-thinking">
+            <option value="true">开启</option>
+            <option value="false">关闭</option>
+          </select>
+        </label>
+        <label class="field">max_tokens
+          <input id="e-max-tokens" type="number" min="0" placeholder="0 = 按数据集/模型">
+        </label>
+        <label class="field">Provider 名
+          <input id="e-provider" placeholder="默认取测试名称" autocomplete="off">
+        </label>
+      </div>
+
+      <h3 class="section-title">LLM Judge（hle / simple_qa 必填）</h3>
+      <div class="grid-3">
+        <label class="field">Judge 模型
+          <input id="e-judge-model" placeholder="deepseek-v4-pro" autocomplete="off">
+        </label>
+        <label class="field">Judge Base URL
+          <input id="e-judge-url" placeholder="https://api.deepseek.com/v1" autocomplete="off">
+        </label>
+        <label class="field">Judge API Key
+          <input id="e-judge-key" type="password" placeholder="sk-..." autocomplete="new-password">
+        </label>
+      </div>
+
+      <div class="estimate" id="e-estimate"></div>
+    </div>
+
     <!-- 报告 -->
     <h3 class="section-title">报告</h3>
     <div class="grid-3">
@@ -219,7 +278,7 @@
       <label class="field">报告标题
         <input id="r-title" placeholder="留空自动生成" autocomplete="off">
       </label>
-      <label class="field">产物格式
+      <label class="field" id="r-formats-field">产物格式
         <div class="check-row">
           <label><input type="checkbox" id="r-html" checked> HTML</label>
           <label><input type="checkbox" id="r-xlsx" checked> Excel</label>
@@ -288,7 +347,7 @@
       <button class="btn ghost sm" id="btn-toggle-log">显示日志</button>
     </div>
     <table class="tbl" id="steps-table">
-      <thead><tr>
+      <thead id="steps-head"><tr>
         <th>#</th><th>档位</th><th>并发</th><th>请求数</th><th>状态</th>
         <th class="num">成功率</th><th class="num">TTFT P50</th><th class="num">Output tps</th><th class="num">耗时</th>
       </tr></thead>
@@ -299,7 +358,7 @@
 
   <div id="run-result" hidden>
     <div class="panel">
-      <div class="panel-head"><h3>验收结论</h3><span id="gate-badge"></span></div>
+      <div class="panel-head"><h3 id="run-result-title">验收结论</h3><span id="gate-badge"></span></div>
       <div id="gate-body"></div>
     </div>
     <div class="panel">

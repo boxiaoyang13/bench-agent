@@ -32,6 +32,16 @@ type planDTO struct {
 	Request          domain.RequestDefaults           `json:"request,omitempty"`
 	DatasetDir       string                           `json:"dataset_dir,omitempty"`
 	ToolParams       json.RawMessage                  `json:"tool_params,omitempty"`
+
+	// eval
+	Datasets      []string          `json:"datasets,omitempty"`
+	Limit         int               `json:"limit,omitempty"`
+	Repeats       int               `json:"repeats,omitempty"`
+	EvalBatchSize int               `json:"eval_batch_size,omitempty"`
+	Judge         *domain.JudgeSpec `json:"judge,omitempty"`
+	ProviderName  string            `json:"provider_name,omitempty"`
+	Thinking      *bool             `json:"thinking,omitempty"`
+	ThinkingType  string            `json:"thinking_type,omitempty"`
 }
 
 func (d planDTO) toDomain() domain.Plan {
@@ -41,6 +51,8 @@ func (d planDTO) toDomain() domain.Plan {
 		CooldownSec: d.CooldownSec, SuccessRateMin: d.SuccessRateMin, TPMBudget: d.TPMBudget,
 		StopOnFailure: d.StopOnFailure, Request: d.Request, DatasetDir: d.DatasetDir,
 		ToolParams: d.ToolParams,
+		Datasets:   d.Datasets, Limit: d.Limit, Repeats: d.Repeats, EvalBatchSize: d.EvalBatchSize,
+		Judge: d.Judge, ProviderName: d.ProviderName, Thinking: d.Thinking, ThinkingType: d.ThinkingType,
 	}
 }
 
@@ -151,22 +163,28 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	plan := planDTOv.toDomain()
-	if plan.Request.Temperature == nil {
-		plan.Request.Temperature = target.Defaults.Temperature
-	} else {
-		plan.Request.Temperature = s.resolveTemperature(target.Model, plan.Request.Temperature)
-	}
-	if plan.Request.MaxTokens == 0 {
-		plan.Request.MaxTokens = defaultInt(target.Defaults.MaxTokens, s.defaultMaxTokens())
-	}
-	if plan.Request.MaxTurns == 0 {
-		plan.Request.MaxTurns = 1
-	}
-	if plan.Request.ConnectTimeoutSec == 0 {
-		plan.Request.ConnectTimeoutSec = defaultInt(target.Defaults.ConnectTimeoutSec, 60)
-	}
-	if plan.Request.ReadTimeoutSec == 0 {
-		plan.Request.ReadTimeoutSec = defaultInt(target.Defaults.ReadTimeoutSec, 600)
+	// 请求参数默认值只在 perf 下从 target 补齐。
+	// eval 不能补 max_tokens：run_eval.py 对思考模型的默认是 131072（kimi 98304），
+	// 注入 target 的 perf 默认 4096 会把 reasoning 截断、最终答案为空（大分数损失）；
+	// temperature 同理，eval 缺省让 Python 侧按模型推断。
+	if cap == domain.CapPerf {
+		if plan.Request.Temperature == nil {
+			plan.Request.Temperature = target.Defaults.Temperature
+		} else {
+			plan.Request.Temperature = s.resolveTemperature(target.Model, plan.Request.Temperature)
+		}
+		if plan.Request.MaxTokens == 0 {
+			plan.Request.MaxTokens = defaultInt(target.Defaults.MaxTokens, s.defaultMaxTokens())
+		}
+		if plan.Request.MaxTurns == 0 {
+			plan.Request.MaxTurns = 1
+		}
+		if plan.Request.ConnectTimeoutSec == 0 {
+			plan.Request.ConnectTimeoutSec = defaultInt(target.Defaults.ConnectTimeoutSec, 60)
+		}
+		if plan.Request.ReadTimeoutSec == 0 {
+			plan.Request.ReadTimeoutSec = defaultInt(target.Defaults.ReadTimeoutSec, 600)
+		}
 	}
 
 	gate := dto.Gate
@@ -274,6 +292,14 @@ func (s *Server) handleRunResults(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if run.Capability == domain.CapEval {
+		writeJSON(w, http.StatusOK, domain.RunResults{
+			RunID: runID, Capability: run.Capability,
+			GateResult: run.GateResult, Summary: run.Summary, Eval: s.evalMetricsForRun(run),
+		})
+		return
+	}
+
 	metrics := s.metricsForRun(r.Context(), run)
 	res := domain.RunResults{
 		RunID: runID, Capability: run.Capability,
@@ -299,6 +325,22 @@ func (s *Server) handleRunResults(w http.ResponseWriter, r *http.Request) {
 		res.Metrics.DifficultyCurve = append(res.Metrics.DifficultyCurve, v)
 	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+// evalMetricsForRun 回读 run 结束时落盘的 metrics.json（结构：{"eval": {...}}）。
+func (s *Server) evalMetricsForRun(run *domain.Run) *domain.EvalMetrics {
+	p := filepath.Join(string(s.cfg.Paths.RunsDir), run.ID, "metrics.json")
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return nil
+	}
+	var f struct {
+		Eval *domain.EvalMetrics `json:"eval"`
+	}
+	if json.Unmarshal(b, &f) != nil {
+		return nil
+	}
+	return f.Eval
 }
 
 // metricsForRun 获取指标：优先从 benchmark_data.db 重算（保证与报告口径一致），

@@ -448,19 +448,30 @@ Catalog (buckets / datasets / suites, 只读)
 
 `steps_total` 计算方式：`Σ_{bucket ∈ buckets} |{p ∈ ladder ∪ extra : p ≤ max_parallel(bucket)}|`，服务端在 `202` 响应中给出，客户端可用于算百分比。
 
-### 5.3 `plan` 规范 —— eval（preview，接口已定）
+### 5.3 `plan` 规范 —— eval
 
 ```json
 {
   "mode": "single",
-  "datasets": ["aime26"],
+  "datasets": ["aime26", "gpqa_diamond"],
   "limit": 30,
   "repeats": 1,
   "eval_batch_size": 10,
+  "thinking": true,
   "judge": {"api_key":"sk-xxx","model":"deepseek-v4-pro","base_url":"https://api.deepseek.com/v1"},
-  "provider_name": "zhipu"
+  "provider_name": "zhipu",
+  "request": {"max_tokens": 8192}
 }
 ```
+
+- `datasets`：取自 `GET /v1/catalog/datasets`，去重保序；未知数据集 → 400。
+- `limit`：每数据集条数，0 = 全量（若数据集配置了 `default_limit` 则用它）。
+- `repeats` / `eval_batch_size`：0 = 数据集默认；上限 50 / 256。
+- `judge`：所选数据集含 `needs_judge=true`（hle / simple_qa）时 `api_key` 必填，否则 400。
+- `provider_name`：缺省取 target.vendor，再缺省 `unknown`。
+- **Step = 数据集**：`steps_total = len(datasets)`，一个数据集一个子进程。
+- 结果在 `GET /v1/runs/{id}/results` 的 `eval` 字段（见 §5.9）；`metrics` 为空。
+- 设计与产物见 [`EVAL.md`](./EVAL.md)。
 
 ### 5.4 `plan` 规范 —— functional（planned，501）
 
@@ -610,12 +621,31 @@ queued ──► preparing ──► running ──► reporting ──► succe
 > **`itl` 与 `tpot` 是两个不同口径**（ITL = 相邻流式 chunk 间隔按 chunk 汇总；TPOT = evalscope 写入的 `time_per_output_token`），不可混用。
 > 分位数算法与该脚本一致（线性插值），保证服务端与历史 Python 报告数字可比。
 
-`capability=eval` 的 `metrics`（v1.1）：
+`capability=eval` 的结构化结果放在 `eval` 字段（`metrics` 为空对象）：
 
 ```json
-{"metrics":{"per_dataset":[{"dataset":"aime26","score":0.87,"samples":30,
-  "skipped":1,"repeats":[0.87],"ttft_p50_sec":0.42,"tpot_ms":18.2}]}}
+{
+  "run_id": "run_...",
+  "capability": "eval",
+  "summary": {"verdict":"pass","datasets_total":2,"datasets_succeeded":2,
+              "datasets_failed":0,"score_avg":0.63,"model":"glm-5.3-test","provider":"turbo"},
+  "eval": {
+    "model": "glm-5.3-test",
+    "provider": "turbo",
+    "datasets": [{
+      "dataset":"aime26","label":"aime26","success":true,
+      "score":1.0,"metric":"mean_acc","num_samples":4,
+      "limit":4,"repeats":1,"eval_batch_size":4,
+      "retries_used":0,"rate_limited":false,"elapsed_sec":170.0,
+      "skipped":0,"cache_hit_rate":0.0
+    }]
+  }
+}
 ```
+
+> 分数直接采信 `thvv/eval` 落盘的 `eval_summary.json`（Python 侧口径），Go 不二次计算。
+> 产物：`eval_report`（eval_report_v2.html）、`eval_summary`（json）、`eval_samples`（csv）、
+> `eval_archive`（tar.gz）、`run_log`、汇总 `all_eval_summary.json`。详见 [`EVAL.md`](./EVAL.md)。
 
 **`GET /v1/runs/{run_id}/results/failures`** — 失败明细分页（对应 `export_failure_details.py`）：
 `?limit=50&cursor=&reason=timeout`，返回 `{items:[{step_index,request_index,reason,http_status,request_body_excerpt,response_body_excerpt,error}], next_cursor}`。

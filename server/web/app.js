@@ -15,6 +15,9 @@ const state = {
   tools: [],
   buckets: { items: [], scenarios: [], default_ladder: [1, 8, 32, 64, 128], number_by_parallel: {} },
   gates: [],
+  datasets: [],
+  capability: 'perf',    // perf | eval
+  evalDatasets: [],      // 选中的评测数据集
   targets: [],
   target: null,          // 当前选中的 Target 对象
   step: 1,               // 向导步骤
@@ -140,6 +143,11 @@ function bucketTokens(label) {
 
 /** 与服务端 steps_total 同一算法（纯函数，用于提交前预估与校验） */
 function computeSteps(plan) {
+  // 效果评测：一个数据集一个步骤
+  if (Array.isArray(plan.datasets)) {
+    const perStep = plan.datasets.map(d => ({ bucket: d, parallel: plan.eval_batch_size || 0, number: plan.limit || 0 }));
+    return { total: perStep.length, perStep, skipped: [] };
+  }
   const cat = state.buckets;
   const ladder = (plan.parallel_ladder && plan.parallel_ladder.length) ? plan.parallel_ladder : cat.default_ladder;
   const perStep = [];
@@ -206,17 +214,19 @@ window.addEventListener('hashchange', router);
 /* ---------------------------------------------------------------- 启动 */
 /** 拉取参考数据（工具/档位/阈值/端点）。登录后与启动时各调一次。 */
 async function loadReferenceData() {
-  const [meta, tools, buckets, gates, targets] = await Promise.all([
+  const [meta, tools, buckets, gates, datasets, targets] = await Promise.all([
     api('GET', '/meta').catch(() => null),
     api('GET', '/tools').catch(() => ({ items: [] })),
     api('GET', '/catalog/buckets').catch(() => null),
     api('GET', '/catalog/gates').catch(() => ({ items: [] })),
+    api('GET', '/catalog/datasets').catch(() => ({ items: [] })),
     api('GET', '/targets').catch(() => ({ items: [] })),
   ]);
   state.meta = meta;
   state.tools = tools.items || [];
   if (buckets) state.buckets = buckets;
   state.gates = gates.items || [];
+  state.datasets = datasets.items || [];
   state.targets = targets.items || [];
   if (meta) setServerBadge(true, meta);
 }
@@ -291,7 +301,9 @@ function initWizard() {
   fillBucketSelects();
   fillGateSelect();
   renderOverrideTable();
+  renderEvalDatasets();
   syncModeUI();
+  syncCapabilityUI();
   goStep(state.step);
 }
 
@@ -489,6 +501,61 @@ $('#m-buckets')?.addEventListener('click', e => {
   updateEstimate();
 });
 
+function syncCapabilityUI() {
+  $$('#cap-seg .seg-item').forEach(b => b.classList.toggle('active', b.dataset.cap === state.capability));
+  $('#pane-perf').hidden = state.capability !== 'perf';
+  $('#pane-eval').hidden = state.capability !== 'eval';
+  $('#r-formats-field').hidden = state.capability === 'eval';
+  updateEstimate();
+  updateEvalEstimate();
+}
+
+$$('#cap-seg .seg-item').forEach(btn => btn.addEventListener('click', () => {
+  state.capability = btn.dataset.cap;
+  fillGateSelect();
+  syncCapabilityUI();
+}));
+
+function renderEvalDatasets() {
+  const box = $('#e-datasets');
+  if (!box) return;
+  if (!state.datasets.length) {
+    box.innerHTML = '<span class="muted">服务端未启用评测数据集</span>';
+    return;
+  }
+  box.innerHTML = state.datasets.map(d => {
+    const on = state.evalDatasets.includes(d.name);
+    const tags = [d.needs_judge ? 'Judge' : '', d.needs_docker ? 'Docker' : ''].filter(Boolean).join(' / ');
+    const title = [d.display_name, d.kind, tags].filter(Boolean).join(' · ');
+    return `<span class="chip${on ? ' on' : ''}" data-ds="${esc(d.name)}" title="${esc(title)}">${esc(d.name)}${tags ? `<small> (${esc(tags)})</small>` : ''}</span>`;
+  }).join('');
+}
+
+$('#e-datasets')?.addEventListener('click', e => {
+  const chip = e.target.closest('.chip');
+  if (!chip) return;
+  const name = chip.dataset.ds;
+  const i = state.evalDatasets.indexOf(name);
+  if (i >= 0) state.evalDatasets.splice(i, 1); else state.evalDatasets.push(name);
+  chip.classList.toggle('on');
+  updateEvalEstimate();
+});
+
+function evalDatasetInfo(name) { return state.datasets.find(d => d.name === name); }
+
+function updateEvalEstimate() {
+  const box = $('#e-estimate');
+  if (!box) return;
+  if (state.capability !== 'eval') { box.hidden = true; return; }
+  box.hidden = false;
+  if (!state.evalDatasets.length) { box.innerHTML = '请至少选择一个数据集'; return; }
+  const needJudge = state.evalDatasets.some(n => evalDatasetInfo(n)?.needs_judge);
+  const needDocker = state.evalDatasets.filter(n => evalDatasetInfo(n)?.needs_docker);
+  box.innerHTML = `本次共 <b>${state.evalDatasets.length}</b> 个数据集：${state.evalDatasets.map(esc).join('、')}。
+    ${needJudge ? '<br>⚠ 含需要 LLM Judge 的数据集，必须在下方填 Judge API Key。' : ''}
+    ${needDocker.length ? `<br>⚠ ${needDocker.map(esc).join('、')} 需要宿主安装 Docker + swebench/ms-enclave。` : ''}`;
+}
+
 function syncModeUI() {
   $$('#mode-seg .seg-item').forEach(b => b.classList.toggle('active', b.dataset.mode === state.mode));
   $('#pane-single').hidden = state.mode !== 'single';
@@ -545,7 +612,33 @@ $('#override-table')?.addEventListener('change', e => {
 });
 
 /* ---------- 计划组装 ---------- */
+function evalPlan() {
+  const num = (sel) => Number($(sel).value) || 0;
+  const plan = {
+    mode: 'single',
+    datasets: [...state.evalDatasets],
+    limit: num('#e-limit'),
+    repeats: num('#e-repeats'),
+    eval_batch_size: num('#e-batch'),
+    thinking: $('#e-thinking').value === 'true',
+    provider_name: $('#e-provider').value.trim() || undefined,
+  };
+  const mt = num('#e-max-tokens');
+  if (mt) plan.request = { max_tokens: mt };
+  const jm = $('#e-judge-model').value.trim();
+  const ju = $('#e-judge-url').value.trim();
+  const jk = $('#e-judge-key').value.trim();
+  if (jm || ju || jk) {
+    plan.judge = {};
+    if (jm) plan.judge.model = jm;
+    if (ju) plan.judge.base_url = ju;
+    if (jk) plan.judge.api_key = jk;
+  }
+  return plan;
+}
+
 function buildPlan() {
+  if (state.capability === 'eval') return evalPlan();
   const base = {
     dataset_dir: 'auto',
     cooldown_sec: Number($('#m-cooldown').value) || 0,
@@ -593,7 +686,7 @@ function buildPlan() {
 function updateEstimate() {
   const box = $('#estimate');
   if (!box) return;
-  if (state.mode === 'single') { box.hidden = true; return; }
+  if (state.capability === 'eval' || state.mode === 'single') { box.hidden = true; return; }
   box.hidden = false;
   const plan = buildPlan();
   if (!plan.buckets.length) { box.innerHTML = '请至少选择一个档位'; return; }
@@ -616,15 +709,23 @@ function updateEstimate() {
 
 function fillGateSelect() {
   const sel = $('#g-profile');
+  const list = state.gates.filter(g => (g.capability || 'perf') === (state.capability || 'perf'));
   sel.innerHTML = '<option value="">不判定</option>' +
-    state.gates.map(g => `<option value="${esc(g.profile)}">${esc(g.profile)} — ${esc(g.description || '')}</option>`).join('');
-  if (state.gates[0]) sel.value = state.gates[0].profile;
+    list.map(g => `<option value="${esc(g.profile)}">${esc(g.profile)} — ${esc(g.description || '')}</option>`).join('');
+  if (list[0]) sel.value = list[0].profile;
+  else if (state.gates[0]) sel.value = state.gates[0].profile;
 }
 
 /* ---------- 步骤 2 → 3 ---------- */
 $('#btn-back-1')?.addEventListener('click', () => goStep(1));
 $('#btn-to-step3')?.addEventListener('click', () => {
-  if (state.mode === 'matrix' && !state.matrixBuckets.length) { toast('请至少选择一个档位', 'err'); return; }
+  if (state.capability === 'eval') {
+    if (!state.evalDatasets.length) { toast('请至少选择一个数据集', 'err'); return; }
+    const needJudge = state.evalDatasets.some(n => evalDatasetInfo(n)?.needs_judge);
+    if (needJudge && !$('#e-judge-key').value.trim()) { toast('所选数据集需要 LLM Judge，请填写 Judge API Key', 'err'); return; }
+  } else if (state.mode === 'matrix' && !state.matrixBuckets.length) {
+    toast('请至少选择一个档位', 'err'); return;
+  }
   goStep(3);
 });
 $('#btn-back-2')?.addEventListener('click', () => goStep(2));
@@ -637,14 +738,20 @@ function buildSubmitPayload() {
   if ($('#r-xlsx').checked) formats.push('xlsx');
   const payload = {
     tool: 'thvv',
-    capability: 'perf',
+    capability: state.capability,
     target_id: state.target?.target_id,
     plan,
     report: { formats, client_name: $('#r-client').value.trim() || undefined, title: $('#r-title').value.trim() || undefined },
   };
-  const profile = $('#g-profile').value;
-  if (profile) {
-    payload.gate = { profile, mode: $('#g-mode').value, params: { user_tpm_quota: Number($('#g-tpm').value) || 0 } };
+  if (state.capability === 'perf') {
+    const profile = $('#g-profile').value;
+    if (profile) {
+      payload.gate = { profile, mode: $('#g-mode').value, params: { user_tpm_quota: Number($('#g-tpm').value) || 0 } };
+    }
+  } else {
+    // eval：默认启用 eval-sla-v1（分数下限）；提交「不判定」则不传 gate
+    const profile = $('#g-profile').value;
+    if (profile) payload.gate = { profile, mode: 'report_only' };
   }
   return payload;
 }
@@ -659,8 +766,28 @@ function renderConfirm() {
   ].map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v ?? '—')}</dd>`).join('');
 
   const payload = buildSubmitPayload();
-  const { total, perStep } = computeSteps(payload.plan);
-  const rows = [['模式', payload.plan.mode === 'single' ? '单档测试' : '全档位矩阵']];
+  const { total } = computeSteps(payload.plan);
+  let rows;
+  if (state.capability === 'eval') {
+    const plan = payload.plan;
+    rows = [
+      ['能力', '效果评测'],
+      ['数据集', (plan.datasets || []).join(' / ')],
+      ['每集条数', plan.limit || '全量'],
+      ['repeats', plan.repeats || '数据集默认'],
+      ['并发', plan.eval_batch_size || '数据集默认'],
+      ['思考模式', plan.thinking ? '开启' : '关闭'],
+      ['max_tokens', plan.request?.max_tokens || '自动'],
+      ['Judge', plan.judge?.model ? `${plan.judge.model}${plan.judge.api_key ? '（已填 Key）' : ''}` : '不需要'],
+      ['验收', payload.gate ? `${payload.gate.profile}（分数下限）` : '不判定'],
+      ['执行步骤', total],
+      ['产物', 'HTML / JSON / CSV / tar.gz'],
+    ];
+    $('#cf-plan').innerHTML = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');
+    $('#cf-json').textContent = JSON.stringify(payload, null, 2);
+    return;
+  }
+  rows = [['模式', payload.plan.mode === 'single' ? '单档测试' : '全档位矩阵']];
   if (payload.plan.mode === 'single') {
     rows.push(['档位', payload.plan.buckets[0]]);
     rows.push(['并发', payload.plan.parallel_ladder[0]]);
@@ -747,9 +874,11 @@ function setRunTitle(run) {
   const cap = run.capability === 'perf' ? '性能压测' : run.capability === 'eval' ? '效果评测' : '功能测试';
   $('#run-title').textContent = `${run.target?.model || ''} · ${cap}`;
   const plan = run.plan || {};
-  const scope = plan.mode === 'single'
-    ? `单档 ${plan.buckets?.[0] || ''} / 并发 ${plan.parallel_ladder?.[0] ?? ''} / ${plan.number ?? ''} 条`
-    : `全档 ${plan.buckets?.length || 0} 个档位 / 梯度 ${(plan.parallel_ladder || []).join(',')}`;
+  const scope = run.capability === 'eval'
+    ? `数据集 ${(plan.datasets || []).length} 个：${(plan.datasets || []).join(', ')}`
+    : (plan.mode === 'single'
+      ? `单档 ${plan.buckets?.[0] || ''} / 并发 ${plan.parallel_ladder?.[0] ?? ''} / ${plan.number ?? ''} 条`
+      : `全档 ${plan.buckets?.length || 0} 个档位 / 梯度 ${(plan.parallel_ladder || []).join(',')}`);
   $('#run-meta').textContent = `${run.run_id} · ${scope} · 创建于 ${new Date(run.created_at).toLocaleString()}`;
 }
 
@@ -768,7 +897,16 @@ function renderRun(run) {
   $('#run-progress-text').textContent = `${done} / ${total} 步${p.current ? ` · 正在跑 ${p.current.bucket} / 并发 ${p.current.parallel}` : ''}`;
   $('#run-progress-eta').textContent = p.eta_sec ? `预计剩余 ${fmtDur(p.eta_sec)}` : (p.elapsed_sec ? `已用 ${fmtDur(p.elapsed_sec)}` : '');
 
-  if (run.steps) renderSteps(run.steps);
+  if (run.steps) renderSteps(run.steps, run.capability);
+}
+
+function renderStepsHead(cap) {
+  const el = $('#steps-head');
+  if (!el) return;
+  el.innerHTML = cap === 'eval'
+    ? '<tr><th>#</th><th>数据集</th><th>并发</th><th>条数</th><th>状态</th><th class="num">得分</th><th class="num">耗时</th></tr>'
+    : '<tr><th>#</th><th>档位</th><th>并发</th><th>请求数</th><th>状态</th>'
+      + '<th class="num">成功率</th><th class="num">TTFT P50</th><th class="num">Output tps</th><th class="num">耗时</th></tr>';
 }
 
 function statusText(s) {
@@ -778,8 +916,23 @@ function statusText(s) {
   })[s] || s;
 }
 
-function renderSteps(steps) {
+function renderSteps(steps, capability) {
+  const cap = capability || state.run?.capability || 'perf';
+  renderStepsHead(cap);
   const tbody = $('#steps-table tbody');
+  if (cap === 'eval') {
+    tbody.innerHTML = steps.map((s, i) => `
+      <tr data-step="${i}">
+        <td class="muted">${i + 1}</td>
+        <td><b>${esc(s.bucket || '—')}</b></td>
+        <td class="num">${s.parallel || '默认'}</td>
+        <td class="num">${s.number || '全量'}</td>
+        <td class="st">${stepBadge(s.status)}</td>
+        <td class="num sr">${s.score != null ? fmtNum(s.score) : '—'}</td>
+        <td class="num dur">${s.duration_sec != null ? fmtDur(s.duration_sec) : '—'}</td>
+      </tr>`).join('');
+    return;
+  }
   tbody.innerHTML = steps.map((s, i) => `
     <tr data-step="${i}">
       <td class="muted">${i + 1}</td>
@@ -846,6 +999,7 @@ function handleEvent(type, d) {
         status: d.status, success_rate: d.success_rate,
         output_tps: d.output_tps, duration_sec: d.duration_sec,
         ttft_p50_sec: d.ttft_p50_sec ?? prev.ttft_p50_sec,
+        score: d.score ?? prev.score,
       });
       renderRun(run);
       appendLog(`← step ${d.step_index + 1} ${d.status} 成功率=${fmtPct(d.success_rate)} 耗时=${fmtDur(d.duration_sec)}`);
@@ -931,6 +1085,9 @@ async function loadRunResult(runId) {
 function renderResults(results, artifacts) {
   $('#run-result').hidden = false;
 
+  if (results.capability === 'eval') { renderEvalResults(results, artifacts); return; }
+  $('#run-result-title').textContent = '验收结论';
+
   const s = results.summary || {};
   const kpis = [
     ['成功率', fmtPct(s.success_rate), `${s.steps_succeeded ?? '—'}/${s.steps_total ?? '—'} 步成功`],
@@ -979,6 +1136,79 @@ function renderResults(results, artifacts) {
     </li>`).join('') : '<li class="muted">暂无产物</li>';
 }
 
+function renderEvalResults(results, artifacts) {
+  $('#run-result-title').textContent = '评测结论';
+  const s = results.summary || {};
+  const ds = (results.eval && results.eval.datasets) || [];
+  const g = results.gate_result;
+  let cls, text;
+  if (g) {
+    cls = g.passed ? 'ok' : 'err';
+    text = g.passed ? '✓ 验收通过' : '✕ 未达标';
+  } else {
+    const verdictMap = { pass: ['ok', '✓ 全部通过'], partial: ['warn', '! 部分通过'], fail: ['err', '✕ 未通过'] };
+    [cls, text] = verdictMap[s.verdict] || ['', '—'];
+  }
+  const badge = $('#gate-badge');
+  badge.className = 'badge ' + cls;
+  badge.textContent = text;
+
+  const kpis = [
+    ['数据集', `${s.datasets_succeeded ?? '—'}/${s.datasets_total ?? '—'}`, '成功 / 总数'],
+    ['平均分', s.score_avg != null ? fmtNum(s.score_avg, 4) : '—', '成功数据集均值'],
+    ['模型', results.eval?.model || '—', results.eval?.provider || ''],
+  ];
+  $('#run-kpis').innerHTML = kpis.map(([k, v, sub]) =>
+    `<div class="kpi"><div class="k">${esc(k)}</div><div class="v">${esc(v)}<small> ${esc(sub)}</small></div></div>`).join('');
+
+  const tierByDs = {};
+  (g?.tier_summary || []).forEach(t => tierByDs[t.tier] = t);
+  const rows = ds.map(d => {
+    const tier = tierByDs[d.dataset];
+    const sc = d.success ? fmtNum(d.score, 4) : '—';
+    const min = tier ? fmtNum(tier.p50_max_sec, 4) : '不判定';
+    const passCell = tier
+      ? (tier.passed ? '<span class="badge ok">达标</span>' : '<span class="badge err">未达标</span>')
+      : '<span class="muted">—</span>';
+    return `
+    <tr>
+      <td><b>${esc(d.dataset)}</b></td>
+      <td>${d.success ? '<span class="badge ok">成功</span>' : `<span class="badge err">失败</span>`}</td>
+      <td class="num"><b>${sc}</b></td>
+      <td class="num">${min}</td>
+      <td>${passCell}</td>
+      <td>${esc(d.metric || '—')}</td>
+      <td class="num">${d.num_samples ?? '—'}</td>
+      <td class="num">${d.repeats || '默认'}</td>
+      <td class="num">${d.skipped ?? 0}</td>
+      <td class="num">${d.elapsed_sec != null ? fmtDur(d.elapsed_sec) : '—'}</td>
+      <td class="muted">${esc(d.error || '')}</td>
+    </tr>`;
+  }).join('');
+  const violRows = (g?.violations || []).map(v => `
+    <tr><td>${esc(v.bucket || '')}</td><td>${esc(v.rule)}</td>
+      <td class="num">${fmtNum(v.actual, 4)}</td><td class="num">${fmtNum(v.threshold, 4)}</td>
+      <td class="muted">${esc(v.message || '')}</td></tr>`).join('');
+  $('#gate-body').innerHTML = ds.length
+    ? `<p class="muted">共 ${ds.length} 个数据集；分数来自 eval_summary.json（Python 侧口径）。
+       ${g ? `验收模板 ${esc(g.profile)} · 违规 ${(g.violations || []).length} 项` : '未启用分数验收'}</p>
+       <table class="tbl"><thead><tr><th>数据集</th><th>状态</th><th class="num">得分</th><th class="num">下限</th><th>结论</th>
+       <th>指标</th><th class="num">样本数</th><th class="num">repeats</th><th class="num">跳过</th><th class="num">耗时</th><th>错误</th>
+       </tr></thead><tbody>${rows}</tbody></table>
+       ${violRows ? `<h4 style="margin-top:16px">违规明细</h4><table class="tbl"><thead><tr>
+         <th>数据集</th><th>规则</th><th class="num">实测</th><th class="num">阈值</th><th>说明</th>
+       </tr></thead><tbody>${violRows}</tbody></table>` : ''}`
+    : '<p class="muted">没有数据集结果。</p>';
+
+  $('#artifact-list').innerHTML = artifacts.length ? artifacts.map(a => `
+    <li>
+      <span class="kind">${esc(a.kind)}</span>
+      <span class="name">${esc(a.filename)}</span>
+      <span class="size">${fmtBytes(a.size_bytes)}</span>
+      <a class="btn sm ghost" href="${esc(a.download_url)}" download>下载</a>
+    </li>`).join('') : '<li class="muted">暂无产物</li>';
+}
+
 /* ================================================================
  * 历史
  * ============================================================== */
@@ -994,14 +1224,26 @@ async function loadHistory(reset) {
     $('#btn-more').hidden = !res.has_more;
     const rows = (res.items || []).map(r => {
       const g = r.gate_result;
-      const verdict = !g ? '—' : (g.passed ? '<span class="badge ok">通过</span>' : '<span class="badge err">未达标</span>');
+      let verdict = '—';
+      if (r.capability === 'eval' && g) {
+        verdict = g.passed ? '<span class="badge ok">通过</span>' : '<span class="badge err">未达标</span>';
+      } else if (r.capability === 'eval') {
+        const v = r.summary?.verdict;
+        verdict = v === 'pass' ? '<span class="badge ok">通过</span>'
+          : v === 'partial' ? '<span class="badge warn">部分通过</span>'
+            : v === 'fail' ? '<span class="badge err">未通过</span>' : '—';
+      } else if (g) {
+        verdict = g.passed ? '<span class="badge ok">通过</span>' : '<span class="badge err">未达标</span>';
+      }
       return `<tr>
         <td class="muted">${new Date(r.created_at).toLocaleString()}</td>
         <td><b>${esc(r.target?.model || '—')}</b><br><span class="hint">${esc(r.target?.vendor || '')}</span></td>
         <td>${r.capability === 'perf' ? '性能压测' : r.capability === 'eval' ? '效果评测' : '功能测试'}</td>
         <td><span class="status-pill ${r.status}">${statusText(r.status)}</span></td>
         <td class="num">${r.progress?.steps_done ?? 0}/${r.progress?.steps_total ?? r.plan?.steps_total ?? 0}</td>
-        <td class="num">${r.summary?.success_rate != null ? fmtPct(r.summary.success_rate) : '—'}</td>
+        <td class="num">${r.capability === 'eval'
+          ? (r.summary?.score_avg != null ? '均分 ' + fmtNum(r.summary.score_avg, 3) : '—')
+          : (r.summary?.success_rate != null ? fmtPct(r.summary.success_rate) : '—')}</td>
         <td>${verdict}</td>
         <td><a href="#/run/${esc(r.run_id)}">查看</a></td>
       </tr>`;

@@ -2,6 +2,7 @@ package report
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/apexcloud/thvv/server/internal/config"
 	"github.com/apexcloud/thvv/server/internal/domain"
@@ -176,4 +177,97 @@ func max(a, b float64) float64 {
 		return a
 	}
 	return b
+}
+
+// ---------------- eval gate ----------------
+
+// EvaluateEvalGate 按数据集分数下限做验收判定（对齐《效果验收标准.xlsx》）。
+//
+// 规则：
+//   - profile.eval_tiers 里配了阈值的数据集参与判定：score < min_score → violation
+//   - min_score 支持 baseline_by 按模型覆盖（键对 model 做小写包含匹配，如 "glm"）
+//   - 未配阈值的数据集不判定（结果照常展示）
+//   - 数据集评测失败（success=false）单独记一条 violation
+func EvaluateEvalGate(profile *config.GateProfile, model string, results []domain.EvalDatasetResult) *domain.GateResult {
+	res := &domain.GateResult{Passed: true, Violations: []domain.Violation{}, TierSummary: []domain.TierSummary{}}
+	if profile == nil {
+		return res
+	}
+	for _, d := range results {
+		if !d.Success {
+			res.Violations = append(res.Violations, domain.Violation{
+				Scope: "dataset", Bucket: d.Dataset, Rule: "eval_success",
+				Message: fmt.Sprintf("%s 评测失败：%s", d.Dataset, orDefaultStr(d.Error, "详见 run.log")),
+			})
+			continue
+		}
+		tier := matchEvalTier(profile, d.Dataset, d.SubitemOf())
+		if tier == nil {
+			continue
+		}
+		min := tier.MinScore
+		if v, ok := matchBaseline(tier.BaselineBy, model); ok {
+			min = v
+		}
+		passed := d.Score >= min
+		res.TierSummary = append(res.TierSummary, domain.TierSummary{
+			Tier: d.Dataset, Steps: d.NumSamples, P50MaxSec: min, Passed: passed,
+		})
+		if !passed {
+			res.Violations = append(res.Violations, domain.Violation{
+				Scope: "dataset", Bucket: d.Dataset, Rule: "min_score",
+				Actual: round(d.Score, 4), Threshold: round(min, 4),
+				Message: fmt.Sprintf("%s 得分 %.4f < 下限 %.4f（基线 %.2f%%）",
+					d.Dataset, d.Score, min, min*100),
+			})
+		}
+	}
+	res.Passed = len(res.Violations) == 0
+	return res
+}
+
+func matchEvalTier(p *config.GateProfile, dataset, subitem string) *config.EvalGateTier {
+	for i := range p.EvalTiers {
+		t := &p.EvalTiers[i]
+		if t.Dataset != dataset {
+			continue
+		}
+		// tier 带子项时必须精确匹配；不带子项的匹配任意子项（整体口径）
+		if t.Subitem != "" && t.Subitem != subitem {
+			continue
+		}
+		return t
+	}
+	return nil
+}
+
+func matchBaseline(by map[string]float64, model string) (float64, bool) {
+	if len(by) == 0 {
+		return 0, false
+	}
+	lm := strings.ToLower(model)
+	// 精确 > 前缀 > 包含
+	for k, v := range by {
+		if strings.EqualFold(k, model) {
+			return v, true
+		}
+	}
+	for k, v := range by {
+		if lm != "" && strings.HasPrefix(lm, strings.ToLower(k)) {
+			return v, true
+		}
+	}
+	for k, v := range by {
+		if lm != "" && strings.Contains(lm, strings.ToLower(k)) {
+			return v, true
+		}
+	}
+	return 0, false
+}
+
+func orDefaultStr(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
 }
