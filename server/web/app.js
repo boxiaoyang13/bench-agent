@@ -16,7 +16,7 @@ const state = {
   buckets: { items: [], scenarios: [], default_ladder: [1, 8, 32, 64, 128], number_by_parallel: {} },
   gates: [],
   datasets: [],
-  capability: 'perf',    // perf | eval
+  capability: 'perf',    // perf | eval | cache
   evalDatasets: [],      // 选中的评测数据集
   targets: [],
   target: null,          // 当前选中的 Target 对象
@@ -143,6 +143,10 @@ function bucketTokens(label) {
 
 /** 与服务端 steps_total 同一算法（纯函数，用于提交前预估与校验） */
 function computeSteps(plan) {
+  // 缓存测试：单步骤
+  if (plan.workload) {
+    return { total: 1, perStep: [{ bucket: plan.workload }], skipped: [] };
+  }
   // 效果评测：一个数据集一个步骤
   if (Array.isArray(plan.datasets)) {
     const perStep = plan.datasets.map(d => ({ bucket: d, parallel: plan.eval_batch_size || 0, number: plan.limit || 0 }));
@@ -505,9 +509,12 @@ function syncCapabilityUI() {
   $$('#cap-seg .seg-item').forEach(b => b.classList.toggle('active', b.dataset.cap === state.capability));
   $('#pane-perf').hidden = state.capability !== 'perf';
   $('#pane-eval').hidden = state.capability !== 'eval';
-  $('#r-formats-field').hidden = state.capability === 'eval';
+  $('#pane-cache').hidden = state.capability !== 'cache';
+  $('#r-formats-field').hidden = state.capability !== 'perf';
+  $('#g-tpm').closest('.field').hidden = state.capability !== 'perf';
   updateEstimate();
   updateEvalEstimate();
+  updateCacheEstimate();
 }
 
 $$('#cap-seg .seg-item').forEach(btn => btn.addEventListener('click', () => {
@@ -637,8 +644,42 @@ function evalPlan() {
   return plan;
 }
 
+function cachePlan() {
+  const num = (sel) => Number($(sel).value) || 0;
+  const seed = num('#c-seed');
+  return {
+    mode: 'single',
+    workload: 'multi-round-chat',
+    duration_sec: num('#c-duration'),
+    qps: Number($('#c-qps').value) || 1,
+    kv_cache_volume_gb: Number($('#c-volume').value) || 0,
+    tokens_per_gb_kvcache: num('#c-tpg'),
+    shared_prompt_length: num('#c-shared'),
+    chat_history_length: num('#c-history'),
+    user_input_length: num('#c-input'),
+    output_length: num('#c-output'),
+    no_warmup: $('#c-warmup').value === 'false',
+    ...(seed ? { seed } : {}),
+  };
+}
+
+function updateCacheEstimate() {
+  const box = $('#c-estimate');
+  if (!box) return;
+  if (state.capability !== 'cache') { box.hidden = true; return; }
+  box.hidden = false;
+  const plan = cachePlan();
+  const perSession = plan.shared_prompt_length + plan.chat_history_length;
+  const users = perSession > 0 ? Math.floor(plan.kv_cache_volume_gb * plan.tokens_per_gb_kvcache / perSession) : 0;
+  const estTokens = Math.round(plan.qps * plan.duration_sec * (perSession + plan.output_length));
+  box.innerHTML = `并发 session 数约 <b>${Math.max(1, users)}</b>（由 KV 容量推导）；` +
+    `预计消耗约 <b>${estTokens.toLocaleString()}</b> token（QPS × 时长 × 单请求 token）。` +
+    (plan.no_warmup ? '<br>⚠ 预热已关闭：为冷启动口径，验收不判改善率。' : '');
+}
+
 function buildPlan() {
   if (state.capability === 'eval') return evalPlan();
+  if (state.capability === 'cache') return cachePlan();
   const base = {
     dataset_dir: 'auto',
     cooldown_sec: Number($('#m-cooldown').value) || 0,
@@ -723,6 +764,9 @@ $('#btn-to-step3')?.addEventListener('click', () => {
     if (!state.evalDatasets.length) { toast('请至少选择一个数据集', 'err'); return; }
     const needJudge = state.evalDatasets.some(n => evalDatasetInfo(n)?.needs_judge);
     if (needJudge && !$('#e-judge-key').value.trim()) { toast('所选数据集需要 LLM Judge，请填写 Judge API Key', 'err'); return; }
+  } else if (state.capability === 'cache') {
+    const dur = Number($('#c-duration').value) || 0;
+    if (dur < 10 || dur > 3600) { toast('测试时长需在 10~3600 秒', 'err'); return; }
   } else if (state.mode === 'matrix' && !state.matrixBuckets.length) {
     toast('请至少选择一个档位', 'err'); return;
   }
@@ -737,7 +781,7 @@ function buildSubmitPayload() {
   if ($('#r-html').checked) formats.push('html');
   if ($('#r-xlsx').checked) formats.push('xlsx');
   const payload = {
-    tool: 'thvv',
+    tool: state.capability === 'cache' ? 'lmcache' : 'thvv',
     capability: state.capability,
     target_id: state.target?.target_id,
     plan,
@@ -749,7 +793,7 @@ function buildSubmitPayload() {
       payload.gate = { profile, mode: $('#g-mode').value, params: { user_tpm_quota: Number($('#g-tpm').value) || 0 } };
     }
   } else {
-    // eval：默认启用 eval-sla-v1（分数下限）；提交「不判定」则不传 gate
+    // eval/cache：默认启用各自 SLA 模板；提交「不判定」则不传 gate
     const profile = $('#g-profile').value;
     if (profile) payload.gate = { profile, mode: 'report_only' };
   }
@@ -768,6 +812,24 @@ function renderConfirm() {
   const payload = buildSubmitPayload();
   const { total } = computeSteps(payload.plan);
   let rows;
+  if (state.capability === 'cache') {
+    const plan = payload.plan;
+    const perSession = plan.shared_prompt_length + plan.chat_history_length;
+    const users = perSession > 0 ? Math.max(1, Math.floor(plan.kv_cache_volume_gb * plan.tokens_per_gb_kvcache / perSession)) : '—';
+    rows = [
+      ['能力', '缓存测试（multi-round-chat）'],
+      ['时长 / QPS', `${plan.duration_sec}s / ${plan.qps}`],
+      ['并发 session', `${users}（容量推导）`],
+      ['Prompt / 历史 / 输入 / 输出', `${plan.shared_prompt_length} / ${plan.chat_history_length} / ${plan.user_input_length} / ${plan.output_length} token`],
+      ['预热', plan.no_warmup ? '关闭（冷启动口径）' : '开启'],
+      ['验收', payload.gate ? `${payload.gate.profile}（稳态 TTFT + 改善率）` : '不判定'],
+      ['执行步骤', total],
+      ['产物', 'CSV / JSON / 配置 / run.log'],
+    ];
+    $('#cf-plan').innerHTML = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');
+    $('#cf-json').textContent = JSON.stringify(payload, null, 2);
+    return;
+  }
   if (state.capability === 'eval') {
     const plan = payload.plan;
     rows = [
@@ -871,12 +933,14 @@ async function openRun(runId) {
 
 function setRunTitle(run) {
   if (!run) { $('#run-title').textContent = '运行中…'; $('#run-meta').textContent = ''; return; }
-  const cap = run.capability === 'perf' ? '性能压测' : run.capability === 'eval' ? '效果评测' : '功能测试';
+  const cap = run.capability === 'perf' ? '性能压测' : run.capability === 'eval' ? '效果评测' : run.capability === 'cache' ? '缓存测试' : '功能测试';
   $('#run-title').textContent = `${run.target?.model || ''} · ${cap}`;
   const plan = run.plan || {};
   const scope = run.capability === 'eval'
     ? `数据集 ${(plan.datasets || []).length} 个：${(plan.datasets || []).join(', ')}`
-    : (plan.mode === 'single'
+    : run.capability === 'cache'
+      ? `${plan.workload || 'multi-round-chat'} · ${plan.duration_sec ?? '—'}s / ${plan.qps ?? '—'} QPS`
+      : (plan.mode === 'single'
       ? `单档 ${plan.buckets?.[0] || ''} / 并发 ${plan.parallel_ladder?.[0] ?? ''} / ${plan.number ?? ''} 条`
       : `全档 ${plan.buckets?.length || 0} 个档位 / 梯度 ${(plan.parallel_ladder || []).join(',')}`);
   $('#run-meta').textContent = `${run.run_id} · ${scope} · 创建于 ${new Date(run.created_at).toLocaleString()}`;
@@ -905,8 +969,10 @@ function renderStepsHead(cap) {
   if (!el) return;
   el.innerHTML = cap === 'eval'
     ? '<tr><th>#</th><th>数据集</th><th>并发</th><th>条数</th><th>状态</th><th class="num">得分</th><th class="num">耗时</th></tr>'
-    : '<tr><th>#</th><th>档位</th><th>并发</th><th>请求数</th><th>状态</th>'
-      + '<th class="num">成功率</th><th class="num">TTFT P50</th><th class="num">Output tps</th><th class="num">耗时</th></tr>';
+    : cap === 'cache'
+      ? '<tr><th>#</th><th>Workload</th><th>并发</th><th>请求数</th><th>状态</th><th class="num">成功率</th><th class="num">耗时</th></tr>'
+      : '<tr><th>#</th><th>档位</th><th>并发</th><th>请求数</th><th>状态</th>'
+        + '<th class="num">成功率</th><th class="num">TTFT P50</th><th class="num">Output tps</th><th class="num">耗时</th></tr>';
 }
 
 function statusText(s) {
@@ -929,6 +995,19 @@ function renderSteps(steps, capability) {
         <td class="num">${s.number || '全量'}</td>
         <td class="st">${stepBadge(s.status)}</td>
         <td class="num sr">${s.score != null ? fmtNum(s.score) : '—'}</td>
+        <td class="num dur">${s.duration_sec != null ? fmtDur(s.duration_sec) : '—'}</td>
+      </tr>`).join('');
+    return;
+  }
+  if (cap === 'cache') {
+    tbody.innerHTML = steps.map((s, i) => `
+      <tr data-step="${i}">
+        <td class="muted">${i + 1}</td>
+        <td><b>${esc(s.bucket || '—')}</b></td>
+        <td class="num">${s.parallel ? s.parallel + ' session' : '—'}</td>
+        <td class="num">${s.number || '—'} 请求</td>
+        <td class="st">${stepBadge(s.status)}</td>
+        <td class="num">${s.success_rate != null ? fmtPct(s.success_rate) : '—'}</td>
         <td class="num dur">${s.duration_sec != null ? fmtDur(s.duration_sec) : '—'}</td>
       </tr>`).join('');
     return;
@@ -1086,6 +1165,7 @@ function renderResults(results, artifacts) {
   $('#run-result').hidden = false;
 
   if (results.capability === 'eval') { renderEvalResults(results, artifacts); return; }
+  if (results.capability === 'cache') { renderCacheResults(results, artifacts); return; }
   $('#run-result-title').textContent = '验收结论';
 
   const s = results.summary || {};
@@ -1126,6 +1206,60 @@ function renderResults(results, artifacts) {
         <th>档位</th><th>规则</th><th class="num">实测</th><th class="num">阈值</th><th>说明</th>
       </tr></thead><tbody>${viol}</tbody></table>` : ''}`;
   }
+
+  $('#artifact-list').innerHTML = artifacts.length ? artifacts.map(a => `
+    <li>
+      <span class="kind">${esc(a.kind)}</span>
+      <span class="name">${esc(a.filename)}</span>
+      <span class="size">${fmtBytes(a.size_bytes)}</span>
+      <a class="btn sm ghost" href="${esc(a.download_url)}" download>下载</a>
+    </li>`).join('') : '<li class="muted">暂无产物</li>';
+}
+
+function renderCacheResults(results, artifacts) {
+  $('#run-result-title').textContent = '缓存测试结论';
+  const s = results.summary || {};
+  const c = results.cache || {};
+  const g = results.gate_result;
+  let cls, text;
+  if (g) {
+    cls = g.passed ? 'ok' : 'err';
+    text = g.passed ? '✓ 验收通过' : '✕ 未达标';
+  } else {
+    const v = s.verdict;
+    cls = v === 'pass' ? 'ok' : v === 'partial' ? 'warn' : 'err';
+    text = v === 'pass' ? '✓ 通过' : v === 'partial' ? '! 部分通过' : '✕ 未通过';
+  }
+  const badge = $('#gate-badge');
+  badge.className = 'badge ' + cls;
+  badge.textContent = text;
+
+  const imp = s.ttft_improvement;
+  const kpis = [
+    ['稳态 TTFT P50', s.ttft_steady_p50_ms != null ? fmtNum(s.ttft_steady_p50_ms) + 'ms' : '—', '前缀命中下的首 token'],
+    ['首轮 TTFT', s.ttft_first_round_ms != null ? fmtNum(s.ttft_first_round_ms) + 'ms' : '—', '冷/半冷缓存'],
+    ['TTFT 改善率', imp != null ? fmtPct(imp) : '—', '1 − 稳态P50/首轮均值'],
+    ['成功率', s.success_rate != null ? fmtPct(s.success_rate) : '—', `${s.successful_requests ?? '—'}/${s.total_requests ?? '—'} 请求`],
+  ];
+  $('#run-kpis').innerHTML = kpis.map(([k, v, sub]) =>
+    `<div class="kpi"><div class="k">${esc(k)}</div><div class="v">${esc(v)}<small> ${esc(sub)}</small></div></div>`).join('');
+
+  const roundRows = (c.rounds || []).map(r => `
+    <tr><td class="num">${r.round}</td><td class="num">${r.requests}</td>
+      <td class="num">${fmtNum(r.ttft_mean_ms)}ms</td>
+      <td class="num">${fmtNum(r.input_tokens_mean)}</td></tr>`).join('');
+  const violRows = (g?.violations || []).map(v => `
+    <tr><td>${esc(v.rule)}</td><td class="num">${fmtNum(v.actual)}</td>
+      <td class="num">${fmtNum(v.threshold)}</td><td class="muted">${esc(v.message || '')}</td></tr>`).join('');
+  $('#gate-body').innerHTML = `
+    <p class="muted">workload ${esc(c.workload || 'multi-round-chat')} · ${esc(c.model || '')} ·
+      ${c.num_sessions ? c.num_sessions + ' 个并发 session · ' : ''}${s.total_requests ?? '—'} 个请求。
+      ${g ? `验收模板 ${esc(g.profile)} · 违规 ${(g.violations || []).length} 项` : '未启用验收'}</p>
+    ${roundRows ? `<table class="tbl"><thead><tr><th class="num">轮次</th><th class="num">请求数</th>
+      <th class="num">TTFT 均值</th><th class="num">输入 token 均值</th></tr></thead><tbody>${roundRows}</tbody></table>` : ''}
+    ${violRows ? `<h4 style="margin-top:16px">违规明细</h4><table class="tbl"><thead><tr>
+      <th>规则</th><th class="num">实测</th><th class="num">阈值</th><th>说明</th>
+    </tr></thead><tbody>${violRows}</tbody></table>` : ''}`;
 
   $('#artifact-list').innerHTML = artifacts.length ? artifacts.map(a => `
     <li>
@@ -1225,7 +1359,9 @@ async function loadHistory(reset) {
     const rows = (res.items || []).map(r => {
       const g = r.gate_result;
       let verdict = '—';
-      if (r.capability === 'eval' && g) {
+      if (r.capability === 'cache' && g) {
+        verdict = g.passed ? '<span class="badge ok">通过</span>' : '<span class="badge err">未达标</span>';
+      } else if (r.capability === 'eval' && g) {
         verdict = g.passed ? '<span class="badge ok">通过</span>' : '<span class="badge err">未达标</span>';
       } else if (r.capability === 'eval') {
         const v = r.summary?.verdict;
@@ -1238,12 +1374,14 @@ async function loadHistory(reset) {
       return `<tr>
         <td class="muted">${new Date(r.created_at).toLocaleString()}</td>
         <td><b>${esc(r.target?.model || '—')}</b><br><span class="hint">${esc(r.target?.vendor || '')}</span></td>
-        <td>${r.capability === 'perf' ? '性能压测' : r.capability === 'eval' ? '效果评测' : '功能测试'}</td>
+        <td>${r.capability === 'perf' ? '性能压测' : r.capability === 'eval' ? '效果评测' : r.capability === 'cache' ? '缓存测试' : '功能测试'}</td>
         <td><span class="status-pill ${r.status}">${statusText(r.status)}</span></td>
         <td class="num">${r.progress?.steps_done ?? 0}/${r.progress?.steps_total ?? r.plan?.steps_total ?? 0}</td>
         <td class="num">${r.capability === 'eval'
           ? (r.summary?.score_avg != null ? '均分 ' + fmtNum(r.summary.score_avg, 3) : '—')
-          : (r.summary?.success_rate != null ? fmtPct(r.summary.success_rate) : '—')}</td>
+          : r.capability === 'cache'
+            ? (r.summary?.ttft_improvement != null ? '改善 ' + fmtPct(r.summary.ttft_improvement) : '—')
+            : (r.summary?.success_rate != null ? fmtPct(r.summary.success_rate) : '—')}</td>
         <td>${verdict}</td>
         <td><a href="#/run/${esc(r.run_id)}">查看</a></td>
       </tr>`;

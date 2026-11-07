@@ -20,11 +20,12 @@ type Capability string
 const (
 	CapPerf       Capability = "perf"
 	CapEval       Capability = "eval"
+	CapCache      Capability = "cache"
 	CapFunctional Capability = "functional"
 )
 
 func (c Capability) Valid() bool {
-	return c == CapPerf || c == CapEval || c == CapFunctional
+	return c == CapPerf || c == CapEval || c == CapCache || c == CapFunctional
 }
 
 // ---------------- Target ----------------
@@ -106,6 +107,49 @@ type BucketOverride struct {
 	Number      int   `json:"number,omitempty"`
 }
 
+// ---------------- cache（capability=cache） ----------------
+
+// CacheRoundStats 是 multi-round-chat 单轮（跨 session 聚合）的统计。
+type CacheRoundStats struct {
+	Round           int     `json:"round"`
+	Requests        int     `json:"requests"`
+	TTFTMeanMS      float64 `json:"ttft_mean_ms"`
+	InputTokensMean float64 `json:"input_tokens_mean,omitempty"`
+}
+
+// CacheMetrics 是一次 cache run 的结果（bench_summary.json + CSV 派生）。
+type CacheMetrics struct {
+	Workload      string            `json:"workload"`
+	Model         string            `json:"model,omitempty"`
+	NumSessions   int               `json:"num_sessions,omitempty"`
+	TotalRequests int               `json:"total_requests"`
+	SuccessReqs   int               `json:"successful_requests"`
+	FailedReqs    int               `json:"failed_requests"`
+	SuccessRate   float64           `json:"success_rate"`
+	ElapsedSec    float64           `json:"elapsed_sec"`
+	FirstRound    *CacheRoundStats  `json:"first_round,omitempty"`
+	SteadyState   *CacheSteadyStats `json:"steady_state,omitempty"`
+	Rounds        []CacheRoundStats `json:"rounds,omitempty"`
+	InputTokens   int               `json:"total_input_tokens,omitempty"`
+	OutputTokens  int               `json:"total_output_tokens,omitempty"`
+	// 来自 bench_summary.json 的聚合（Python 口径）
+	MeanTTFTMS      float64 `json:"mean_ttft_ms,omitempty"`
+	DecodeSpeedP50  float64 `json:"decode_speed_p50,omitempty"`
+	DecodeSpeedP90  float64 `json:"decode_speed_p90,omitempty"`
+	InputThroughput float64 `json:"input_throughput,omitempty"`
+}
+
+// CacheSteadyStats 是稳态（非首轮）请求的分位统计——缓存命中下的真实表现。
+type CacheSteadyStats struct {
+	TTFTp50MS       float64 `json:"ttft_p50_ms"`
+	TTFTp90MS       float64 `json:"ttft_p90_ms"`
+	TTFTp99MS       float64 `json:"ttft_p99_ms"`
+	Latencyp50MS    float64 `json:"request_latency_p50_ms,omitempty"`
+	DecodeSpeedP50  float64 `json:"decode_speed_p50,omitempty"`
+	Requests        int     `json:"requests"`
+	TTFTImprovement float64 `json:"ttft_improvement,omitempty"` // 1 - steady_p50 / first_mean
+}
+
 // JudgeSpec 是评测用 LLM Judge 的凭据（只在该 run 内存在，不落 Target）。
 type JudgeSpec struct {
 	Model   string `json:"model,omitempty"`
@@ -135,6 +179,21 @@ type Plan struct {
 	Request          RequestDefaults           `json:"request,omitempty"`
 	DatasetDir       string                    `json:"dataset_dir,omitempty"`
 	StepsTotal       int                       `json:"steps_total,omitempty"`
+
+	// cache（capability=cache，tool=lmcache）
+	Workload        string  `json:"workload,omitempty"` // multi-round-chat
+	KVCacheVolumeGB float64 `json:"kv_cache_volume_gb,omitempty"`
+	TokensPerGBKV   int     `json:"tokens_per_gb_kvcache,omitempty"`
+	QPS             float64 `json:"qps,omitempty"`
+	DurationSec     int     `json:"duration_sec,omitempty"`
+	Seed            *int    `json:"seed,omitempty"`
+	NoWarmup        bool    `json:"no_warmup,omitempty"`
+	IgnoreEOS       bool    `json:"ignore_eos,omitempty"`
+	// 请求形状（MRC）
+	SharedPromptLen int `json:"shared_prompt_length,omitempty"`
+	ChatHistoryLen  int `json:"chat_history_length,omitempty"`
+	UserInputLen    int `json:"user_input_length,omitempty"`
+	OutputLen       int `json:"output_length,omitempty"`
 
 	// eval（capability=eval）
 	Datasets      []string   `json:"datasets,omitempty"`
@@ -454,17 +513,20 @@ type Run struct {
 type ArtifactKind string
 
 const (
-	ArtHTMLReport  ArtifactKind = "html_report"
-	ArtXLSXReport  ArtifactKind = "xlsx_report"
-	ArtFailureCSV  ArtifactKind = "failure_csv"
-	ArtSLAJSON     ArtifactKind = "sla_json"
-	ArtRawDB       ArtifactKind = "raw_db"
-	ArtRunLog      ArtifactKind = "run_log"
-	ArtEvalReport  ArtifactKind = "eval_report"
-	ArtEvalSummary ArtifactKind = "eval_summary"
-	ArtEvalSamples ArtifactKind = "eval_samples"
-	ArtEvalArchive ArtifactKind = "eval_archive"
-	ArtArchive     ArtifactKind = "archive"
+	ArtHTMLReport   ArtifactKind = "html_report"
+	ArtXLSXReport   ArtifactKind = "xlsx_report"
+	ArtFailureCSV   ArtifactKind = "failure_csv"
+	ArtSLAJSON      ArtifactKind = "sla_json"
+	ArtRawDB        ArtifactKind = "raw_db"
+	ArtRunLog       ArtifactKind = "run_log"
+	ArtEvalReport   ArtifactKind = "eval_report"
+	ArtEvalSummary  ArtifactKind = "eval_summary"
+	ArtEvalSamples  ArtifactKind = "eval_samples"
+	ArtEvalArchive  ArtifactKind = "eval_archive"
+	ArtBenchCSV     ArtifactKind = "bench_csv"
+	ArtBenchSummary ArtifactKind = "bench_summary"
+	ArtBenchConfig  ArtifactKind = "bench_config"
+	ArtArchive      ArtifactKind = "archive"
 )
 
 type Artifact struct {
@@ -607,6 +669,7 @@ type RunResults struct {
 	Summary    map[string]any `json:"summary"`
 	Metrics    PerfMetrics    `json:"metrics"`
 	Eval       *EvalMetrics   `json:"eval,omitempty"`
+	Cache      *CacheMetrics  `json:"cache,omitempty"`
 }
 
 // EvalDatasetResult 是单个数据集的评测结果（来自 eval_summary.json）。

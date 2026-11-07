@@ -259,6 +259,23 @@ func (c *Config) Check() []Issue {
 			if capName == "perf" {
 				checkPerf(name, cap, errf, warnf)
 			}
+			if capName == "cache" && eng.Kind == "subprocess" {
+				base := fmt.Sprintf("engines.%s.cache", name)
+				if cap.Script == "" {
+					errf(base+".script", "必填（lmcache CLI 路径）")
+				} else if !isExecutable(string(cap.Script)) {
+					errf(base+".script", "%s 不可执行", cap.Script)
+				}
+				if cap.CacheDefaults != nil {
+					d := cap.CacheDefaults
+					if d.TokensPerGBKV != 0 && (d.TokensPerGBKV < 1024 || d.TokensPerGBKV > 10_000_000) {
+						errf(base+".defaults.tokens_per_gb_kvcache", "非法（1024..10000000）")
+					}
+					if d.QPS < 0 || d.QPS > 100 {
+						errf(base+".defaults.qps", "非法（0..100）")
+					}
+				}
+			}
 		}
 	}
 

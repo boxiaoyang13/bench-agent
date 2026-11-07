@@ -53,6 +53,7 @@ make run   CONFIG=./config/thvv.dev.yaml     # http://127.0.0.1:18080/ui/
 ├── docs/                         协议与设计文档
 │   ├── API.md / openapi.yaml     HTTP 协议规范 + 接口契约
 │   ├── EVAL.md                   效果评测接入设计（Step=数据集 / 产物 / 限制）
+│   ├── CACHE.md                  缓存测试接入设计（lmcache bench multi-round-chat）
 │   ├── DESIGN.md / CONFIG.md     设计文档（§9.1 双跑对账）/ 配置规范
 │   ├── WEB-UI.md                 前端与交互（含实现记录）
 │   └── config/                   Python 侧配置样例（thvv.yaml、path_resolver_reference.py）
@@ -93,6 +94,7 @@ make run   CONFIG=./config/thvv.dev.yaml     # http://127.0.0.1:18080/ui/
 | 报告：HTML / 45 列 xlsx / 失败 CSV / SLA json | ✅ |
 | `capability=eval` 效果评测（17 数据集，Step=数据集，产物 eval_report_v2.html/CSV/JSON/tar.gz） | ✅ |
 | eval 分数验收 `eval-sla-v1`（对齐《效果验收标准.xlsx》，支持 `baseline_by` 按模型覆盖） | ✅ |
+| 缓存测试（lmcache bench multi-round-chat，`cache-sla-v1` 稳态 TTFT + 改善率验收，见 `docs/CACHE.md`） | ✅ |
 | Web 页面（登录、三步向导、运行监控、结果、历史、能力清单） | ✅ |
 | 引擎：`builtin` 模拟 / `subprocess` evalscope | ✅（subprocess 已端到端联调，见下） |
 | `capability=functional` | ⏳ 预留（返回 `501 not_implemented` + `available_at`） |

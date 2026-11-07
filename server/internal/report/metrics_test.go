@@ -486,3 +486,54 @@ func TestEvaluateEvalGate(t *testing.T) {
 		t.Fatalf("kimi 基线 0.42，得分 0.43 应通过: %+v", res2.Violations)
 	}
 }
+
+// TestEvaluateCacheGate 稳态 TTFT / 改善率 / 成功率 / no_warmup 口径。
+func TestEvaluateCacheGate(t *testing.T) {
+	profile := &config.GateProfile{
+		Capability: "cache",
+		CacheTiers: []config.CacheGateTier{
+			{SteadyTTFTp50MaxMS: 800, TTFTImprovementMin: 0.30, SuccessRateMin: 0.99},
+		},
+	}
+	good := &domain.CacheMetrics{
+		TotalRequests: 20, SuccessReqs: 20, SuccessRate: 1,
+		FirstRound:  &domain.CacheRoundStats{Round: 0, Requests: 3, TTFTMeanMS: 1000},
+		SteadyState: &domain.CacheSteadyStats{Requests: 17, TTFTp50MS: 400, TTFTImprovement: 0.60},
+	}
+	if res := EvaluateCacheGate(profile, good, false); !res.Passed {
+		t.Fatalf("应通过: %+v", res.Violations)
+	}
+
+	slow := &domain.CacheMetrics{
+		TotalRequests: 20, SuccessReqs: 20, SuccessRate: 1,
+		FirstRound:  &domain.CacheRoundStats{Round: 0, Requests: 3, TTFTMeanMS: 1000},
+		SteadyState: &domain.CacheSteadyStats{Requests: 17, TTFTp50MS: 900, TTFTImprovement: 0.10},
+	}
+	res := EvaluateCacheGate(profile, slow, false)
+	if res.Passed {
+		t.Fatal("稳态超限且改善不足应不通过")
+	}
+	rules := map[string]bool{}
+	for _, v := range res.Violations {
+		rules[v.Rule] = true
+	}
+	if !rules["steady_ttft_p50_max_ms"] || !rules["ttft_improvement_min"] {
+		t.Fatalf("违规规则缺失: %+v", rules)
+	}
+
+	// no_warmup：不判改善率，只判稳态上限
+	cold := &domain.CacheMetrics{
+		TotalRequests: 20, SuccessReqs: 20, SuccessRate: 1,
+		FirstRound:  &domain.CacheRoundStats{Round: 0, Requests: 3, TTFTMeanMS: 1000},
+		SteadyState: &domain.CacheSteadyStats{Requests: 17, TTFTp50MS: 500, TTFTImprovement: 0.10},
+	}
+	if res := EvaluateCacheGate(profile, cold, true); !res.Passed {
+		t.Fatalf("no_warmup 不判改善率，应通过: %+v", res.Violations)
+	}
+
+	// 无请求
+	empty := &domain.CacheMetrics{}
+	if res := EvaluateCacheGate(profile, empty, false); res.Passed {
+		t.Fatal("无请求应不通过")
+	}
+}

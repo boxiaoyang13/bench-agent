@@ -271,3 +271,61 @@ func orDefaultStr(v, def string) string {
 	}
 	return v
 }
+
+// ---------------- cache gate ----------------
+
+// EvaluateCacheGate 按 cache-sla-v1 判定（稳态 TTFT / 改善率 / 成功率）。
+//
+//   - no_warmup 的 run 不判改善率（首轮即冷态，口径不同）
+//   - 无有效请求 / 无稳态样本 → eval_success 违规
+func EvaluateCacheGate(profile *config.GateProfile, m *domain.CacheMetrics, noWarmup bool) *domain.GateResult {
+	res := &domain.GateResult{Passed: true, Violations: []domain.Violation{}, TierSummary: []domain.TierSummary{}}
+	if profile == nil || m == nil {
+		return res
+	}
+	if m.TotalRequests == 0 {
+		res.Violations = append(res.Violations, domain.Violation{
+			Scope: "cache", Rule: "eval_success", Message: "没有有效请求（详见 run.log）",
+		})
+		res.Passed = false
+		return res
+	}
+	tier := &config.CacheGateTier{}
+	if len(profile.CacheTiers) > 0 {
+		tier = &profile.CacheTiers[0]
+	}
+	if tier.SuccessRateMin > 0 && m.SuccessRate < tier.SuccessRateMin {
+		res.Violations = append(res.Violations, domain.Violation{
+			Scope: "cache", Rule: "min_success_rate",
+			Actual: round(m.SuccessRate, 4), Threshold: tier.SuccessRateMin,
+			Message: fmt.Sprintf("成功率 %.2f%% < %.2f%%", m.SuccessRate*100, tier.SuccessRateMin*100),
+		})
+	}
+	ss := m.SteadyState
+	if ss == nil || ss.Requests == 0 {
+		res.Violations = append(res.Violations, domain.Violation{
+			Scope: "cache", Rule: "eval_success", Message: "无稳态样本（每 session 只跑了首轮？延长 duration）",
+		})
+	} else {
+		if tier.SteadyTTFTp50MaxMS > 0 && ss.TTFTp50MS > tier.SteadyTTFTp50MaxMS {
+			res.Violations = append(res.Violations, domain.Violation{
+				Scope: "cache", Rule: "steady_ttft_p50_max_ms",
+				Actual: round(ss.TTFTp50MS, 2), Threshold: tier.SteadyTTFTp50MaxMS,
+				Message: fmt.Sprintf("稳态 TTFT P50 %.0fms > %.0fms", ss.TTFTp50MS, tier.SteadyTTFTp50MaxMS),
+			})
+		}
+		if !noWarmup && tier.TTFTImprovementMin > 0 && ss.TTFTImprovement < tier.TTFTImprovementMin {
+			res.Violations = append(res.Violations, domain.Violation{
+				Scope: "cache", Rule: "ttft_improvement_min",
+				Actual: round(ss.TTFTImprovement, 4), Threshold: tier.TTFTImprovementMin,
+				Message: fmt.Sprintf("TTFT 改善率 %.1f%% < %.1f%%（前缀缓存未生效或收益不足）",
+					ss.TTFTImprovement*100, tier.TTFTImprovementMin*100),
+			})
+		}
+		res.TierSummary = append(res.TierSummary, domain.TierSummary{
+			Tier: "steady", Steps: ss.Requests, P50MaxSec: ss.TTFTp50MS, Passed: len(res.Violations) == 0,
+		})
+	}
+	res.Passed = len(res.Violations) == 0
+	return res
+}

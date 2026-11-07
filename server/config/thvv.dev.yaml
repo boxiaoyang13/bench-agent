@@ -21,6 +21,7 @@ roots:
   data: "${THVV_DATA:-../data}"
   venv: "${THVV_VENV:-/infer-data/bench/TokenHub-Vendor-Verifier/.venv}"
   bin: "venv:bin"
+  bench-cache: "${THVV_CACHE_HOME:-/infer-data/bench/bench-cache}"
 
 server:
   listen: "0.0.0.0:18080"   # 对外监听；仅本机用可改回 127.0.0.1:18080
@@ -111,6 +112,33 @@ engines:
         enabled: false
         status: planned
         available_at: "v1.2"
+
+  # 缓存测试（lmcache bench engine，工具在 /infer-data/bench/bench-cache）
+  lmcache:
+    enabled: true
+    kind: subprocess
+    display_name: "LMCache 缓存测试"
+    version: "1.0.0"
+    runtime:
+      python: "bench-cache:.venv/bin/python"
+      evalscope: "bench-cache:.venv/bin/lmcache"   # 复用字段：此处表示 lmcache CLI 入口
+    capabilities:
+      cache:
+        enabled: true
+        status: ga
+        working_dir: "bench-cache:"
+        script: "bench-cache:.venv/bin/lmcache"
+        cache_defaults:
+          workload: "multi-round-chat"
+          kv_cache_volume_gb: 0.25     # 小容量→少量并发 session，适配网关型端点
+          tokens_per_gb_kvcache: 65536
+          qps: 1.0
+          duration_sec: 60
+          seed: 42
+          shared_prompt_length: 2000
+          chat_history_length: 10000
+          user_input_length: 50
+          output_length: 200
 
 reports:
   default_formats: [html, xlsx]

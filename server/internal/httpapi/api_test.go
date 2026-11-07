@@ -82,6 +82,11 @@ engines:
       perf: { enabled: true, status: ga }
       eval: { enabled: true, status: ga }
       functional: { enabled: false, status: planned, available_at: "v1.2" }
+  lmcache:
+    enabled: true
+    kind: builtin
+    capabilities:
+      cache: { enabled: true, status: ga }
 observability:
   log_level: error
   access_log: false
@@ -778,5 +783,125 @@ func TestEvalGate(t *testing.T) {
 	}
 	if runFull.GateResult.Passed && res.Eval.Datasets[0].Score < 0.8912 {
 		t.Fatal("分数低于下限却判通过")
+	}
+}
+
+// TestCacheFlow capability=cache 全链路（builtin 引擎）。
+func TestCacheFlow(t *testing.T) {
+	t.Setenv("THVV_FAKE_STEP_MS", "10")
+	t.Setenv("THVV_FAKE_FAIL_RATE", "0")
+	h := newHarness(t)
+	h.login()
+
+	resp, body := h.do("POST", "/targets", map[string]any{
+		"name": "cache-t", "vendor": "zhipu",
+		"api_url":  "https://api.example.com/v1/chat/completions",
+		"protocol": "openai", "model": "glm-5.2", "api_key": "sk-secret-1234",
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("建端点: %d %s", resp.StatusCode, body)
+	}
+	var target map[string]any
+	mustJSON(t, body, &target)
+	tid, _ := target["target_id"].(string)
+
+	resp, body = h.do("POST", "/runs", map[string]any{
+		"tool": "lmcache", "capability": "cache", "target_id": tid,
+		"plan": map[string]any{
+			"workload": "multi-round-chat", "duration_sec": 30, "qps": 1,
+		},
+	}, map[string]string{"Idempotency-Key": "cache-1"})
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("提交缓存测试: %d %s", resp.StatusCode, body)
+	}
+	var run map[string]any
+	mustJSON(t, body, &run)
+	runID, _ := run["run_id"].(string)
+	plan := run["plan"].(map[string]any)
+	if plan["workload"] != "multi-round-chat" {
+		t.Fatalf("workload 异常: %v", plan["workload"])
+	}
+	if int(plan["steps_total"].(float64)) != 1 {
+		t.Fatalf("steps_total 期望 1: %v", plan["steps_total"])
+	}
+
+	final := h.waitTerminal(runID, 20*time.Second)
+	if final["status"] != "succeeded" {
+		t.Fatalf("run 未成功: %v (%v)", final["status"], final["error"])
+	}
+
+	resp, body = h.do("GET", "/runs/"+runID+"/results", nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("/results: %d %s", resp.StatusCode, body)
+	}
+	var res struct {
+		Capability string `json:"capability"`
+		Summary    map[string]any
+		Cache      *struct {
+			TotalRequests int `json:"total_requests"`
+			SteadyState   *struct {
+				TTFTp50MS       float64 `json:"ttft_p50_ms"`
+				TTFTImprovement float64 `json:"ttft_improvement"`
+			} `json:"steady_state"`
+		} `json:"cache"`
+	}
+	mustJSON(t, body, &res)
+	if res.Capability != "cache" || res.Cache == nil || res.Cache.TotalRequests == 0 {
+		t.Fatalf("cache 结果异常: %+v", res)
+	}
+	if res.Cache.SteadyState == nil || res.Cache.SteadyState.TTFTImprovement <= 0 {
+		t.Fatalf("稳态/改善率异常: %+v", res.Cache.SteadyState)
+	}
+	if res.Summary["verdict"] != "pass" {
+		t.Fatalf("verdict: %v", res.Summary["verdict"])
+	}
+	// builtin 改善率 50~70%，默认 gate(≥30%, P50<800ms) 应通过
+	if g := res.Summary["gate_passed"]; g != true {
+		t.Fatalf("gate 应通过: %v（summary=%v）", g, res.Summary)
+	}
+}
+
+// TestCacheValidation plan 校验。
+func TestCacheValidation(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+	resp, body := h.do("POST", "/targets", map[string]any{
+		"name": "cache-v", "vendor": "zhipu",
+		"api_url":  "https://api.example.com/v1/chat/completions",
+		"protocol": "openai", "model": "glm-5.2", "api_key": "sk-x",
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("建端点: %d %s", resp.StatusCode, body)
+	}
+	var target map[string]any
+	mustJSON(t, body, &target)
+	tid, _ := target["target_id"].(string)
+
+	cases := []struct {
+		name string
+		plan map[string]any
+		code int
+	}{
+		{"未知 workload", map[string]any{"workload": "random-prefill"}, http.StatusBadRequest},
+		{"时长过短", map[string]any{"duration_sec": 5}, http.StatusBadRequest},
+		{"时长超限", map[string]any{"duration_sec": 99999}, http.StatusBadRequest},
+		{"qps 非法", map[string]any{"qps": -1}, http.StatusBadRequest},
+		{"tokens/gb 非法", map[string]any{"tokens_per_gb_kvcache": 1}, http.StatusBadRequest},
+	}
+	for _, c := range cases {
+		resp, body := h.do("POST", "/runs", map[string]any{
+			"tool": "lmcache", "capability": "cache", "target_id": tid, "plan": c.plan,
+		}, map[string]string{"Idempotency-Key": "cv-" + c.name})
+		if resp.StatusCode != c.code {
+			t.Fatalf("%s: 期望 %d，实际 %d %s", c.name, c.code, resp.StatusCode, body)
+		}
+	}
+	// capability 归属：thvv 没有 cache → 400/501
+	resp, _ = h.do("POST", "/runs", map[string]any{
+		"tool": "thvv", "capability": "cache", "target_id": tid,
+		"plan": map[string]any{"duration_sec": 30},
+	}, nil)
+	if resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("thvv 不应提供 cache: %d", resp.StatusCode)
 	}
 }

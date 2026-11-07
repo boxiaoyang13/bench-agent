@@ -357,10 +357,10 @@ func (s *Server) handleProbeTarget(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := contextWithTimeout(r, timeout)
 	defer cancel()
 
-	// ?capability=eval 时用评测引擎预检（会多查 eval 脚本 / Judge 配置）
+	// ?capability=cache/eval 时用对应引擎预检
 	probeCap := domain.Capability(orDefault(r.URL.Query().Get("capability"), string(domain.CapPerf)))
 	var eng engine.Engine
-	if e, err := s.reg.Get(s.toolOf(t), probeCap); err == nil {
+	if e, err := s.reg.Get(s.reg.ToolForCap(probeCap), probeCap); err == nil {
 		eng = e
 	} else {
 		eng = s.reg.AnyProbe(s.toolOf(t))
@@ -371,8 +371,8 @@ func (s *Server) handleProbeTarget(w http.ResponseWriter, r *http.Request) {
 	}
 	rep := eng.Probe(ctx, rt)
 
-	// 数据集检查以服务端为准（引擎侧可能不知道 Go 的配置）；eval 的数据集在引擎内自查
-	if probeCap != domain.CapEval {
+	// 数据集检查只对 perf 有意义；eval/cache 的数据集/环境由各自引擎自查
+	if probeCap == domain.CapPerf {
 		rep.Checks = s.augmentDatasetCheck(rep.Checks)
 	}
 

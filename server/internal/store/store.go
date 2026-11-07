@@ -472,6 +472,7 @@ func (s *Store) UpsertStep(ctx context.Context, runID string, st domain.Step) er
 		(run_id,step_index,bucket,parallel,number,status,success_rate,ttft_p50_sec,output_tps,duration_sec,db_path)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(run_id,step_index) DO UPDATE SET
+			bucket=excluded.bucket, parallel=excluded.parallel, number=excluded.number,
 			status=excluded.status, success_rate=excluded.success_rate,
 			ttft_p50_sec=excluded.ttft_p50_sec, output_tps=excluded.output_tps,
 			duration_sec=excluded.duration_sec, db_path=excluded.db_path`,

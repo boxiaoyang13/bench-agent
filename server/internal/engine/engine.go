@@ -13,7 +13,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -68,13 +70,15 @@ type Spec struct {
 
 // Result 是引擎执行结果。
 type Result struct {
-	Steps    []domain.Step
-	Metrics  []domain.StepMetrics
-	DBPaths  map[int]string      // stepIndex → benchmark_data.db（perf）
-	Eval     *domain.EvalMetrics // eval 能力的结果
-	Files    []FileArtifact      // 需要归档的产物（eval）
-	LogPath  string
-	ExitCode int
+	Steps     []domain.Step
+	Metrics   []domain.StepMetrics
+	DBPaths   map[int]string       // stepIndex → benchmark_data.db（perf）
+	Eval      *domain.EvalMetrics  // eval 能力的结果
+	Cache     *domain.CacheMetrics // cache 能力的结果
+	CacheNote string               // cache 失败时的补充说明
+	Files     []FileArtifact       // 需要归档的产物（eval/cache）
+	LogPath   string
+	ExitCode  int
 }
 
 // FileArtifact 是引擎产出的单个可下载文件。
@@ -191,4 +195,21 @@ func pingTarget(ctx context.Context, t ResolvedTarget) (int64, error) {
 		return lat, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	return lat, nil
+}
+
+// percentileF 供 CSV 派生统计使用（与 report.Percentile 同算法：线性插值）。
+func percentileF(v []float64, p float64) (float64, bool) {
+	if len(v) == 0 {
+		return 0, false
+	}
+	s := make([]float64, len(v))
+	copy(s, v)
+	sort.Float64s(s)
+	k := float64(len(s)-1) * p / 100
+	f := math.Floor(k)
+	c := math.Ceil(k)
+	if f == c {
+		return s[int(f)], true
+	}
+	return s[int(f)] + (s[int(c)]-s[int(f)])*(k-f), true
 }

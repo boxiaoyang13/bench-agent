@@ -154,6 +154,11 @@ func (m *Manager) Submit(ctx context.Context, req SubmitRequest) (*domain.Run, e
 		if err != nil {
 			return nil, err
 		}
+	case domain.CapCache:
+		plan, steps, err = m.normalizeCachePlan(req.Tool, req.Plan)
+		if err != nil {
+			return nil, err
+		}
 	default:
 		var norm domain.Normalizer
 		norm, err = m.normalizer(req.Tool, req.Capability)
@@ -452,7 +457,8 @@ func (m *Manager) execute(ctx context.Context, runID string) {
 
 	m.report(runCtx, lr, res)
 	status := domain.StatusSucceeded
-	if lr.run.Capability == domain.CapEval {
+	switch lr.run.Capability {
+	case domain.CapEval:
 		ok, total := evalSuccessCount(res.Eval)
 		switch {
 		case ok == 0 && total > 0:
@@ -460,8 +466,22 @@ func (m *Manager) execute(ctx context.Context, runID string) {
 		case ok < total:
 			status = domain.StatusPartial
 		}
-	} else if hasFailedStep(lr) {
-		status = domain.StatusPartial
+	case domain.CapCache:
+		// 全部请求失败 → failed；部分失败 → partial（gate 另行判定）
+		if res.Cache != nil && res.Cache.TotalRequests > 0 {
+			switch {
+			case res.Cache.SuccessReqs == 0:
+				status = domain.StatusFailed
+			case res.Cache.FailedReqs > 0:
+				status = domain.StatusPartial
+			}
+		} else {
+			status = domain.StatusFailed
+		}
+	default:
+		if hasFailedStep(lr) {
+			status = domain.StatusPartial
+		}
 	}
 	m.finish(runCtx, lr, status, nil)
 }
@@ -562,8 +582,12 @@ func (m *Manager) updateStep(ctx context.Context, lr *liveRun, idx int, mut func
 // ---------------- 结果与产物 ----------------
 
 func (m *Manager) report(ctx context.Context, lr *liveRun, res engine.Result) {
-	if lr.run.Capability == domain.CapEval {
+	switch lr.run.Capability {
+	case domain.CapEval:
 		m.reportEval(ctx, lr, res)
+		return
+	case domain.CapCache:
+		m.reportCache(ctx, lr, res)
 		return
 	}
 	m.setStatus(ctx, lr, domain.StatusReporting)

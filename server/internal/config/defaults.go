@@ -123,6 +123,9 @@ func (c *Config) applyDefaults() {
 	if _, ok := c.Gates.Profiles["eval-sla-v1"]; !ok {
 		c.Gates.Profiles["eval-sla-v1"] = defaultEvalSLAProfile()
 	}
+	if _, ok := c.Gates.Profiles["cache-sla-v1"]; !ok {
+		c.Gates.Profiles["cache-sla-v1"] = defaultCacheSLAProfile()
+	}
 	d(&c.Gates.DefaultProfile, "perf-sla-v1")
 
 	// engines: 每个 capability 的默认值
@@ -304,6 +307,16 @@ func defaultBuckets() []BucketCfg {
 // defaultEvalSLAProfile 与 thvv/eval/效果验收标准.xlsx 的基线对齐
 // （取 glm-5.3 列为默认基线，允许 ±2-4% 浮动已折算进 min_score）。
 // 模型差异大的场景建议在 YAML 里用 baseline_by 按模型覆盖。
+func defaultCacheSLAProfile() *GateProfile {
+	return &GateProfile{
+		Capability:  "cache",
+		Description: "多轮对话前缀缓存：稳态 TTFT 上限 + 首轮改善率 + 成功率",
+		CacheTiers: []CacheGateTier{
+			{SteadyTTFTp50MaxMS: 800, TTFTImprovementMin: 0.30, SuccessRateMin: 0.99},
+		},
+	}
+}
+
 func defaultEvalSLAProfile() *GateProfile {
 	lo := func(base float64) float64 { return base/100 - 0.04 } // 基线 -4% 浮动下限
 	return &GateProfile{

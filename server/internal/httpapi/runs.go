@@ -42,6 +42,20 @@ type planDTO struct {
 	ProviderName  string            `json:"provider_name,omitempty"`
 	Thinking      *bool             `json:"thinking,omitempty"`
 	ThinkingType  string            `json:"thinking_type,omitempty"`
+
+	// cache（tool=lmcache）
+	Workload        string  `json:"workload,omitempty"`
+	KVCacheVolumeGB float64 `json:"kv_cache_volume_gb,omitempty"`
+	TokensPerGBKV   int     `json:"tokens_per_gb_kvcache,omitempty"`
+	QPS             float64 `json:"qps,omitempty"`
+	CacheDuration   int     `json:"duration_sec,omitempty"`
+	Seed            *int    `json:"seed,omitempty"`
+	NoWarmup        bool    `json:"no_warmup,omitempty"`
+	IgnoreEOS       bool    `json:"ignore_eos,omitempty"`
+	SharedPromptLen int     `json:"shared_prompt_length,omitempty"`
+	ChatHistoryLen  int     `json:"chat_history_length,omitempty"`
+	UserInputLen    int     `json:"user_input_length,omitempty"`
+	OutputLen       int     `json:"output_length,omitempty"`
 }
 
 func (d planDTO) toDomain() domain.Plan {
@@ -53,6 +67,10 @@ func (d planDTO) toDomain() domain.Plan {
 		ToolParams: d.ToolParams,
 		Datasets:   d.Datasets, Limit: d.Limit, Repeats: d.Repeats, EvalBatchSize: d.EvalBatchSize,
 		Judge: d.Judge, ProviderName: d.ProviderName, Thinking: d.Thinking, ThinkingType: d.ThinkingType,
+		Workload: d.Workload, KVCacheVolumeGB: d.KVCacheVolumeGB, TokensPerGBKV: d.TokensPerGBKV,
+		QPS: d.QPS, DurationSec: d.CacheDuration, Seed: d.Seed, NoWarmup: d.NoWarmup,
+		IgnoreEOS: d.IgnoreEOS, SharedPromptLen: d.SharedPromptLen, ChatHistoryLen: d.ChatHistoryLen,
+		UserInputLen: d.UserInputLen, OutputLen: d.OutputLen,
 	}
 }
 
@@ -84,10 +102,11 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	if !s.decode(w, r, &dto) {
 		return
 	}
-	if dto.Tool == "" {
-		dto.Tool = s.toolOf(nil)
-	}
 	cap := domain.Capability(orDefault(dto.Capability, "perf"))
+	if dto.Tool == "" {
+		// 默认工具按请求的能力挑（多引擎后不能再取名字排序的第一个）
+		dto.Tool = s.reg.ToolForCap(cap)
+	}
 	if !cap.Valid() {
 		writeProblem(w, r, domain.NewProblem(400, "validation_failed", "capability 必须是 perf | eval | functional"))
 		return
@@ -292,10 +311,17 @@ func (s *Server) handleRunResults(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if run.Capability == domain.CapEval {
+	switch run.Capability {
+	case domain.CapEval:
 		writeJSON(w, http.StatusOK, domain.RunResults{
 			RunID: runID, Capability: run.Capability,
 			GateResult: run.GateResult, Summary: run.Summary, Eval: s.evalMetricsForRun(run),
+		})
+		return
+	case domain.CapCache:
+		writeJSON(w, http.StatusOK, domain.RunResults{
+			RunID: runID, Capability: run.Capability,
+			GateResult: run.GateResult, Summary: run.Summary, Cache: s.cacheMetricsForRun(run),
 		})
 		return
 	}
@@ -341,6 +367,22 @@ func (s *Server) evalMetricsForRun(run *domain.Run) *domain.EvalMetrics {
 		return nil
 	}
 	return f.Eval
+}
+
+// cacheMetricsForRun 回读 run 结束时落盘的 metrics.json（结构：{"cache": {...}}）。
+func (s *Server) cacheMetricsForRun(run *domain.Run) *domain.CacheMetrics {
+	p := filepath.Join(string(s.cfg.Paths.RunsDir), run.ID, "metrics.json")
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return nil
+	}
+	var f struct {
+		Cache *domain.CacheMetrics `json:"cache"`
+	}
+	if json.Unmarshal(b, &f) != nil {
+		return nil
+	}
+	return f.Cache
 }
 
 // metricsForRun 获取指标：优先从 benchmark_data.db 重算（保证与报告口径一致），

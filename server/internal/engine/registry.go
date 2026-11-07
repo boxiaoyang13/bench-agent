@@ -96,9 +96,12 @@ func NewRegistry(cfg *config.Config) *Registry {
 				} else if v, ok := cfg.Resolved["roots.thvv"]; ok {
 					home = v
 				}
-				if cap == domain.CapEval {
+				switch cap {
+				case domain.CapEval:
 					e.byCap[cap] = NewEval(name, eng, capCfg, home)
-				} else {
+				case domain.CapCache:
+					e.byCap[cap] = NewCache(name, eng, capCfg, home)
+				default:
 					e.byCap[cap] = NewSubprocess(name, eng, capCfg, home)
 				}
 				e.status[cap] = orDefault(capCfg.Status, "ga")
@@ -190,6 +193,21 @@ func (r *Registry) Status(tool string, cap domain.Capability) (string, string) {
 		return "unavailable", "未配置"
 	}
 	return st, e.reason[cap]
+}
+
+// ToolForCap 返回第一个（按名排序）启用了指定能力的工具名；都没有时退回第一个工具。
+func (r *Registry) ToolForCap(cap domain.Capability) string {
+	for _, name := range r.order {
+		if e, ok := r.entries[name]; ok {
+			if _, ok2 := e.byCap[cap]; ok2 {
+				return name
+			}
+		}
+	}
+	if len(r.order) > 0 {
+		return r.order[0]
+	}
+	return ""
 }
 
 // AnyProbe 选一个可用引擎做 probe。

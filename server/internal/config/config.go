@@ -218,6 +218,9 @@ type Capability struct {
 	Datasets []Dataset `yaml:"datasets"`
 	Judge    *Judge    `yaml:"judge"`
 
+	// cache（lmcache bench engine）；键名不能与 perf 的 defaults 重复
+	CacheDefaults *CacheDefaults `yaml:"cache_defaults"`
+
 	// http
 	PlanSchema   string `yaml:"plan_schema"`
 	ResultSchema string `yaml:"result_schema"`
@@ -284,6 +287,20 @@ type Judge struct {
 	APIKey  string `yaml:"api_key"`
 }
 
+// CacheDefaults 是 lmcache bench multi-round-chat 的默认参数。
+type CacheDefaults struct {
+	Workload        string  `yaml:"workload"`
+	KVCacheVolumeGB float64 `yaml:"kv_cache_volume_gb"`
+	TokensPerGBKV   int     `yaml:"tokens_per_gb_kvcache"`
+	QPS             float64 `yaml:"qps"`
+	DurationSec     int     `yaml:"duration_sec"`
+	Seed            int     `yaml:"seed"`
+	SharedPromptLen int     `yaml:"shared_prompt_length"`
+	ChatHistoryLen  int     `yaml:"chat_history_length"`
+	UserInputLen    int     `yaml:"user_input_length"`
+	OutputLen       int     `yaml:"output_length"`
+}
+
 // ---------- reports / gates ----------
 
 type Reports struct {
@@ -319,6 +336,15 @@ type GateProfile struct {
 	// eval：按数据集的分数下限（0~1）。
 	// 与《效果验收标准.xlsx》对齐：基线可按 target.model 配置覆盖，未命中用 default。
 	EvalTiers []EvalGateTier `yaml:"eval_tiers,omitempty"`
+
+	// cache：multi-round-chat 前缀缓存验收（cache-sla-v1）。
+	CacheTiers []CacheGateTier `yaml:"cache_tiers,omitempty"`
+}
+
+type CacheGateTier struct {
+	SteadyTTFTp50MaxMS float64 `yaml:"steady_ttft_p50_max_ms"` // 稳态 TTFT P50 上限
+	TTFTImprovementMin float64 `yaml:"ttft_improvement_min"`   // 稳态相对首轮的最小改善率（0~1）
+	SuccessRateMin     float64 `yaml:"success_rate_min"`       // 成功率下限（0~1）
 }
 
 type EvalGateTier struct {

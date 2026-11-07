@@ -105,6 +105,9 @@ func (f *Fake) Run(ctx context.Context, spec Spec, emit func(Event)) (Result, er
 	if spec.Capability == domain.CapEval {
 		return f.runEval(ctx, spec, emit)
 	}
+	if spec.Capability == domain.CapCache {
+		return f.runCache(ctx, spec, emit)
+	}
 	res := Result{DBPaths: map[int]string{}}
 	total := len(spec.Steps)
 	perStep := time.Duration(f.StepMS) * time.Millisecond
@@ -268,5 +271,60 @@ func (f *Fake) runEval(ctx context.Context, spec Spec, emit func(Event)) (Result
 			"score": score, "duration_sec": dur,
 		}})
 	}
+	return res, nil
+}
+
+// runCache 是 cache 能力的模拟实现：首轮 TTFT 高、后续低，产出可判定的改善率。
+func (f *Fake) runCache(ctx context.Context, spec Spec, emit func(Event)) (Result, error) {
+	res := Result{DBPaths: map[int]string{}}
+	emit(Event{Kind: EvStepStarted, At: time.Now().UTC(), Data: map[string]any{
+		"step_index": 0, "bucket": "multi-round-chat", "parallel": 0, "number": 0,
+	}})
+	if err := ctx.Err(); err != nil {
+		return res, err
+	}
+	select {
+	case <-ctx.Done():
+		return res, ctx.Err()
+	case <-time.After(time.Duration(f.StepMS) * time.Millisecond):
+	}
+
+	first := 900.0 + rand.Float64()*300                 // 首轮 900~1200ms
+	steadyP50 := first * (1 - 0.5 - rand.Float64()*0.2) // 稳态改善 50~70%
+	total := 12
+	failed := 0
+	if rand.Float64() < f.FailRate {
+		failed = 1 + rand.Intn(2)
+	}
+	sr := float64(total-failed) / float64(total)
+	dur := float64(f.StepMS) / 1000
+	ok := failed < total
+	status := domain.StepSucceeded
+	if !ok {
+		status = domain.StepFailed
+	}
+	res.Steps = append(res.Steps, domain.Step{
+		Index: 0, Bucket: "multi-round-chat", Parallel: 3, Number: total,
+		Status: status, SuccessRate: &sr, DurationSec: &dur,
+	})
+	res.Cache = &domain.CacheMetrics{
+		Workload: "multi-round-chat", Model: spec.Target.Model, NumSessions: 3,
+		TotalRequests: total, SuccessReqs: total - failed, FailedReqs: failed,
+		SuccessRate: sr, ElapsedSec: dur, MeanTTFTMS: first * 0.6,
+		FirstRound: &domain.CacheRoundStats{Round: 0, Requests: 3, TTFTMeanMS: first},
+		SteadyState: &domain.CacheSteadyStats{
+			Requests: total - 3, TTFTp50MS: steadyP50, TTFTp90MS: steadyP50 * 1.3,
+			TTFTp99MS: steadyP50 * 1.8, TTFTImprovement: 1 - steadyP50/first,
+		},
+		Rounds: []domain.CacheRoundStats{
+			{Round: 0, Requests: 3, TTFTMeanMS: first},
+			{Round: 1, Requests: 3, TTFTMeanMS: steadyP50 * 1.1},
+			{Round: 2, Requests: 3, TTFTMeanMS: steadyP50},
+		},
+	}
+	emit(Event{Kind: EvStepFinished, At: time.Now().UTC(), Data: map[string]any{
+		"step_index": 0, "status": string(status), "success_rate": sr,
+		"ttft_steady_p50_ms": steadyP50, "duration_sec": dur,
+	}})
 	return res, nil
 }
