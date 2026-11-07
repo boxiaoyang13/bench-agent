@@ -312,7 +312,7 @@ func defaultCacheSLAProfile() *GateProfile {
 		Capability:  "cache",
 		Description: "多轮对话前缀缓存：稳态 TTFT 上限 + 首轮改善率 + 成功率",
 		CacheTiers: []CacheGateTier{
-			{SteadyTTFTp50MaxMS: 800, TTFTImprovementMin: 0.30, SuccessRateMin: 0.99},
+			{SteadyTTFTp50MaxMS: 800, TTFTImprovementMin: 0.30, SuccessRateMin: 0.99, PrefixHitRateMin: 0.50},
 		},
 	}
 }

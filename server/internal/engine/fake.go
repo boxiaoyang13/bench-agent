@@ -307,10 +307,17 @@ func (f *Fake) runCache(ctx context.Context, spec Spec, emit func(Event)) (Resul
 		Index: 0, Bucket: "multi-round-chat", Parallel: 3, Number: total,
 		Status: status, SuccessRate: &sr, DurationSec: &dur,
 	})
+	hitRate := 0.90 + rand.Float64()*0.08
 	res.Cache = &domain.CacheMetrics{
 		Workload: "multi-round-chat", Model: spec.Target.Model, NumSessions: 3,
 		TotalRequests: total, SuccessReqs: total - failed, FailedReqs: failed,
 		SuccessRate: sr, ElapsedSec: dur, MeanTTFTMS: first * 0.6,
+		PrefixHitRate: &hitRate, CacheFieldReported: true,
+		ProbeRounds: []domain.CacheProbeRound{
+			{Round: 0, PromptTokens: 12000, CachedTokens: 0},
+			{Round: 1, PromptTokens: 12200, CachedTokens: 12000, HitRate: hitRate},
+			{Round: 2, PromptTokens: 12400, CachedTokens: 12200, HitRate: hitRate},
+		},
 		FirstRound: &domain.CacheRoundStats{Round: 0, Requests: 3, TTFTMeanMS: first},
 		SteadyState: &domain.CacheSteadyStats{
 			Requests: total - 3, TTFTp50MS: steadyP50, TTFTp90MS: steadyP50 * 1.3,

@@ -521,6 +521,40 @@ func TestEvaluateCacheGate(t *testing.T) {
 		t.Fatalf("违规规则缺失: %+v", rules)
 	}
 
+	// 前缀命中率：低于下限 / 端点未上报
+	lowHit := &domain.CacheMetrics{
+		TotalRequests: 20, SuccessReqs: 20, SuccessRate: 1,
+		SteadyState:        &domain.CacheSteadyStats{Requests: 17, TTFTp50MS: 400, TTFTImprovement: 0.60},
+		PrefixHitRate:      func() *float64 { v := 0.30; return &v }(),
+		CacheFieldReported: true,
+	}
+	hitProfile := &config.GateProfile{Capability: "cache",
+		CacheTiers: []config.CacheGateTier{{PrefixHitRateMin: 0.50}}}
+	res2 := EvaluateCacheGate(hitProfile, lowHit, false)
+	if res2.Passed {
+		t.Fatal("命中率 0.30 < 0.50 应不通过")
+	}
+	found := false
+	for _, v := range res2.Violations {
+		if v.Rule == "prefix_hit_rate_min" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("缺 prefix_hit_rate_min 违规: %+v", res2.Violations)
+	}
+
+	notReported := &domain.CacheMetrics{
+		TotalRequests: 20, SuccessReqs: 20, SuccessRate: 1,
+		SteadyState:        &domain.CacheSteadyStats{Requests: 17, TTFTp50MS: 400, TTFTImprovement: 0.60},
+		PrefixHitRate:      func() *float64 { v := 0.0; return &v }(),
+		CacheFieldReported: false,
+	}
+	res3 := EvaluateCacheGate(hitProfile, notReported, false)
+	if res3.Passed {
+		t.Fatal("端点未上报 cached_tokens 应不通过")
+	}
+
 	// no_warmup：不判改善率，只判稳态上限
 	cold := &domain.CacheMetrics{
 		TotalRequests: 20, SuccessReqs: 20, SuccessRate: 1,

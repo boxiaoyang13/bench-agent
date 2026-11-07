@@ -180,6 +180,17 @@ func (e *CacheEngine) Run(ctx context.Context, spec Spec, emit func(Event)) (Res
 		"step_index": 0, "bucket": st.Bucket, "parallel": 0, "number": 0,
 	}})
 
+	// 前缀命中率探针：在 bench 之前直连端点抓原始 usage（含 cached_tokens）。
+	// lmcache bench 的 CSV 不含该字段；探针失败不阻断 bench。
+	probeRounds, probeErr := e.probePrefixCache(ctx, spec, outDir)
+	for _, pr := range probeRounds {
+		fmt.Fprintf(logFile, "[probe] round=%d prompt=%d cached=%d hit=%.1f%% ttft=%.0fms\n",
+			pr.Round, pr.PromptTokens, pr.CachedTokens, pr.HitRate*100, pr.ReqMS)
+	}
+	if probeErr != nil {
+		fmt.Fprintf(logFile, "[probe] 探针未完成: %v（不影响 bench）\n", probeErr)
+	}
+
 	args := e.benchArgs(spec, outDir)
 	cmd := exec.CommandContext(ctx, e.cli, args...)
 	cmd.Dir = e.workdir
@@ -247,7 +258,7 @@ func (e *CacheEngine) Run(ctx context.Context, spec Spec, emit func(Event)) (Res
 	}
 
 	// 读取结果
-	metrics, ferr := readBenchResults(outDir)
+	metrics, ferr := readBenchResults(outDir, probeRounds)
 	status := domain.StepSucceeded
 	errMsg := ""
 	if ferr != nil {
@@ -428,7 +439,7 @@ type benchSummaryFile struct {
 
 // readBenchResults 读 bench_summary.json + bench_results.csv，派生缓存指标。
 // CSV 派生在 report 包实现（report.DeriveCacheMetrics），这里做 IO 与组装。
-func readBenchResults(dir string) (*domain.CacheMetrics, error) {
+func readBenchResults(dir string, probeRounds []domain.CacheProbeRound) (*domain.CacheMetrics, error) {
 	m := &domain.CacheMetrics{Workload: "multi-round-chat"}
 
 	b, err := os.ReadFile(filepath.Join(dir, "bench_summary.json"))
@@ -461,6 +472,13 @@ func readBenchResults(dir string) (*domain.CacheMetrics, error) {
 		m.FirstRound = first
 	}
 	m.NumSessions = countSessions(filepath.Join(dir, "bench_results.csv"))
+	if probeRounds != nil {
+		m.ProbeRounds = probeRounds
+		if hr, reported := DeriveProbeHitRate(probeRounds); len(probeRounds) > 1 {
+			m.PrefixHitRate = &hr
+			m.CacheFieldReported = reported
+		}
+	}
 	return m, nil
 }
 
@@ -622,6 +640,7 @@ func collectCacheFiles(workload, dir string) []FileArtifact {
 	}{
 		{"bench_results.csv", domain.ArtBenchCSV, "text/csv; charset=utf-8"},
 		{"bench_summary.json", domain.ArtBenchSummary, "application/json"},
+		{"prefix_usage.csv", domain.ArtBenchCSV, "text/csv; charset=utf-8"},
 	}
 	var out []FileArtifact
 	for _, c := range candidates {

@@ -1236,6 +1236,8 @@ function renderCacheResults(results, artifacts) {
 
   const imp = s.ttft_improvement;
   const kpis = [
+    ['前缀命中率', s.prefix_hit_rate != null ? fmtPct(s.prefix_hit_rate) : '—',
+      s.cache_field_reported === false ? '⚠ 端点未上报 cached_tokens' : 'cached/prompt（探针直采）'],
     ['稳态 TTFT P50', s.ttft_steady_p50_ms != null ? fmtNum(s.ttft_steady_p50_ms) + 'ms' : '—', '前缀命中下的首 token'],
     ['首轮 TTFT', s.ttft_first_round_ms != null ? fmtNum(s.ttft_first_round_ms) + 'ms' : '—', '冷/半冷缓存'],
     ['TTFT 改善率', imp != null ? fmtPct(imp) : '—', '1 − 稳态P50/首轮均值'],
@@ -1251,11 +1253,21 @@ function renderCacheResults(results, artifacts) {
   const violRows = (g?.violations || []).map(v => `
     <tr><td>${esc(v.rule)}</td><td class="num">${fmtNum(v.actual)}</td>
       <td class="num">${fmtNum(v.threshold)}</td><td class="muted">${esc(v.message || '')}</td></tr>`).join('');
+  const probeRows = (c.probe_rounds || []).map(r => `
+    <tr><td class="num">${r.round}</td><td class="num">${r.prompt_tokens}</td>
+      <td class="num">${r.cached_tokens}</td>
+      <td class="num">${r.hit_rate != null ? fmtPct(r.hit_rate) : '—'}</td>
+      <td class="num">${r.req_ms ? fmtNum(r.req_ms) + 'ms' : '—'}</td></tr>`).join('');
   $('#gate-body').innerHTML = `
     <p class="muted">workload ${esc(c.workload || 'multi-round-chat')} · ${esc(c.model || '')} ·
       ${c.num_sessions ? c.num_sessions + ' 个并发 session · ' : ''}${s.total_requests ?? '—'} 个请求。
       ${g ? `验收模板 ${esc(g.profile)} · 违规 ${(g.violations || []).length} 项` : '未启用验收'}</p>
-    ${roundRows ? `<table class="tbl"><thead><tr><th class="num">轮次</th><th class="num">请求数</th>
+    ${probeRows ? `<h4 style="margin-top:12px">前缀命中率探针（原始 usage）</h4>
+      <table class="tbl"><thead><tr><th class="num">轮次</th><th class="num">prompt_tokens</th>
+      <th class="num">cached_tokens</th><th class="num">命中率</th><th class="num">请求耗时</th>
+      </tr></thead><tbody>${probeRows}</tbody></table>
+      <p class="muted">探针在 bench 前直连端点抓取 usage.prompt_tokens_details.cached_tokens；原始文件见 prefix_usage.csv</p>` : ''}
+    ${roundRows ? `<h4 style="margin-top:12px">bench 逐轮 TTFT</h4><table class="tbl"><thead><tr><th class="num">轮次</th><th class="num">请求数</th>
       <th class="num">TTFT 均值</th><th class="num">输入 token 均值</th></tr></thead><tbody>${roundRows}</tbody></table>` : ''}
     ${violRows ? `<h4 style="margin-top:16px">违规明细</h4><table class="tbl"><thead><tr>
       <th>规则</th><th class="num">实测</th><th class="num">阈值</th><th>说明</th>
@@ -1380,7 +1392,8 @@ async function loadHistory(reset) {
         <td class="num">${r.capability === 'eval'
           ? (r.summary?.score_avg != null ? '均分 ' + fmtNum(r.summary.score_avg, 3) : '—')
           : r.capability === 'cache'
-            ? (r.summary?.ttft_improvement != null ? '改善 ' + fmtPct(r.summary.ttft_improvement) : '—')
+            ? (r.summary?.prefix_hit_rate != null ? '命中 ' + fmtPct(r.summary.prefix_hit_rate)
+              : r.summary?.ttft_improvement != null ? '改善 ' + fmtPct(r.summary.ttft_improvement) : '—')
             : (r.summary?.success_rate != null ? fmtPct(r.summary.success_rate) : '—')}</td>
         <td>${verdict}</td>
         <td><a href="#/run/${esc(r.run_id)}">查看</a></td>

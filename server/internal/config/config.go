@@ -345,6 +345,7 @@ type CacheGateTier struct {
 	SteadyTTFTp50MaxMS float64 `yaml:"steady_ttft_p50_max_ms"` // 稳态 TTFT P50 上限
 	TTFTImprovementMin float64 `yaml:"ttft_improvement_min"`   // 稳态相对首轮的最小改善率（0~1）
 	SuccessRateMin     float64 `yaml:"success_rate_min"`       // 成功率下限（0~1）
+	PrefixHitRateMin   float64 `yaml:"prefix_hit_rate_min"`    // 前缀命中率下限（0~1；cached/prompt）
 }
 
 type EvalGateTier struct {

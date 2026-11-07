@@ -286,11 +286,22 @@ gates:
           success_rate_min: 0.99
 ```
 
+前缀命中率探针（Go 直采）：
+
+- bench 之前对端点发 1 次冷 + 4 次增长请求（同 workload 的 token 形状），
+  抓 `usage.prompt_tokens_details.cached_tokens`
+- 结果：`cache.probe_rounds[]`（逐轮原始 usage）、`cache.prefix_hit_rate`（稳态）、
+  `cache.cache_field_reported`（端点是否上报该字段）
+- 产物：`prefix_usage.csv`（round / prompt_tokens / cached_tokens / hit_rate / req_ms）
+- 探针失败不阻断 bench
+
 判定（`report.EvaluateCacheGate`）：
 
 - `success_rate < min` → `min_success_rate` 违规
 - `ttft_steady_p50_ms > max` → `steady_ttft_p50_max` 违规
 - `ttft_improvement < min` → `ttft_improvement_min` 违规（缓存未生效/未配置的强信号）
+- `prefix_hit_rate < prefix_hit_rate_min`（默认 0.50）→ `prefix_hit_rate_min` 违规；
+  端点未上报 cached_tokens 时给出独立提示（无法确认前缀缓存）
 - 未预热 run（`no_warmup=true`）不判 improvement（首轮即冷态，口径不同）
 
 ---

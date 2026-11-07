@@ -117,6 +117,15 @@ type CacheRoundStats struct {
 	InputTokensMean float64 `json:"input_tokens_mean,omitempty"`
 }
 
+// CacheProbeRound 是前缀命中率探针的单轮原始 usage。
+type CacheProbeRound struct {
+	Round        int     `json:"round"`
+	PromptTokens int     `json:"prompt_tokens"`
+	CachedTokens int     `json:"cached_tokens"`
+	HitRate      float64 `json:"hit_rate"`         // cached / prompt（端点未上报时为 0）
+	ReqMS        float64 `json:"req_ms,omitempty"` // 非流式请求耗时（prefill 主导，作 TTFT 代理）
+}
+
 // CacheMetrics 是一次 cache run 的结果（bench_summary.json + CSV 派生）。
 type CacheMetrics struct {
 	Workload      string            `json:"workload"`
@@ -130,8 +139,13 @@ type CacheMetrics struct {
 	FirstRound    *CacheRoundStats  `json:"first_round,omitempty"`
 	SteadyState   *CacheSteadyStats `json:"steady_state,omitempty"`
 	Rounds        []CacheRoundStats `json:"rounds,omitempty"`
-	InputTokens   int               `json:"total_input_tokens,omitempty"`
-	OutputTokens  int               `json:"total_output_tokens,omitempty"`
+	// 前缀命中率探针（Go 侧直采 usage.prompt_tokens_details.cached_tokens，
+	// lmcache bench 的 CSV 不含该字段）
+	ProbeRounds        []CacheProbeRound `json:"probe_rounds,omitempty"`
+	PrefixHitRate      *float64          `json:"prefix_hit_rate,omitempty"`      // 稳态（非首轮）cached/prompt
+	CacheFieldReported bool              `json:"cache_field_reported,omitempty"` // 端点是否上报 cached_tokens
+	InputTokens        int               `json:"total_input_tokens,omitempty"`
+	OutputTokens       int               `json:"total_output_tokens,omitempty"`
 	// 来自 bench_summary.json 的聚合（Python 口径）
 	MeanTTFTMS      float64 `json:"mean_ttft_ms,omitempty"`
 	DecodeSpeedP50  float64 `json:"decode_speed_p50,omitempty"`

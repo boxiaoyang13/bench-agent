@@ -156,6 +156,10 @@ func (m *Manager) reportCache(ctx context.Context, lr *liveRun, res engine.Resul
 	if cm.FirstRound != nil {
 		summary["ttft_first_round_ms"] = round6(cm.FirstRound.TTFTMeanMS)
 	}
+	if cm.PrefixHitRate != nil {
+		summary["prefix_hit_rate"] = round6(*cm.PrefixHitRate)
+		summary["cache_field_reported"] = cm.CacheFieldReported
+	}
 	if gate != nil {
 		summary["gate_passed"] = gate.Passed
 		summary["gate_violations"] = len(gate.Violations)

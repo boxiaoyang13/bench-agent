@@ -115,7 +115,7 @@ s1_r2,False,0,0,0,0,0,7,0,0,boom
 // TestReadBenchResultsMissing summary 缺失时报可读错误。
 func TestReadBenchResultsMissing(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := readBenchResults(dir); err == nil {
+	if _, err := readBenchResults(dir, nil); err == nil {
 		t.Fatal("缺 bench_summary.json 应报错")
 	}
 }
@@ -131,6 +131,42 @@ func TestCacheBaseURL(t *testing.T) {
 	for in, want := range cases {
 		if got := cacheBaseURL(in); got != want {
 			t.Errorf("cacheBaseURL(%q)=%q，期望 %q", in, got, want)
+		}
+	}
+}
+
+// TestDeriveProbeHitRate 探针命中率派生：稳态=非首轮；端点未上报的识别。
+func TestDeriveProbeHitRate(t *testing.T) {
+	rounds := []domain.CacheProbeRound{
+		{Round: 0, PromptTokens: 12000, CachedTokens: 0},
+		{Round: 1, PromptTokens: 12200, CachedTokens: 12000},
+		{Round: 2, PromptTokens: 12400, CachedTokens: 12200},
+	}
+	hr, reported := DeriveProbeHitRate(rounds)
+	// 稳态 = (12000+12200)/(12200+12400) = 24200/24600
+	want := 24200.0 / 24600.0
+	if hr < want-1e-9 || hr > want+1e-9 {
+		t.Fatalf("命中率 %v，期望 %v", hr, want)
+	}
+	if !reported {
+		t.Fatal("有 cached_tokens>0 应识别为已上报")
+	}
+
+	// 端点不返回 cached_tokens：reported=false，命中率 0
+	noCache := []domain.CacheProbeRound{
+		{Round: 0, PromptTokens: 100, CachedTokens: 0},
+		{Round: 1, PromptTokens: 100, CachedTokens: 0},
+	}
+	hr2, reported2 := DeriveProbeHitRate(noCache)
+	if hr2 != 0 || reported2 {
+		t.Fatalf("未上报场景: hr=%v reported=%v", hr2, reported2)
+	}
+
+	// 单轮：无稳态
+	if _, _ = DeriveProbeHitRate(rounds[:1]); true {
+		hr3, _ := DeriveProbeHitRate(rounds[:1])
+		if hr3 != 0 {
+			t.Fatal("单轮无稳态，命中率应为 0")
 		}
 	}
 }

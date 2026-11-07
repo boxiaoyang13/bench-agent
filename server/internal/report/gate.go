@@ -322,6 +322,23 @@ func EvaluateCacheGate(profile *config.GateProfile, m *domain.CacheMetrics, noWa
 					ss.TTFTImprovement*100, tier.TTFTImprovementMin*100),
 			})
 		}
+		// 前缀命中率（比改善率更直接回答「缓存有没有生效」）
+		if tier.PrefixHitRateMin > 0 && m.PrefixHitRate != nil {
+			if !m.CacheFieldReported {
+				res.Violations = append(res.Violations, domain.Violation{
+					Scope: "cache", Rule: "prefix_hit_rate_min",
+					Actual: 0, Threshold: tier.PrefixHitRateMin,
+					Message: "端点未上报 usage.prompt_tokens_details.cached_tokens，无法确认前缀缓存（可能未启用）",
+				})
+			} else if *m.PrefixHitRate < tier.PrefixHitRateMin {
+				res.Violations = append(res.Violations, domain.Violation{
+					Scope: "cache", Rule: "prefix_hit_rate_min",
+					Actual: round(*m.PrefixHitRate, 4), Threshold: tier.PrefixHitRateMin,
+					Message: fmt.Sprintf("前缀命中率 %.1f%% < %.1f%%（重复前缀的 cached_tokens 占比不足）",
+						*m.PrefixHitRate*100, tier.PrefixHitRateMin*100),
+				})
+			}
+		}
 		res.TierSummary = append(res.TierSummary, domain.TierSummary{
 			Tier: "steady", Steps: ss.Requests, P50MaxSec: ss.TTFTp50MS, Passed: len(res.Violations) == 0,
 		})
