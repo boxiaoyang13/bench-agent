@@ -19,6 +19,7 @@
 | `tokenizer_map` | 13 条模型族 → tokenizer 映射 | `run.sh: auto_detect_tokenizer` |
 | `matrix.*` | 梯度 `[1,8,32,64,128]`、冷却 `120s`、早停关闭、TPM 不限、失败即跳 | `run.sh: BUCKETS` / `CONCURRENCY_LADDER` / … |
 | `gates.profiles["perf-sla-v1"]` | 6 档 TTFT P50/P90 阈值 + 30 t/s + 99% 成功率 | `sla_eval.py: TIERS` |
+| `gates.profiles["cache-sla-v1"]` / `["cache-perf-sla-v1"]` | 缓存收益（稳态 TTFT + 改善率 + 命中率）；后者再加 TPOT / 解码速度 / 吞吐 / 最小样本数 | 新增（`docs/CACHE.md` §7） |
 | `reports.title.*` | `{model} 性能压测报告 ({bucket})` / `(全档位 {ts})` | `gen_perf_dashboard.py` |
 | `limits.*` | 并发 2 / 队列 16 / 单 run 12h / 保留 30 天 | 新增（无历史对应） |
 
@@ -496,9 +497,26 @@ THVV 只负责：把 `plan.tool_params` 按 schema 校验 → 转发 → 翻译�
 |---|---|
 | `default_profile` | `plan.gate.profile` 未指定时用哪个；留空则默认不判定 |
 | `profiles.<name>.tiers[]` | 分档阈值，`lo <= avg_prompt_tokens < hi`（上界不含，与 `sla_eval.py` 一致） |
+| `profiles.<name>.cache_tiers[]` | cache 能力专用阈值，见下表 |
 | `global.min_output_tokens_per_sec` | 吞吐下限（原脚本硬编码 30） |
 | `global.min_success_rate` | 成功率下限 |
 | `default_params` | 如 `user_tpm_quota` |
+
+`cache_tiers[]` 字段（除前四项外均为可选，0 = 不判该项）：
+
+| 字段 | 说明 |
+|---|---|
+| `steady_ttft_p50_max_ms` | 稳态 TTFT P50 上限 |
+| `ttft_improvement_min` | 稳态相对首轮的 TTFT 改善率下限（0~1） |
+| `success_rate_min` | 成功率下限（0~1） |
+| `prefix_hit_rate_min` | 前缀命中率下限（cached/prompt，0~1） |
+| `tpot_p50_max_ms` | 稳态 TPOT P50 上限（ms/token） |
+| `decode_speed_min` | 稳态解码速度 P50 下限（tokens/s） |
+| `input_throughput_min` | 全 run 输入吞吐下限（tokens/s，含 cached token，慎用） |
+| `min_samples` | 稳态样本数下限（低于阈值直接违规） |
+
+> 注意：cache 的性能字段是「前缀缓存命中态」的表观性能，与 `perf-sla-v1` 的
+> 冷启动/定压口径不可直接横比。阈值默认值只是起点，应按被测模型在 YAML 覆盖。
 
 阈值模板通过 `GET /v1/catalog/gates` 暴露给前端，「验收门槛」下拉框直接读它 —— 加新模板无需改前端。
 

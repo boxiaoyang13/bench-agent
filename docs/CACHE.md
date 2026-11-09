@@ -5,6 +5,8 @@
 > Target / Run / Step / Artifact / SSE / 取消 / 报告下载协议。
 >
 > 状态：v1 已实现并真机端到端验证通过（§11 清单全部完成；真机结论见文末「验证记录」）。
+> v1.1（方案 A）已接入「性能维度」：同一个 multi-round-chat run 同时产出缓存收益与稳态性能
+> （TPOT / 解码速度 / 时延分位 / 吞吐），并支持 `cache-perf-sla-v1` 验收，见 §3.3、§7、§11.2。
 > 相关：[`API.md`](./API.md) · [`CONFIG.md`](./CONFIG.md) · [`EVAL.md`](./EVAL.md)（接入模式的先例）
 > 上游文档：https://docs.lmcache.ai/zh_CN/cli/bench.html
 
@@ -103,9 +105,10 @@ s0_r0,True,1.0550086498,1.9992547035,4583,128,135.55788716,1794032745.09,…
 |---|---|
 | multi-round-chat 单 workload，一次 run 一个 step | 不接 kv-tier-pressure / long-doc-* 等其它 workload（协议留 `workload` 字段） |
 | 复用现有 Target（OpenAI 兼容端点 + 凭据） | 不管理 LMCache server 本身（`lmcache server` 的部署/配置属被测环境） |
-| bench_summary.json → 结构化指标；CSV 逐条归档 | 不在 Go 侧重算逐请求指标（以 Python 落盘为准） |
+| bench_summary.json → 结构化指标；CSV 逐条归档 | 不在 Go 侧重算逐请求 TTFT / 吞吐（以 Python 落盘为准）；TPOT / 稳态分位由 CSV 派生 |
 | 缓存收益分析：首轮 vs 稳态 TTFT 对比（从 CSV 派生） | 不做 token 级命中归因（需要被测端开 token trace，另用 `bench trace-analyze`） |
 | `cache-sla-v1` 验收：稳态 TTFT 阈值 + 改善率 | 不做跨 run 的缓存收益趋势对比（v1.1） |
+| **性能维度（方案 A）**：稳态 TPOT / 解码速度 / 时延分位 / 吞吐 → summary + `cache-perf-sla-v1` | 不做并发档位（多 step 压测曲线，方案 B，见 §12） |
 
 ---
 
@@ -187,15 +190,28 @@ Step：`bucket = "multi-round-chat"`、`number = 请求数（事后回填）`、
     "verdict": "pass",
     "total_requests": 15, "successful_requests": 15, "success_rate": 1.0,
     "ttft_first_round_ms": 1055.0, "ttft_steady_p50_ms": 447.7,
+    "ttft_steady_p90_ms": 539.8, "ttft_steady_p99_ms": 984.9,
     "ttft_improvement": 0.576,
-    "mean_decode_speed": 138.3, "input_throughput": 2468.7
+    "mean_decode_speed": 138.3, "tpot_mean_ms": 7.2,
+    "tpot_steady_p50_ms": 7.4, "tpot_steady_p90_ms": 8.1,
+    "decode_speed_steady_p50": 134.0,
+    "input_throughput": 2468.7, "output_throughput": 61.8,
+    "request_latency_p50_ms": 1375.5, "request_latency_p90_ms": 1502.0,
+    "request_latency_p99_ms": 1984.9,
+    "samples_steady": 12
   },
   "cache": {
     "workload": "multi-round-chat",
     "num_sessions": 3,
+    "mean_decode_speed": 138.3, "tpot_mean_ms": 7.2,
+    "output_throughput": 61.8,
+    "request_latency_p50_ms": 1375.5, "request_latency_p90_ms": 1502.0,
+    "request_latency_p99_ms": 1984.9,
     "steady_state": {
       "ttft_p50_ms": 447.7, "ttft_p90_ms": 539.8, "ttft_p99_ms": 984.9,
-      "request_latency_p50_ms": 1375.5, "decode_speed_p50": 134.0
+      "request_latency_p50_ms": 1375.5,
+      "decode_speed_p50": 134.0, "tpot_p50_ms": 7.4, "tpot_p90_ms": 8.1,
+      "requests": 12
     },
     "first_round": { "ttft_mean_ms": 1055.0, "requests": 3 },
     "rounds": [
@@ -212,7 +228,16 @@ Step：`bucket = "multi-round-chat"`、`number = 请求数（事后回填）`、
 - `ttft_first_round_ms`：所有 session 首轮 TTFT 均值（冷/半冷缓存）
 - `ttft_steady_p50_ms`：非首轮请求的 TTFT P50（稳态，前缀已命中）
 - `ttft_improvement = 1 - steady_p50 / first_round_mean`：**缓存收益的核心指标**
-- 失败请求（`successful=False`）不进 TTFT 统计，计入 `success_rate`
+- 失败请求（`successful=False`）不进统计，计入 `success_rate`
+- **性能维度（方案 A）**：
+  - `tpot_*` / `decode_speed_*` 从 CSV 的 `decode_speed` 列派生（`TPOT = 1000 / decode_speed`）；
+    该列缺失时用 `(request_latency - ttft) / (num_output_tokens - 1)` 兜底
+  - `request_latency_p50/p90/p99_ms`、`mean_decode_speed`、`input/output_throughput` 直接取
+    `bench_summary.json`（Python 口径，全量成功请求）
+  - **口径**：这些是「多轮对话 + 前缀缓存命中态」下的表观性能。`TTFT` 受前缀缓存影响大；
+    `TPOT / 解码速度 / 输出吞吐`主要反映模型生成性能。与 perf（冷启动 / 定压 / 按输入长度分档）
+    的数字**不可直接横比**，比较时须 workload 形状与参数一致
+  - 统计可靠性由 `samples_steady` 体现：默认 60s × 1QPS 只有约 60 条请求，P99 基本等于最大值
 
 ---
 
@@ -272,19 +297,43 @@ artifact kinds：`bench_csv`、`bench_summary`（json）、`bench_config`（json
 
 ---
 
-## 7. 验收（cache-sla-v1）
+## 7. 验收（cache-sla-v1 / cache-perf-sla-v1）
 
 ```yaml
 gates:
   profiles:
-    cache-sla-v1:
+    cache-sla-v1:                      # v1：只看缓存收益（保持向后兼容）
       capability: cache
-      description: "多轮对话前缀缓存：稳态 TTFT 下限 + 首轮改善率"
+      description: "多轮对话前缀缓存：稳态 TTFT 上限 + 首轮改善率"
       cache_tiers:
         - steady_ttft_p50_max_ms: 800     # 稳态 TTFT P50 上限
           ttft_improvement_min: 0.30      # 稳态相对首轮至少改善 30%
           success_rate_min: 0.99
+    cache-perf-sla-v1:                 # v1.1：缓存收益 + 稳态性能
+      capability: cache
+      description: "多轮对话：前缀缓存收益 + 稳态性能 + 最小样本数"
+      cache_tiers:
+        - steady_ttft_p50_max_ms: 800
+          ttft_improvement_min: 0.30
+          success_rate_min: 0.99
+          prefix_hit_rate_min: 0.50
+          min_samples: 100               # 稳态样本数下限（否则性能结论不可靠）
+          tpot_p50_max_ms: 80            # 稳态 TPOT P50 上限（ms/token）
+          decode_speed_min: 15           # 稳态解码速度 P50 下限（tokens/s）
+          input_throughput_min: 0        # 0 = 不判；依赖 prompt 形状，需要时在 YAML 打开
 ```
+
+`cache_tiers` 新增字段（均为可选，0 = 不判该项）：
+
+| 字段 | 说明 |
+|---|---|
+| `tpot_p50_max_ms` | 稳态 TPOT P50 上限（ms/token）；由 CSV `decode_speed` 派生 |
+| `decode_speed_min` | 稳态解码速度 P50 下限（tokens/s）；回退到全量 summary 口径 |
+| `input_throughput_min` | 全 run input throughput 下限（tokens/s，含 cached token，慎用） |
+| `min_samples` | 稳态样本数下限；低于阈值直接违规，不静默通过 |
+
+> 性能口径：这些数字是「前缀缓存命中态」的表观性能，不是冷启动/独占压测性能；
+> 与 `perf-sla-v1` 的数字不可直接横比。阈值只是默认值，各部署按被测模型覆盖。
 
 前缀命中率探针（Go 直采）：
 
@@ -302,6 +351,11 @@ gates:
 - `ttft_improvement < min` → `ttft_improvement_min` 违规（缓存未生效/未配置的强信号）
 - `prefix_hit_rate < prefix_hit_rate_min`（默认 0.50）→ `prefix_hit_rate_min` 违规；
   端点未上报 cached_tokens 时给出独立提示（无法确认前缀缓存）
+- 稳态样本数 < `min_samples` → `min_samples` 违规（提示延长 duration / 提高 QPS）
+- `tpot_p50_ms > tpot_p50_max_ms` → `tpot_p50_max_ms` 违规
+- `decode_speed_p50 < decode_speed_min` → `decode_speed_min` 违规
+- `input_throughput < input_throughput_min` → `input_throughput_min` 违规
+- 性能数据缺失（TPOT / decode speed / throughput 取不到）视为违规，不静默通过
 - 未预热 run（`no_warmup=true`）不判 improvement（首轮即冷态，口径不同）
 
 ---
@@ -310,10 +364,12 @@ gates:
 
 1. 「测试计划」能力切换新增第三项：`性能压测 / 效果评测 / 缓存测试`（来自 `/v1/tools` 聚合）
 2. cache 面板：时长、QPS、prompt/历史/输入/输出 token 长度、KV 容量与 tokens/GB、
-   预热开关（默认开）、随机种子（高级）
+   预热开关（默认开）、随机种子（高级）；估算框显示 session 数、预计请求数与
+   「性能验收建议 ≥100 稳态样本」
 3. 步骤表：单行（workload 名 / 时长 / 状态 / 稳态 TTFT / 改善率 / 耗时）
-4. 结果页：KPI 卡（稳态 TTFT P50、首轮 TTFT、改善率、成功率）+ 逐轮 TTFT 表 +
-   违规明细 + 产物下载
+4. 结果页：KPI 卡（前缀命中率、稳态 TTFT P50、首轮 TTFT、改善率、TPOT P50、
+   解码速度、输出吞吐、成功率）+ 逐轮 TTFT 表 + 性能指标表（稳态 P90/P99、
+   请求时延分位、TPOT 分位、in/out 吞吐、样本数）+ 口径说明 + 违规明细 + 产物下载
 5. 历史列表：`能力` 列显示 `缓存测试`，结论列同 eval
 
 ---
@@ -335,8 +391,12 @@ gates:
 |---|---|
 | 单测 | plan 规范化（duration/qps/token 长度边界、未知 workload → 400） |
 | 单测 | CSV 派生：rounds 解析、首轮/稳态口径、失败请求剔除、improvement 计算 |
+| 单测 | CSV 派生 TPOT：`decode_speed` 映射 + 时延/输出 token 兜底 |
+| 单测 | `bench_summary.json` 性能字段映射（时延分位 / mean decode / 输出吞吐 / TPOTMean） |
+| 单测 | 性能 gate：TPOT / 解码速度 / 吞吐 / `min_samples` 违规；数据缺失不静默通过 |
 | 集成 | builtin 引擎：提交 cache run → SSE → `/results.cache` → artifacts 下载 |
 | 真机 | `multi-round-chat 30s`：step 成功、稳态 TTFT < 首轮、改善率 > 0、CSV/JSON 可下载 |
+| 真机 | `cache-perf-sla-v1`：性能指标齐全、样本数不足时正确输出 `min_samples` 违规 |
 | 真机 | `--no-warmup` 冷启动 run：不判 improvement，结果照常产出 |
 | 真机 | 端点 401/502：step failed、错误可读、run.log 无明文 key |
 | 取消 | 运行中 `POST /cancel`：step canceled、已有 CSV 归档、run 状态正确 |
@@ -367,10 +427,32 @@ gates:
   结尾的 URL 追加 /v1）；② SteadyState 为 nil 时的空指针 panic；
   ③ `UpsertStep` 的 ON CONFLICT 不更新 parallel/number（perf 未暴露，cache 回填 0）
 
-## 12. 后续（v1.1）
+## 11.2 方案 A（v1.1）：性能维度落地
 
-1. 其它 workload：`long-doc-qa`（多查询共享长文档）、`prefix-suffix-tuner`（前缀击穿）、
+同一份 `multi-round-chat` 负载同时产出「缓存收益 + 稳态性能」，不新增子进程、不改 CLI 调用：
+
+1. `engine/cache.go`：补解析 `bench_summary.json` 的 `mean_decode_speed` / `output_throughput` /
+   `p50|p90|p99_request_latency_ms`；从 CSV 第 7 列 `decode_speed` 派生稳态 TPOT（缺失时用
+   `(request_latency - ttft) / (num_output_tokens - 1)` 兜底）与稳态解码速度
+2. `domain`：`CacheMetrics` 增加 `mean_decode_speed` / `output_throughput` / `tpot_mean_ms` /
+   `request_latency_p50|p90|p99_ms`；`CacheSteadyStats` 增加 `tpot_p50|p90_ms`
+   （`decode_speed_p50` 由 CSV 稳态填充，原来为空）
+3. `runmgr/cache.go`：`summary` 增加性能段（稳态 TTFT P90/P99、TPOT、解码速度、
+   in/out 吞吐、时延分位、`samples_steady`），旧字段不变
+4. `config`：`CacheGateTier` 增加 `tpot_p50_max_ms` / `decode_speed_min` /
+   `input_throughput_min` / `min_samples`；新增内置模板 `cache-perf-sla-v1`
+   （`cache-sla-v1` 行为不变，向后兼容）
+5. `report/gate.go`：`EvaluateCacheGate` 增加性能与最小样本判定；性能数据缺失视为违规
+6. `web`：结果页 KPI 8 张（新增 TPOT P50 / 解码速度 / 输出吞吐）+ 性能指标表 +
+   「前缀缓存命中态」口径说明；计划页估算框与确认页显示预计请求数
+7. 测试：CSV TPOT 派生（含兜底）、summary 性能字段映射、性能 gate 规则；§10 全表回归
+
+## 12. 后续（v1.2）
+
+1. 并发档位（方案 B）：plan 增加负载阶梯（`sessions` / QPS 多档），runmgr 展开多 step，
+   engine 顺序多次调用 lmcache bench，输出 TTFT / TPOT / 吞吐 vs 并发曲线
+2. 其它 workload：`long-doc-qa`（多查询共享长文档）、`prefix-suffix-tuner`（前缀击穿）、
    `kv-tier-pressure`（容量压力 + Zipf 热点）——plan.workload 已预留
-2. 跨 run 缓存收益趋势（同 target 多次 run 的 steady TTFT 曲线）
-3. 对接 `lmcache bench trace-analyze`：被测端开 token trace 后做命中归因
-4. 双跑对账：Go 派生的 steady/rounds 指标与 Python 侧（若有）核对
+3. 跨 run 缓存收益趋势（同 target 多次 run 的 steady TTFT 曲线）
+4. 对接 `lmcache bench trace-analyze`：被测端开 token trace 后做命中归因
+5. 双跑对账：Go 派生的 steady/rounds 指标与 Python 侧（若有）核对

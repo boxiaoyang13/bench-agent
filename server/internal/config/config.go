@@ -346,6 +346,13 @@ type CacheGateTier struct {
 	TTFTImprovementMin float64 `yaml:"ttft_improvement_min"`   // 稳态相对首轮的最小改善率（0~1）
 	SuccessRateMin     float64 `yaml:"success_rate_min"`       // 成功率下限（0~1）
 	PrefixHitRateMin   float64 `yaml:"prefix_hit_rate_min"`    // 前缀命中率下限（0~1；cached/prompt）
+
+	// 性能维度（方案 A）：同一份 multi-round-chat 负载的「前缀缓存命中态」性能。
+	// 0 = 不判该项。
+	TPOTP50MaxMS       float64 `yaml:"tpot_p50_max_ms"`      // 稳态 TPOT P50 上限（ms/token）
+	DecodeSpeedMin     float64 `yaml:"decode_speed_min"`     // 稳态 decode speed P50 下限（tokens/s）
+	InputThroughputMin float64 `yaml:"input_throughput_min"` // 全 run input throughput 下限（tokens/s）
+	MinSamples         int     `yaml:"min_samples"`          // 稳态最小样本数（低于则不判性能、直接违规）
 }
 
 type EvalGateTier struct {

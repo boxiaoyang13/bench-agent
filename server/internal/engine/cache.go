@@ -432,6 +432,10 @@ type benchSummaryFile struct {
 		P50DecodeSpeed     float64 `json:"p50_decode_speed"`
 		P90DecodeSpeed     float64 `json:"p90_decode_speed"`
 		InputThroughput    float64 `json:"input_throughput"`
+		OutputThroughput   float64 `json:"output_throughput"`
+		P50LatencyMS       float64 `json:"p50_request_latency_ms"`
+		P90LatencyMS       float64 `json:"p90_request_latency_ms"`
+		P99LatencyMS       float64 `json:"p99_request_latency_ms"`
 		TotalInputTokens   int     `json:"total_input_tokens"`
 		TotalOutputTokens  int     `json:"total_output_tokens"`
 	} `json:"results"`
@@ -461,6 +465,14 @@ func readBenchResults(dir string, probeRounds []domain.CacheProbeRound) (*domain
 	m.DecodeSpeedP50 = s.Results.P50DecodeSpeed
 	m.DecodeSpeedP90 = s.Results.P90DecodeSpeed
 	m.InputThroughput = s.Results.InputThroughput
+	m.OutputThroughput = s.Results.OutputThroughput
+	m.MeanDecodeSpeed = s.Results.MeanDecodeSpeed
+	if m.MeanDecodeSpeed > 0 {
+		m.TPOTMeanMS = 1000 / m.MeanDecodeSpeed
+	}
+	m.LatencyP50MS = s.Results.P50LatencyMS
+	m.LatencyP90MS = s.Results.P90LatencyMS
+	m.LatencyP99MS = s.Results.P99LatencyMS
 	m.InputTokens = s.Results.TotalInputTokens
 	m.OutputTokens = s.Results.TotalOutputTokens
 	m.Model = s.Config.Model
@@ -513,11 +525,13 @@ func DeriveCacheRounds(csvPath string) ([]domain.CacheRoundStats, *domain.CacheS
 	defer f.Close()
 
 	type row struct {
-		rid     string
-		ok      bool
-		ttft    float64
-		latency float64
-		input   float64
+		rid         string
+		ok          bool
+		ttft        float64
+		latency     float64
+		input       float64
+		output      float64
+		decodeSpeed float64 // tokens/s（第 7 列）
 	}
 	var rows []row
 	sc := bufio.NewScanner(f)
@@ -541,6 +555,12 @@ func DeriveCacheRounds(csvPath string) ([]domain.CacheRoundStats, *domain.CacheS
 		}
 		if v, e := strconv.ParseFloat(parts[4], 64); e == nil {
 			r.input = v
+		}
+		if v, e := strconv.ParseFloat(parts[5], 64); e == nil {
+			r.output = v
+		}
+		if v, e := strconv.ParseFloat(parts[6], 64); e == nil {
+			r.decodeSpeed = v
 		}
 		rows = append(rows, r)
 	}
@@ -597,7 +617,7 @@ func DeriveCacheRounds(csvPath string) ([]domain.CacheRoundStats, *domain.CacheS
 
 	// 稳态 = 非首轮
 	steady := &domain.CacheSteadyStats{}
-	var sTTFT, sLat, sSpd []float64
+	var sTTFT, sLat, sSpd, sTPOT []float64
 	for n, rs := range byRound {
 		if n == 0 {
 			continue
@@ -605,8 +625,13 @@ func DeriveCacheRounds(csvPath string) ([]domain.CacheRoundStats, *domain.CacheS
 		for _, r := range rs {
 			sTTFT = append(sTTFT, r.ttft*1000)
 			sLat = append(sLat, r.latency*1000)
-			if r.latency > 0 {
-				sSpd = append(sSpd, 0) // decode_speed 列在 CSV 第 7 列；简化：由 summary 提供
+			// TPOT：优先用工具落的 decode_speed（tokens/s）；缺失时用
+			// (request_latency - ttft) / (num_output_tokens - 1) 兜底。
+			if r.decodeSpeed > 0 {
+				sSpd = append(sSpd, r.decodeSpeed)
+				sTPOT = append(sTPOT, 1000/r.decodeSpeed)
+			} else if r.output > 1 && r.latency > r.ttft {
+				sTPOT = append(sTPOT, (r.latency-r.ttft)*1000/(r.output-1))
 			}
 		}
 	}
@@ -616,6 +641,13 @@ func DeriveCacheRounds(csvPath string) ([]domain.CacheRoundStats, *domain.CacheS
 		steady.TTFTp90MS = pctF(sTTFT, 90)
 		steady.TTFTp99MS = pctF(sTTFT, 99)
 		steady.Latencyp50MS = pctF(sLat, 50)
+		if len(sSpd) > 0 {
+			steady.DecodeSpeedP50 = pctF(sSpd, 50)
+		}
+		if len(sTPOT) > 0 {
+			steady.TPOTp50MS = pctF(sTPOT, 50)
+			steady.TPOTp90MS = pctF(sTPOT, 90)
+		}
 		if first.TTFTMeanMS > 0 {
 			steady.TTFTImprovement = 1 - steady.TTFTp50MS/first.TTFTMeanMS
 		}

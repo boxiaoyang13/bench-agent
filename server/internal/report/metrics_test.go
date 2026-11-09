@@ -571,3 +571,61 @@ func TestEvaluateCacheGate(t *testing.T) {
 		t.Fatal("无请求应不通过")
 	}
 }
+
+// TestEvaluateCacheGatePerf 性能维度（TPOT / decode speed / input throughput / 最小样本）。
+func TestEvaluateCacheGatePerf(t *testing.T) {
+	profile := &config.GateProfile{
+		Capability: "cache",
+		CacheTiers: []config.CacheGateTier{{
+			TPOTP50MaxMS: 80, DecodeSpeedMin: 15, InputThroughputMin: 1000, MinSamples: 10,
+		}},
+	}
+	good := &domain.CacheMetrics{
+		TotalRequests: 30, SuccessReqs: 30, SuccessRate: 1, InputThroughput: 2000,
+		SteadyState: &domain.CacheSteadyStats{
+			Requests: 20, TTFTp50MS: 400, TPOTp50MS: 40, DecodeSpeedP50: 25,
+		},
+	}
+	if res := EvaluateCacheGate(profile, good, false); !res.Passed {
+		t.Fatalf("性能达标应通过: %+v", res.Violations)
+	}
+
+	bad := &domain.CacheMetrics{
+		TotalRequests: 30, SuccessReqs: 30, SuccessRate: 1, InputThroughput: 500,
+		SteadyState: &domain.CacheSteadyStats{
+			Requests: 5, TTFTp50MS: 400, TPOTp50MS: 120, DecodeSpeedP50: 8,
+		},
+	}
+	res := EvaluateCacheGate(profile, bad, false)
+	if res.Passed {
+		t.Fatal("TPOT/解码速度/吞吐/样本数不达标应不通过")
+	}
+	rules := map[string]bool{}
+	for _, v := range res.Violations {
+		rules[v.Rule] = true
+	}
+	for _, want := range []string{"tpot_p50_max_ms", "decode_speed_min", "input_throughput_min", "min_samples"} {
+		if !rules[want] {
+			t.Fatalf("缺 %s 违规: %+v", want, res.Violations)
+		}
+	}
+
+	// 数据缺失：TPOT 无样本、吞吐为 0 → 应违规而不是静默通过
+	missing := &domain.CacheMetrics{
+		TotalRequests: 30, SuccessReqs: 30, SuccessRate: 1,
+		SteadyState: &domain.CacheSteadyStats{Requests: 20, TTFTp50MS: 400},
+	}
+	res2 := EvaluateCacheGate(profile, missing, false)
+	if res2.Passed {
+		t.Fatal("性能数据缺失应不通过")
+	}
+	rules2 := map[string]bool{}
+	for _, v := range res2.Violations {
+		rules2[v.Rule] = true
+	}
+	for _, want := range []string{"tpot_p50_max_ms", "decode_speed_min", "input_throughput_min"} {
+		if !rules2[want] {
+			t.Fatalf("数据缺失缺 %s 违规: %+v", want, res2.Violations)
+		}
+	}
+}

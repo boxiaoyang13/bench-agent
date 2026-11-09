@@ -126,6 +126,9 @@ func (c *Config) applyDefaults() {
 	if _, ok := c.Gates.Profiles["cache-sla-v1"]; !ok {
 		c.Gates.Profiles["cache-sla-v1"] = defaultCacheSLAProfile()
 	}
+	if _, ok := c.Gates.Profiles["cache-perf-sla-v1"]; !ok {
+		c.Gates.Profiles["cache-perf-sla-v1"] = defaultCachePerfSLAProfile()
+	}
 	d(&c.Gates.DefaultProfile, "perf-sla-v1")
 
 	// engines: 每个 capability 的默认值
@@ -314,6 +317,29 @@ func defaultCacheSLAProfile() *GateProfile {
 		CacheTiers: []CacheGateTier{
 			{SteadyTTFTp50MaxMS: 800, TTFTImprovementMin: 0.30, SuccessRateMin: 0.99, PrefixHitRateMin: 0.50},
 		},
+	}
+}
+
+// defaultCachePerfSLAProfile 在 cache-sla-v1 基础上增加性能维度：
+// 稳态 TPOT / decode speed / input throughput + 最小样本数。
+//
+// 注意：这是「前缀缓存命中态」的表观性能，与 perf（evalscope）冷启动/定压口径
+// 不可直接横比；阈值只是默认值，各部署应按被测模型在 YAML 覆盖。
+// 性能结论需要足够样本，60s×1QPS 只有约 60 条，故默认 min_samples=100。
+func defaultCachePerfSLAProfile() *GateProfile {
+	return &GateProfile{
+		Capability:  "cache",
+		Description: "多轮对话：前缀缓存收益 + 稳态性能（TPOT/解码速度/输入吞吐）+ 最小样本数",
+		CacheTiers: []CacheGateTier{{
+			SteadyTTFTp50MaxMS: 800,
+			TTFTImprovementMin: 0.30,
+			SuccessRateMin:     0.99,
+			PrefixHitRateMin:   0.50,
+			TPOTP50MaxMS:       80,
+			DecodeSpeedMin:     15,
+			InputThroughputMin: 0, // 依赖 prompt 形状，默认不判；需要时在 YAML 打开
+			MinSamples:         100,
+		}},
 	}
 }
 

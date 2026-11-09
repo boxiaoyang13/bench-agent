@@ -151,6 +151,15 @@ type CacheMetrics struct {
 	DecodeSpeedP50  float64 `json:"decode_speed_p50,omitempty"`
 	DecodeSpeedP90  float64 `json:"decode_speed_p90,omitempty"`
 	InputThroughput float64 `json:"input_throughput,omitempty"`
+
+	// 性能维度（方案 A）：同一份 MRC 负载的「前缀缓存命中态」性能。
+	// 注意 TTFT 受缓存影响大，decode speed / TPOT 主要反映模型生成性能。
+	MeanDecodeSpeed  float64 `json:"mean_decode_speed,omitempty"` // tokens/s（输出侧，全量成功请求）
+	OutputThroughput float64 `json:"output_throughput,omitempty"` // tokens/s（全 run）
+	TPOTMeanMS       float64 `json:"tpot_mean_ms,omitempty"`      // 1000 / MeanDecodeSpeed
+	LatencyP50MS     float64 `json:"request_latency_p50_ms,omitempty"`
+	LatencyP90MS     float64 `json:"request_latency_p90_ms,omitempty"`
+	LatencyP99MS     float64 `json:"request_latency_p99_ms,omitempty"`
 }
 
 // CacheSteadyStats 是稳态（非首轮）请求的分位统计——缓存命中下的真实表现。
@@ -159,7 +168,9 @@ type CacheSteadyStats struct {
 	TTFTp90MS       float64 `json:"ttft_p90_ms"`
 	TTFTp99MS       float64 `json:"ttft_p99_ms"`
 	Latencyp50MS    float64 `json:"request_latency_p50_ms,omitempty"`
-	DecodeSpeedP50  float64 `json:"decode_speed_p50,omitempty"`
+	DecodeSpeedP50  float64 `json:"decode_speed_p50,omitempty"` // tokens/s（稳态，CSV 派生）
+	TPOTp50MS       float64 `json:"tpot_p50_ms,omitempty"`      // 每输出 token 耗时（稳态）
+	TPOTp90MS       float64 `json:"tpot_p90_ms,omitempty"`
 	Requests        int     `json:"requests"`
 	TTFTImprovement float64 `json:"ttft_improvement,omitempty"` // 1 - steady_p50 / first_mean
 }

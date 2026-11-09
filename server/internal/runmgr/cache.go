@@ -151,7 +151,40 @@ func (m *Manager) reportCache(ctx context.Context, lr *liveRun, res engine.Resul
 	}
 	if ss != nil {
 		summary["ttft_steady_p50_ms"] = round6(ss.TTFTp50MS)
+		summary["ttft_steady_p90_ms"] = round6(ss.TTFTp90MS)
+		summary["ttft_steady_p99_ms"] = round6(ss.TTFTp99MS)
 		summary["ttft_improvement"] = round6(ss.TTFTImprovement)
+		summary["samples_steady"] = ss.Requests
+		if ss.TPOTp50MS > 0 {
+			summary["tpot_steady_p50_ms"] = round6(ss.TPOTp50MS)
+			summary["tpot_steady_p90_ms"] = round6(ss.TPOTp90MS)
+		}
+		if ss.DecodeSpeedP50 > 0 {
+			summary["decode_speed_steady_p50"] = round6(ss.DecodeSpeedP50)
+		}
+	}
+	// 性能维度：口径是「前缀缓存命中态下的表观性能」，与 perf 冷启动口径不可直接横比。
+	// TTFT 受前缀缓存影响大，decode speed / TPOT 主要反映模型生成性能。
+	if cm.TPOTMeanMS > 0 {
+		summary["tpot_mean_ms"] = round6(cm.TPOTMeanMS)
+	}
+	if cm.MeanDecodeSpeed > 0 {
+		summary["mean_decode_speed"] = round6(cm.MeanDecodeSpeed)
+	}
+	if cm.InputThroughput > 0 {
+		summary["input_throughput"] = round6(cm.InputThroughput)
+	}
+	if cm.OutputThroughput > 0 {
+		summary["output_throughput"] = round6(cm.OutputThroughput)
+	}
+	for k, v := range map[string]float64{
+		"request_latency_p50_ms": cm.LatencyP50MS,
+		"request_latency_p90_ms": cm.LatencyP90MS,
+		"request_latency_p99_ms": cm.LatencyP99MS,
+	} {
+		if v > 0 {
+			summary[k] = round6(v)
+		}
 	}
 	if cm.FirstRound != nil {
 		summary["ttft_first_round_ms"] = round6(cm.FirstRound.TTFTMeanMS)

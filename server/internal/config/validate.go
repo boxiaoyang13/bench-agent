@@ -161,6 +161,12 @@ func (c *Config) Check() []Issue {
 			}
 			prevHi = t.Hi
 		}
+		for i, t := range p.CacheTiers {
+			if t.SteadyTTFTp50MaxMS < 0 || t.TPOTP50MaxMS < 0 || t.DecodeSpeedMin < 0 ||
+				t.InputThroughputMin < 0 || t.MinSamples < 0 {
+				errf(fmt.Sprintf("gates.%s.cache_tiers[%d]", name, i), "阈值不能为负数")
+			}
+		}
 	}
 
 	// 7. reports

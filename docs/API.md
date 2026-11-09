@@ -719,6 +719,26 @@ Web 界面「历史记录」页的入口：
 > 产物：`eval_report`（eval_report_v2.html）、`eval_summary`（json）、`eval_samples`（csv）、
 > `eval_archive`（tar.gz）、`run_log`、汇总 `all_eval_summary.json`。详见 [`EVAL.md`](./EVAL.md)。
 
+`capability=cache` 的结构化结果放在 `cache` 字段（`metrics` 为空对象），`summary` 同时包含缓存收益
+（稳态 TTFT、改善率、前缀命中率）与性能维度（TPOT、解码速度、in/out 吞吐、时延分位、样本数）：
+
+```json
+{
+  "run_id": "run_...",
+  "capability": "cache",
+  "summary": {"verdict":"pass","samples_steady":12,"tpot_steady_p50_ms":7.4,
+              "decode_speed_steady_p50":134.0,"input_throughput":2468.7,
+              "output_throughput":61.8,"request_latency_p99_ms":1984.9},
+  "cache": {
+    "workload": "multi-round-chat", "num_sessions": 3,
+    "steady_state": {"requests":12,"ttft_p50_ms":447.7,"tpot_p50_ms":7.4,"decode_speed_p50":134.0}
+  }
+}
+```
+
+> 口径与完整字段见 [`CACHE.md`](./CACHE.md) §3.3；性能数字是「前缀缓存命中态」的表观性能，
+> 与 perf 的冷启动口径不可直接横比。
+
 **`GET /v1/runs/{run_id}/results/failures`** — 失败明细分页（对应 `export_failure_details.py`）：
 `?limit=50&cursor=&reason=timeout`，返回 `{items:[{step_index,request_index,reason,http_status,request_body_excerpt,response_body_excerpt,error}], next_cursor}`。
 

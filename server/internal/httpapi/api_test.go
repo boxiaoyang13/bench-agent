@@ -838,10 +838,15 @@ func TestCacheFlow(t *testing.T) {
 		Capability string `json:"capability"`
 		Summary    map[string]any
 		Cache      *struct {
-			TotalRequests int `json:"total_requests"`
-			SteadyState   *struct {
+			TotalRequests    int     `json:"total_requests"`
+			OutputThroughput float64 `json:"output_throughput"`
+			MeanDecodeSpeed  float64 `json:"mean_decode_speed"`
+			LatencyP99MS     float64 `json:"request_latency_p99_ms"`
+			SteadyState      *struct {
 				TTFTp50MS       float64 `json:"ttft_p50_ms"`
 				TTFTImprovement float64 `json:"ttft_improvement"`
+				TPOTp50MS       float64 `json:"tpot_p50_ms"`
+				DecodeSpeedP50  float64 `json:"decode_speed_p50"`
 			} `json:"steady_state"`
 		} `json:"cache"`
 	}
@@ -852,12 +857,66 @@ func TestCacheFlow(t *testing.T) {
 	if res.Cache.SteadyState == nil || res.Cache.SteadyState.TTFTImprovement <= 0 {
 		t.Fatalf("稳态/改善率异常: %+v", res.Cache.SteadyState)
 	}
+	// 性能维度（方案 A）：内建引擎应产出完整性能指标并映射到 summary
+	if res.Cache.OutputThroughput <= 0 || res.Cache.MeanDecodeSpeed <= 0 ||
+		res.Cache.LatencyP99MS <= 0 || res.Cache.SteadyState.TPOTp50MS <= 0 ||
+		res.Cache.SteadyState.DecodeSpeedP50 <= 0 {
+		t.Fatalf("性能指标缺失: %+v", res.Cache)
+	}
+	for _, k := range []string{"tpot_steady_p50_ms", "decode_speed_steady_p50", "output_throughput",
+		"input_throughput", "request_latency_p99_ms", "samples_steady"} {
+		if _, ok := res.Summary[k]; !ok {
+			t.Fatalf("summary 缺性能字段 %s: %v", k, res.Summary)
+		}
+	}
 	if res.Summary["verdict"] != "pass" {
 		t.Fatalf("verdict: %v", res.Summary["verdict"])
 	}
 	// builtin 改善率 50~70%，默认 gate(≥30%, P50<800ms) 应通过
 	if g := res.Summary["gate_passed"]; g != true {
 		t.Fatalf("gate 应通过: %v（summary=%v）", g, res.Summary)
+	}
+
+	// cache-perf-sla-v1：builtin 只有 9 条稳态样本 < min_samples=100，
+	// 必须给出 min_samples 违规（性能结论不可靠），而不是静默通过。
+	resp, body = h.do("POST", "/runs", map[string]any{
+		"tool": "lmcache", "capability": "cache", "target_id": tid,
+		"plan": map[string]any{"workload": "multi-round-chat", "duration_sec": 30, "qps": 1},
+		"gate": map[string]any{"profile": "cache-perf-sla-v1", "mode": "report_only"},
+	}, map[string]string{"Idempotency-Key": "cache-2"})
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("提交 cache-perf 测试: %d %s", resp.StatusCode, body)
+	}
+	mustJSON(t, body, &run)
+	runID, _ = run["run_id"].(string)
+	final = h.waitTerminal(runID, 20*time.Second)
+	if final["status"] != "succeeded" {
+		t.Fatalf("cache-perf run 未成功: %v (%v)", final["status"], final["error"])
+	}
+	resp, body = h.do("GET", "/runs/"+runID+"/results", nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("/results: %d %s", resp.StatusCode, body)
+	}
+	var perfRes struct {
+		GateResult struct {
+			Passed     bool `json:"passed"`
+			Violations []struct {
+				Rule string `json:"rule"`
+			} `json:"violations"`
+		} `json:"gate_result"`
+	}
+	mustJSON(t, body, &perfRes)
+	if perfRes.GateResult.Passed {
+		t.Fatalf("cache-perf-sla-v1 样本不足应不通过: %+v", perfRes.GateResult)
+	}
+	found := false
+	for _, v := range perfRes.GateResult.Violations {
+		if v.Rule == "min_samples" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("缺 min_samples 违规: %+v", perfRes.GateResult.Violations)
 	}
 }
 

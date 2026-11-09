@@ -308,11 +308,21 @@ func (f *Fake) runCache(ctx context.Context, spec Spec, emit func(Event)) (Resul
 		Status: status, SuccessRate: &sr, DurationSec: &dur,
 	})
 	hitRate := 0.90 + rand.Float64()*0.08
+	// 性能维度（与真实 lmcache summary/CSV 派生口径一致）
+	decodeSpeed := 120.0 + rand.Float64()*60 // 120~180 t/s
+	tpot := 1000 / decodeSpeed
+	latP50 := steadyP50 + 900 + rand.Float64()*200
+	inputTP := 2000.0 + rand.Float64()*800
+	outputTP := 50.0 + rand.Float64()*30
 	res.Cache = &domain.CacheMetrics{
 		Workload: "multi-round-chat", Model: spec.Target.Model, NumSessions: 3,
 		TotalRequests: total, SuccessReqs: total - failed, FailedReqs: failed,
 		SuccessRate: sr, ElapsedSec: dur, MeanTTFTMS: first * 0.6,
 		PrefixHitRate: &hitRate, CacheFieldReported: true,
+		OutputThroughput: outputTP, InputThroughput: inputTP,
+		MeanDecodeSpeed: decodeSpeed, DecodeSpeedP50: decodeSpeed * 0.98,
+		DecodeSpeedP90: decodeSpeed * 1.05, TPOTMeanMS: tpot,
+		LatencyP50MS: latP50, LatencyP90MS: latP50 * 1.2, LatencyP99MS: latP50 * 1.5,
 		ProbeRounds: []domain.CacheProbeRound{
 			{Round: 0, PromptTokens: 12000, CachedTokens: 0},
 			{Round: 1, PromptTokens: 12200, CachedTokens: 12000, HitRate: hitRate},
@@ -322,6 +332,8 @@ func (f *Fake) runCache(ctx context.Context, spec Spec, emit func(Event)) (Resul
 		SteadyState: &domain.CacheSteadyStats{
 			Requests: total - 3, TTFTp50MS: steadyP50, TTFTp90MS: steadyP50 * 1.3,
 			TTFTp99MS: steadyP50 * 1.8, TTFTImprovement: 1 - steadyP50/first,
+			Latencyp50MS: latP50, DecodeSpeedP50: decodeSpeed * 0.98,
+			TPOTp50MS: tpot, TPOTp90MS: tpot * 1.2,
 		},
 		Rounds: []domain.CacheRoundStats{
 			{Round: 0, Requests: 3, TTFTMeanMS: first},

@@ -106,9 +106,92 @@ s1_r2,False,0,0,0,0,0,7,0,0,boom
 	if diff := steady.TTFTImprovement - (1 - 450.0/1100.0); diff > 0.001 || diff < -0.001 {
 		t.Fatalf("改善率: %v", steady.TTFTImprovement)
 	}
+	// 性能派生：decode_speed=60 t/s → 稳态 TPOT = 1000/60 ms
+	if diff := steady.DecodeSpeedP50 - 60; diff > 0.01 || diff < -0.01 {
+		t.Fatalf("稳态解码速度 P50 期望 60，实际 %v", steady.DecodeSpeedP50)
+	}
+	if diff := steady.TPOTp50MS - 1000.0/60; diff > 0.01 || diff < -0.01 {
+		t.Fatalf("稳态 TPOT P50 期望 16.67ms，实际 %v", steady.TPOTp50MS)
+	}
 	// r2 失败行不计入轮次请求数
 	if rounds[2].Requests != 1 {
 		t.Fatalf("r2 请求数期望 1（失败剔除），实际 %d", rounds[2].Requests)
+	}
+}
+
+// TestDeriveCacheRoundsTPOTFallback CSV 无 decode_speed 时用
+// (request_latency - ttft) / (num_output_tokens - 1) 兜底。
+func TestDeriveCacheRoundsTPOTFallback(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "bench_results.csv")
+	csv := `request_id,successful,ttft,request_latency,num_input_tokens,num_output_tokens,decode_speed,submit_time,first_token_time,finish_time,error
+s0_r0,True,1.0,3.0,4000,201,0,1,2,3,
+s0_r1,True,0.5,1.5,4200,101,0,4,5,6,
+s0_r2,True,0.6,1.6,4400,101,0,7,8,9,
+`
+	if err := os.WriteFile(p, []byte(csv), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, steady, _, err := DeriveCacheRounds(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// r1: (1.5-0.5)*1000/100 = 10ms；r2: (1.6-0.6)*1000/100 = 10ms
+	if diff := steady.TPOTp50MS - 10; diff > 0.01 || diff < -0.01 {
+		t.Fatalf("兜底 TPOT 期望 10ms，实际 %v", steady.TPOTp50MS)
+	}
+	if steady.DecodeSpeedP50 != 0 {
+		t.Fatalf("无 decode_speed 列时不应伪造解码速度: %v", steady.DecodeSpeedP50)
+	}
+}
+
+// TestReadBenchResultsPerf bench_summary.json 的性能字段映射 + 派生 TPOT。
+func TestReadBenchResultsPerf(t *testing.T) {
+	dir := t.TempDir()
+	summary := `{
+  "config": {"workload": "multi-round-chat", "model": "glm-5.3-test", "mrc_duration": 30.0},
+  "results": {
+    "total_requests": 4, "successful_requests": 4, "failed_requests": 0, "elapsed_time": 30.0,
+    "mean_ttft_ms": 500, "p50_ttft_ms": 480, "p90_ttft_ms": 600, "p99_ttft_ms": 700,
+    "mean_decode_speed": 50, "p50_decode_speed": 48, "p90_decode_speed": 60,
+    "input_throughput": 2500, "output_throughput": 120,
+    "p50_request_latency_ms": 1500, "p90_request_latency_ms": 2000, "p99_request_latency_ms": 2500,
+    "total_input_tokens": 10000, "total_output_tokens": 800
+  }
+}`
+	csv := `request_id,successful,ttft,request_latency,num_input_tokens,num_output_tokens,decode_speed,submit_time,first_token_time,finish_time,error
+s0_r0,True,1.0,2.0,4000,128,50,1,2,3,
+s1_r0,True,1.2,2.2,4000,128,50,1,2,3,
+s0_r1,True,0.4,1.4,4200,128,50,4,5,6,
+s1_r1,True,0.5,1.5,4200,128,50,4,5,6,
+`
+	if err := os.WriteFile(filepath.Join(dir, "bench_summary.json"), []byte(summary), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "bench_results.csv"), []byte(csv), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := readBenchResults(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.MeanDecodeSpeed != 50 || m.OutputThroughput != 120 || m.InputThroughput != 2500 {
+		t.Fatalf("summary 性能字段映射错误: %+v", m)
+	}
+	if diff := m.TPOTMeanMS - 20; diff > 0.01 || diff < -0.01 {
+		t.Fatalf("TPOTMeanMS 期望 20，实际 %v", m.TPOTMeanMS)
+	}
+	if m.LatencyP50MS != 1500 || m.LatencyP90MS != 2000 || m.LatencyP99MS != 2500 {
+		t.Fatalf("时延分位映射错误: %v/%v/%v", m.LatencyP50MS, m.LatencyP90MS, m.LatencyP99MS)
+	}
+	if m.NumSessions != 2 {
+		t.Fatalf("session 数期望 2，实际 %d", m.NumSessions)
+	}
+	if m.SteadyState == nil || m.SteadyState.TPOTp50MS != 20 {
+		t.Fatalf("稳态 TPOT 期望 20ms: %+v", m.SteadyState)
+	}
+	if m.SteadyState.DecodeSpeedP50 != 50 {
+		t.Fatalf("稳态解码速度期望 50: %+v", m.SteadyState)
 	}
 }
 

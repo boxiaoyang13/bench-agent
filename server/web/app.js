@@ -726,6 +726,7 @@ function updateCacheEstimate() {
   const users = perSession > 0 ? Math.floor(plan.kv_cache_volume_gb * plan.tokens_per_gb_kvcache / perSession) : 0;
   const estTokens = Math.round(plan.qps * plan.duration_sec * (perSession + plan.output_length));
   box.innerHTML = `并发 session 数约 <b>${Math.max(1, users)}</b>（由 KV 容量推导）；` +
+    `预计请求数约 <b>${Math.round(plan.qps * plan.duration_sec)}</b>（性能验收建议 ≥100 稳态样本）；` +
     `预计消耗约 <b>${estTokens.toLocaleString()}</b> token（QPS × 时长 × 单请求 token）。` +
     (plan.no_warmup ? '<br>⚠ 预热已关闭：为冷启动口径，验收不判改善率。' : '');
 }
@@ -873,9 +874,12 @@ function renderConfirm() {
       ['能力', '缓存测试（multi-round-chat）'],
       ['时长 / QPS', `${plan.duration_sec}s / ${plan.qps}`],
       ['并发 session', `${users}（容量推导）`],
+      ['预计请求数', `${Math.round(plan.qps * plan.duration_sec)}（性能验收建议 ≥100）`],
       ['Prompt / 历史 / 输入 / 输出', `${plan.shared_prompt_length} / ${plan.chat_history_length} / ${plan.user_input_length} / ${plan.output_length} token`],
       ['预热', plan.no_warmup ? '关闭（冷启动口径）' : '开启'],
-      ['验收', payload.gate ? `${payload.gate.profile}（稳态 TTFT + 改善率）` : '不判定'],
+      ['验收', payload.gate
+        ? `${payload.gate.profile}（${payload.gate.profile.includes('perf') ? '缓存收益 + 稳态性能' : '缓存收益'}）`
+        : '不判定'],
       ['执行步骤', total],
       ['产物', 'CSV / JSON / 配置 / run.log'],
     ];
@@ -1302,12 +1306,17 @@ function renderCacheResults(results, artifacts) {
   badge.textContent = text;
 
   const imp = s.ttft_improvement;
+  const ss = c.steady_state || {};
+  const numOr = (v, unit) => (v != null && v > 0 ? fmtNum(v) + unit : '—');
   const kpis = [
     ['前缀命中率', s.prefix_hit_rate != null ? fmtPct(s.prefix_hit_rate) : '—',
       s.cache_field_reported === false ? '⚠ 端点未上报 cached_tokens' : 'cached/prompt（探针直采）'],
     ['稳态 TTFT P50', s.ttft_steady_p50_ms != null ? fmtNum(s.ttft_steady_p50_ms) + 'ms' : '—', '前缀命中下的首 token'],
     ['首轮 TTFT', s.ttft_first_round_ms != null ? fmtNum(s.ttft_first_round_ms) + 'ms' : '—', '冷/半冷缓存'],
     ['TTFT 改善率', imp != null ? fmtPct(imp) : '—', '1 − 稳态P50/首轮均值'],
+    ['TPOT P50', numOr(ss.tpot_p50_ms, 'ms'), '稳态，每输出 token'],
+    ['解码速度 P50', numOr(ss.decode_speed_p50, ' t/s'), '稳态，主要反映生成性能'],
+    ['输出吞吐', numOr(c.output_throughput || s.output_throughput, ' t/s'), '全 run'],
     ['成功率', s.success_rate != null ? fmtPct(s.success_rate) : '—', `${s.successful_requests ?? '—'}/${s.total_requests ?? '—'} 请求`],
   ];
   $('#run-kpis').innerHTML = kpis.map(([k, v, sub]) =>
@@ -1325,6 +1334,14 @@ function renderCacheResults(results, artifacts) {
       <td class="num">${r.cached_tokens}</td>
       <td class="num">${r.hit_rate != null ? fmtPct(r.hit_rate) : '—'}</td>
       <td class="num">${r.req_ms ? fmtNum(r.req_ms) + 'ms' : '—'}</td></tr>`).join('');
+  // 性能维度（总是渲染，缺失显示 —；口径见下方说明）
+  const perfRows = [
+    ['稳态 TTFT P90 / P99', `${numOr(s.ttft_steady_p90_ms, 'ms')} / ${numOr(s.ttft_steady_p99_ms, 'ms')}`],
+    ['请求时延 P50 / P90 / P99', `${numOr(c.request_latency_p50_ms, 'ms')} / ${numOr(c.request_latency_p90_ms, 'ms')} / ${numOr(c.request_latency_p99_ms, 'ms')}`],
+    ['TPOT P50 / P90（稳态）', `${numOr(ss.tpot_p50_ms, 'ms')} / ${numOr(ss.tpot_p90_ms, 'ms')}`],
+    ['输入 / 输出吞吐', `${numOr(c.input_throughput || s.input_throughput, ' t/s')} / ${numOr(c.output_throughput || s.output_throughput, ' t/s')}`],
+    ['样本数（总 / 稳态）', `${s.total_requests ?? '—'} / ${s.samples_steady ?? ss.requests ?? '—'}`],
+  ].map(([k, v]) => `<tr><td>${esc(k)}</td><td class="num">${esc(v)}</td></tr>`).join('');
   $('#gate-body').innerHTML = `
     <p class="muted">workload ${esc(c.workload || 'multi-round-chat')} · ${esc(c.model || '')} ·
       ${c.num_sessions ? c.num_sessions + ' 个并发 session · ' : ''}${s.total_requests ?? '—'} 个请求。
@@ -1336,6 +1353,10 @@ function renderCacheResults(results, artifacts) {
       <p class="muted">探针在 bench 前直连端点抓取 usage.prompt_tokens_details.cached_tokens；原始文件见 prefix_usage.csv</p>` : ''}
     ${roundRows ? `<h4 style="margin-top:12px">bench 逐轮 TTFT</h4><table class="tbl"><thead><tr><th class="num">轮次</th><th class="num">请求数</th>
       <th class="num">TTFT 均值</th><th class="num">输入 token 均值</th></tr></thead><tbody>${roundRows}</tbody></table>` : ''}
+    <h4 style="margin-top:16px">性能指标（前缀缓存命中态）</h4>
+    <table class="tbl"><thead><tr><th>指标</th><th class="num">数值</th></tr></thead><tbody>${perfRows}</tbody></table>
+    <p class="muted">TTFT 受前缀缓存影响大；TPOT / 解码速度 / 输出吞吐主要反映模型生成性能。
+      性能结论需足够稳态样本（建议 ≥100，可延长时长或提高 QPS），且与性能压测的冷启动口径不可直接横比。</p>
     ${violRows ? `<h4 style="margin-top:16px">违规明细</h4><table class="tbl"><thead><tr>
       <th>规则</th><th class="num">实测</th><th class="num">阈值</th><th>说明</th>
     </tr></thead><tbody>${violRows}</tbody></table>` : ''}`;
