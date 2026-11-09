@@ -635,6 +635,22 @@ Web 界面「历史记录」页的入口：
 
 > 按状态批量删（`statuses` + `dry_run`）只保留在 API 侧给自动化/运维用，Web 界面不提供入口。
 
+### 5.8.4 单步跳过 / 取消（多步骤 run）
+
+性能矩阵、效果评测多数据集、缓存并发档位都是「一个 run 多个 step」。支持单步操作，
+不必为一两个不想跑的用例停掉整个 run：
+
+- `POST /v1/runs/{run_id}/steps/{step_index}/skip` — 只允许**待执行**（`pending`）步骤；
+  `200` → `{"run_id":"...","step_index":2,"step":{...,"status":"skipped"}}`。引擎轮到该 step 时
+  直接跳过（不产生指标/产物），其余 step 照常执行。已 skipped 再调仍 `200`（幂等）。
+- `POST /v1/runs/{run_id}/steps/{step_index}/cancel` — 只允许**运行中**（`running`）步骤；
+  `202` → `{"run_id":"...","step_index":0,"status":"cancel_requested"}`。服务端 kill 该 step 的
+  子进程（SIGTERM→SIGKILL），记录 `canceled` 后继续后续 step。
+- 状态冲突（运行中调 skip、待执行调 cancel、run 已终态）→ `409 conflict`；不存在 → `404`。
+- 语义：跳过/取消的 step 不算失败、不参与 gate；部分步骤被跳过/取消时
+  `summary.skipped_steps` / `summary.canceled_steps` 给出计数；**全部**步骤被跳过时
+  run 以 `canceled` 收口（`summary.verdict="canceled"`），而不是 `failed`。
+
 ### 5.9 `GET /v1/runs/{run_id}/results` — 结构化指标
 
 统一响应外壳（不同 capability 填不同 `metrics` 结构）：

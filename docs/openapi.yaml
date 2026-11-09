@@ -331,6 +331,50 @@ paths:
                   canceled_at: {type: string, format: date-time}
         '404': {$ref: '#/components/responses/NotFound'}
 
+  /runs/{run_id}/steps/{step_index}/skip:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+      - {name: step_index, in: path, required: true, schema: {type: integer, minimum: 0}}
+    post:
+      tags: [runs]
+      summary: 跳过待执行的步骤（多步骤 run：性能矩阵 / 评测数据集 / 缓存并发档位）
+      operationId: skipRunStep
+      responses:
+        '200':
+          description: 已标记跳过（幂等）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  run_id: {type: string}
+                  step_index: {type: integer}
+                  step: {$ref: '#/components/schemas/StepSummary'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+
+  /runs/{run_id}/steps/{step_index}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+      - {name: step_index, in: path, required: true, schema: {type: integer, minimum: 0}}
+    post:
+      tags: [runs]
+      summary: 取消正在运行的步骤（kill 该 step 子进程后继续后续步骤）
+      operationId: cancelRunStep
+      responses:
+        '202':
+          description: 已请求取消该步骤
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  run_id: {type: string}
+                  step_index: {type: integer}
+                  status: {type: string, enum: [cancel_requested]}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+
   /runs/{run_id}/events:
     parameters:
       - $ref: '#/components/parameters/RunId'
@@ -1079,7 +1123,7 @@ components:
         bucket: {type: string}
         parallel: {type: integer}
         number: {type: integer}
-        status: {type: string, enum: [pending, running, succeeded, failed, skipped]}
+        status: {type: string, enum: [pending, running, succeeded, failed, canceled, skipped]}
         success_rate: {type: [number, 'null']}
         ttft_p50_sec: {type: [number, 'null']}
         output_tps: {type: [number, 'null']}

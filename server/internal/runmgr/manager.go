@@ -27,6 +27,9 @@ import (
 // ErrQueueFull 表示排队已满。
 var ErrQueueFull = errors.New("队列已满")
 
+// ErrStepState 表示单步操作与当前 step 状态冲突（HTTP 409）。
+var ErrStepState = errors.New("step 状态不允许该操作")
+
 // ValidationError 表示请求参数不合法（HTTP 400）。
 type ValidationError struct{ Msg string }
 
@@ -62,6 +65,10 @@ type liveRun struct {
 	run     *domain.Run
 	steps   []domain.StepSpec
 	started time.Time
+
+	// 单 step 控制（运行中「取消本步」/排队中「跳过」）
+	stepMu      sync.Mutex
+	stepCancels map[int]context.CancelFunc
 }
 
 // New 构造 Manager。
@@ -241,6 +248,92 @@ func (m *Manager) Submit(ctx context.Context, req SubmitRequest) (*domain.Run, e
 		return nil, ErrQueueFull
 	}
 	return run, nil
+}
+
+// SkipStep 把「待执行」的 step 标记为跳过：引擎在启动该 step 前会看到 skipped 并直接跳过，
+// 其余 step 照常执行（用于从多档/多数据集中剔掉不想跑的用例）。
+func (m *Manager) SkipStep(ctx context.Context, runID string, index int) (*domain.Step, error) {
+	lr := m.liveRun(runID)
+	if lr == nil {
+		run, err := m.st.GetRun(ctx, runID)
+		if err != nil {
+			return nil, err
+		}
+		if run.Status.Terminal() {
+			return nil, fmt.Errorf("%w：run 已结束（%s），无法跳过", ErrStepState, run.Status)
+		}
+		return nil, fmt.Errorf("%w：run 尚未进入执行", ErrStepState)
+	}
+	lr.mu.Lock()
+	var st domain.Step
+	found := false
+	for i := range lr.run.Steps {
+		if lr.run.Steps[i].Index != index {
+			continue
+		}
+		found = true
+		st = lr.run.Steps[i]
+		switch st.Status {
+		case domain.StepSkipped:
+			// 幂等
+		case domain.StepPending:
+			lr.run.Steps[i].Status = domain.StepSkipped
+			st = lr.run.Steps[i]
+		default:
+			lr.mu.Unlock()
+			return nil, fmt.Errorf("%w：step %d 当前为 %s，运行中请用「取消」", ErrStepState, index, st.Status)
+		}
+		break
+	}
+	lr.mu.Unlock()
+	if !found {
+		return nil, fmt.Errorf("%w：step %d 不存在", ErrStepState, index)
+	}
+	dctx, dcancel := detached(ctx)
+	defer dcancel()
+	_ = m.st.UpsertStep(dctx, runID, st)
+	return &st, nil
+}
+
+// CancelStep 取消「正在运行」的单个 step：kill 该 step 的子进程后继续执行剩余 step。
+// 整 run 的取消请用 Cancel。
+func (m *Manager) CancelStep(ctx context.Context, runID string, index int) (*domain.Step, error) {
+	lr := m.liveRun(runID)
+	if lr == nil {
+		run, err := m.st.GetRun(ctx, runID)
+		if err != nil {
+			return nil, err
+		}
+		if run.Status.Terminal() {
+			return nil, fmt.Errorf("%w：run 已结束（%s）", ErrStepState, run.Status)
+		}
+		return nil, fmt.Errorf("%w：run 尚未进入执行，请用「跳过」", ErrStepState)
+	}
+	lr.mu.Lock()
+	var st domain.Step
+	found := false
+	for i := range lr.run.Steps {
+		if lr.run.Steps[i].Index == index {
+			st = lr.run.Steps[i]
+			found = true
+			break
+		}
+	}
+	lr.mu.Unlock()
+	if !found {
+		return nil, fmt.Errorf("%w：step %d 不存在", ErrStepState, index)
+	}
+	if st.Status != domain.StepRunning {
+		return nil, fmt.Errorf("%w：step %d 当前为 %s（未开始请用「跳过」）", ErrStepState, index, st.Status)
+	}
+	lr.stepMu.Lock()
+	cancel := lr.stepCancels[index]
+	lr.stepMu.Unlock()
+	if cancel == nil {
+		return nil, fmt.Errorf("%w：step %d 取消信号尚未就绪，请稍后重试", ErrStepState, index)
+	}
+	cancel()
+	return &st, nil
 }
 
 // ---------------- 查询 ----------------
@@ -462,6 +555,32 @@ func (m *Manager) execute(ctx context.Context, runID string) {
 		Steps:       lr.steps,
 		WorkDir:     filepath.Join(string(m.cfg.Paths.RunsDir), runID),
 		DatasetsDir: string(m.cfg.Paths.DatasetsDir),
+		// 单步控制：引擎在启动每个 step 前检查是否被跳过；每个 step 用可单独取消的 ctx。
+		SkipStep: func(index int) bool {
+			lr.mu.Lock()
+			defer lr.mu.Unlock()
+			for i := range lr.run.Steps {
+				if lr.run.Steps[i].Index == index {
+					return lr.run.Steps[i].Status == domain.StepSkipped
+				}
+			}
+			return false
+		},
+		StepContext: func(parent context.Context, index int) (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithCancel(parent)
+			lr.stepMu.Lock()
+			if lr.stepCancels == nil {
+				lr.stepCancels = map[int]context.CancelFunc{}
+			}
+			lr.stepCancels[index] = cancel
+			lr.stepMu.Unlock()
+			return ctx, func() {
+				lr.stepMu.Lock()
+				delete(lr.stepCancels, index)
+				lr.stepMu.Unlock()
+				cancel()
+			}
+		},
 	}
 	// 长档位（512k/1m）的 token 计数必须用数据集构建时的分词器（对齐 run.sh 的
 	// DATASET_TOKENIZER），显式配置 long_buckets 优先；未配置时回退为
@@ -576,6 +695,23 @@ func (m *Manager) execute(ctx context.Context, runID string) {
 			status = domain.StatusPartial
 		}
 	}
+	// 全部步骤被用户跳过（没有可评测的数据）：按 canceled 收口，不算失败；
+	// 同时清掉报告阶段可能产生的 eval_success/gate 结论，避免历史里显示「未达标」。
+	if status != domain.StatusCanceled {
+		if executed, skipped := stepCounts(lr); executed == 0 && skipped > 0 {
+			lr.mu.Lock()
+			if lr.run.Summary == nil {
+				lr.run.Summary = map[string]any{}
+			}
+			lr.run.Summary["verdict"] = "canceled"
+			lr.run.Summary["skipped_steps"] = skipped
+			delete(lr.run.Summary, "gate_passed")
+			delete(lr.run.Summary, "gate_violations")
+			lr.run.GateResult = nil
+			lr.mu.Unlock()
+			status = domain.StatusCanceled
+		}
+	}
 	m.finish(runCtx, lr, status, failProb)
 }
 
@@ -613,8 +749,13 @@ func (m *Manager) onEngineEvent(ctx context.Context, lr *liveRun, ev engine.Even
 		dur := asFloat(ev.Data["duration_sec"])
 		ttft := asFloat(ev.Data["ttft_p50_sec"])
 		status := domain.StepFailed
-		if asString(ev.Data["status"]) == string(domain.StepSucceeded) {
+		switch asString(ev.Data["status"]) {
+		case string(domain.StepSucceeded):
 			status = domain.StepSucceeded
+		case string(domain.StepCanceled):
+			status = domain.StepCanceled
+		case string(domain.StepSkipped):
+			status = domain.StepSkipped
 		}
 		m.updateStep(ctx, lr, idx, func(st *domain.Step) {
 			st.Status = status
@@ -1031,12 +1172,38 @@ func (m *Manager) finish(ctx context.Context, lr *liveRun, status domain.RunStat
 	lr.run.Status = status
 	lr.run.FinishedAt = &now
 	lr.run.Error = prob
-	// 任何终态都应收口：进度 100%，StepsDone 只统计真正结束的 step
+	// 任何终态都应收口：进度 100%，StepsDone 统计已结束的 step
 	lr.run.Progress.Percent = 100
 	lr.run.Progress.StepsDone = countDone(lr.run.Steps)
 	arts := lr.run.Artifacts
 	summary := lr.run.Summary
 	gate := lr.run.GateResult
+	// 单步跳过/取消的计数进 summary，便于结果页/历史一眼看出「不是全跑了」
+	skippedSteps, canceledSteps := 0, 0
+	for _, st := range lr.run.Steps {
+		switch st.Status {
+		case domain.StepSkipped:
+			skippedSteps++
+		case domain.StepCanceled:
+			canceledSteps++
+		}
+	}
+	if skippedSteps > 0 || canceledSteps > 0 {
+		if summary == nil {
+			summary = map[string]any{}
+			lr.run.Summary = summary
+		}
+		if skippedSteps > 0 {
+			summary["skipped_steps"] = skippedSteps
+		}
+		if canceledSteps > 0 {
+			summary["canceled_steps"] = canceledSteps
+		}
+		// 有步骤被剔除时，「全绿」的结论不再成立：pass → partial（gate 结论仍以 gate_result 为准）
+		if v, ok := summary["verdict"]; !ok || v == "pass" {
+			summary["verdict"] = "partial"
+		}
+	}
 	lr.mu.Unlock()
 
 	dctx, dcancel := detached(ctx)
@@ -1365,6 +1532,21 @@ func collectFailures(res engine.Result, steps []domain.Step, excerpt int) []doma
 	return out
 }
 
+// stepCounts 统计「真正执行过」与「被跳过」的 step 数。
+func stepCounts(lr *liveRun) (executed, skipped int) {
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+	for _, st := range lr.run.Steps {
+		switch st.Status {
+		case domain.StepSucceeded, domain.StepFailed, domain.StepCanceled:
+			executed++
+		case domain.StepSkipped:
+			skipped++
+		}
+	}
+	return executed, skipped
+}
+
 func hasFailedStep(lr *liveRun) bool {
 	lr.mu.Lock()
 	defer lr.mu.Unlock()
@@ -1376,11 +1558,13 @@ func hasFailedStep(lr *liveRun) bool {
 	return false
 }
 
-// countDone 统计「真正执行过」的 step：skipped（未开始）不计入。
+// countDone 统计已结束的 step：succeeded / failed / canceled / skipped。
+// 运行中「跳过」的 step 曾经 pending，但也算已结束（进度要能到 100%）。
 func countDone(steps []domain.Step) int {
 	n := 0
 	for _, s := range steps {
-		if s.Status == domain.StepSucceeded || s.Status == domain.StepFailed || s.Status == domain.StepCanceled {
+		switch s.Status {
+		case domain.StepSucceeded, domain.StepFailed, domain.StepCanceled, domain.StepSkipped:
 			n++
 		}
 	}

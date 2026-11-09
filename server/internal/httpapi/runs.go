@@ -300,6 +300,44 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleSkipStep 跳过「待执行」的 step：只影响该 step，其余照常执行。
+func (s *Server) handleSkipStep(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("run_id")
+	idx, err := strconv.Atoi(r.PathValue("step_index"))
+	if err != nil || idx < 0 {
+		writeProblem(w, r, domain.NewProblem(400, "validation_failed", "step_index 必须是非负整数"))
+		return
+	}
+	step, err := s.mgr.SkipStep(r.Context(), runID, idx)
+	if err != nil {
+		writeProblem(w, r, errProblem(err))
+		return
+	}
+	s.st.Audit(r.Context(), actorName(r), "run.step.skip", runID, fmt.Sprintf("step=%d", idx))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"run_id": runID, "step_index": idx, "step": step,
+	})
+}
+
+// handleCancelStep 取消「正在运行」的 step：kill 该 step 的子进程后继续剩余 step。
+func (s *Server) handleCancelStep(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("run_id")
+	idx, err := strconv.Atoi(r.PathValue("step_index"))
+	if err != nil || idx < 0 {
+		writeProblem(w, r, domain.NewProblem(400, "validation_failed", "step_index 必须是非负整数"))
+		return
+	}
+	step, err := s.mgr.CancelStep(r.Context(), runID, idx)
+	if err != nil {
+		writeProblem(w, r, errProblem(err))
+		return
+	}
+	s.st.Audit(r.Context(), actorName(r), "run.step.cancel", runID, fmt.Sprintf("step=%d", idx))
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"run_id": runID, "step_index": idx, "status": "cancel_requested", "step": step,
+	})
+}
+
 // handleDeleteRun 硬删除一条终态 run（含 steps / 产物记录 / 事件 / runs/<id> 目录）。
 func (s *Server) handleDeleteRun(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("run_id")

@@ -74,6 +74,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET "+bp+"/runs", s.handleListRuns)
 	mux.HandleFunc("GET "+bp+"/runs/{run_id}", s.handleGetRun)
 	mux.HandleFunc("POST "+bp+"/runs/{run_id}/cancel", s.handleCancelRun)
+	mux.HandleFunc("POST "+bp+"/runs/{run_id}/steps/{step_index}/skip", s.handleSkipStep)
+	mux.HandleFunc("POST "+bp+"/runs/{run_id}/steps/{step_index}/cancel", s.handleCancelStep)
 	mux.HandleFunc("DELETE "+bp+"/runs/{run_id}", s.handleDeleteRun)
 	mux.HandleFunc("POST "+bp+"/runs/{run_id}/rerun", s.handleRerunRun)
 	mux.HandleFunc("POST "+bp+"/runs/purge", s.handlePurgeRuns)
@@ -378,6 +380,8 @@ func errProblem(err error) *domain.Problem {
 		p.Retryable = true
 		return p
 	case errors.Is(err, runmgr.ErrEphemeralRerun):
+		return domain.NewProblem(409, "conflict", err.Error())
+	case errors.Is(err, runmgr.ErrStepState):
 		return domain.NewProblem(409, "conflict", err.Error())
 	}
 	return domain.NewProblem(500, "internal_error", fmt.Sprintf("%v", err))

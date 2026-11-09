@@ -179,6 +179,17 @@ func (s *Subprocess) Run(ctx context.Context, spec Spec, emit func(Event)) (Resu
 		if err := ctx.Err(); err != nil {
 			return res, err
 		}
+		if StepSkipped(spec, i) {
+			res.Steps = append(res.Steps, domain.Step{
+				Index: i, Bucket: st.Bucket, Parallel: st.Parallel, Number: st.Number,
+				Status: domain.StepSkipped,
+			})
+			emit(Event{Kind: EvStepFinished, At: time.Now().UTC(), Data: map[string]any{
+				"step_index": i, "status": string(domain.StepSkipped), "success_rate": 0.0,
+			}})
+			continue
+		}
+		stepCtx, stepCancel := StepRunContext(spec, ctx, i)
 		emit(Event{Kind: EvStepStarted, At: time.Now().UTC(), Data: map[string]any{
 			"step_index": i, "bucket": st.Bucket, "parallel": st.Parallel, "number": st.Number,
 		}})
@@ -189,7 +200,7 @@ func (s *Subprocess) Run(ctx context.Context, spec Spec, emit func(Event)) (Resu
 		}
 
 		args := s.perfArgs(spec, st, outDir)
-		cmd := exec.CommandContext(ctx, s.evalscope, args...)
+		cmd := exec.CommandContext(stepCtx, s.evalscope, args...)
 		cmd.Dir = s.workdir
 		cmd.Env = s.childEnv(spec)
 		setPgid(cmd)
@@ -238,7 +249,7 @@ func (s *Subprocess) Run(ctx context.Context, spec Spec, emit func(Event)) (Resu
 		waitErr := make(chan error, 1)
 		go func() { waitErr <- cmd.Wait() }()
 		select {
-		case <-ctx.Done():
+		case <-stepCtx.Done():
 			killTree(cmd, true)
 			select {
 			case <-waitErr:
@@ -247,9 +258,24 @@ func (s *Subprocess) Run(ctx context.Context, spec Spec, emit func(Event)) (Resu
 				<-waitErr
 			}
 			wg.Wait()
-			return res, ctx.Err()
+			stepCancel()
+			// 父 ctx 结束 = 整个 run 被取消/超时，交给上层终态处理
+			if err := ctx.Err(); err != nil {
+				return res, err
+			}
+			// 只有本 step 被单独取消：记录 canceled，继续后面的档位
+			sr := 0.0
+			res.Steps = append(res.Steps, domain.Step{
+				Index: i, Bucket: st.Bucket, Parallel: st.Parallel, Number: st.Number,
+				Status: domain.StepCanceled, SuccessRate: &sr,
+			})
+			emit(Event{Kind: EvStepFinished, At: time.Now().UTC(), Data: map[string]any{
+				"step_index": i, "status": string(domain.StepCanceled), "success_rate": 0.0,
+			}})
+			continue
 		case err := <-waitErr:
 			wg.Wait()
+			stepCancel()
 			if err != nil {
 				res.ExitCode = exitCode(err)
 				emit(Event{Kind: EvError, At: time.Now().UTC(), Data: map[string]any{

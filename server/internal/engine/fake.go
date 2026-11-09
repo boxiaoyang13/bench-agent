@@ -116,6 +116,15 @@ func (f *Fake) Run(ctx context.Context, spec Spec, emit func(Event)) (Result, er
 		if err := ctx.Err(); err != nil {
 			return res, err
 		}
+		if StepSkipped(spec, i) {
+			res.Steps = append(res.Steps, domain.Step{Index: i, Bucket: st.Bucket,
+				Parallel: st.Parallel, Number: st.Number, Status: domain.StepSkipped})
+			emit(Event{Kind: EvStepFinished, At: time.Now().UTC(), Data: map[string]any{
+				"step_index": i, "status": string(domain.StepSkipped), "success_rate": 0.0,
+			}})
+			continue
+		}
+		stepCtx, stepCancel := StepRunContext(spec, ctx, i)
 		emit(Event{Kind: EvStepStarted, At: time.Now().UTC(), Data: map[string]any{
 			"step_index": i, "bucket": st.Bucket, "parallel": st.Parallel, "number": st.Number,
 		}})
@@ -125,13 +134,17 @@ func (f *Fake) Run(ctx context.Context, spec Spec, emit func(Event)) (Result, er
 		tps := roundTo(42/math.Pow(scale, 0.35), 2)
 		tpot := roundTo(1000/(tps*6+40)*6, 2)
 
-		// 分段推进（3 段），并支持取消
+		// 分段推进（3 段），支持整 run 取消与单 step 取消
 		ticks := 3
+		stepCanceled := false
 		for t := 1; t <= ticks; t++ {
 			select {
-			case <-ctx.Done():
-				return res, ctx.Err()
+			case <-stepCtx.Done():
+				stepCanceled = true
 			case <-time.After(perStep / time.Duration(ticks)):
+			}
+			if stepCanceled {
+				break
 			}
 			if t < ticks {
 				emit(Event{Kind: EvStepProgress, At: time.Now().UTC(), Data: map[string]any{
@@ -140,6 +153,20 @@ func (f *Fake) Run(ctx context.Context, spec Spec, emit func(Event)) (Result, er
 				}})
 			}
 		}
+		if stepCanceled {
+			stepCancel()
+			if err := ctx.Err(); err != nil {
+				return res, err
+			}
+			sr := 0.0
+			res.Steps = append(res.Steps, domain.Step{Index: i, Bucket: st.Bucket,
+				Parallel: st.Parallel, Number: st.Number, Status: domain.StepCanceled, SuccessRate: &sr})
+			emit(Event{Kind: EvStepFinished, At: time.Now().UTC(), Data: map[string]any{
+				"step_index": i, "status": string(domain.StepCanceled), "success_rate": 0.0,
+			}})
+			continue
+		}
+		stepCancel()
 
 		failed := rand.Float64() < f.FailRate
 		successRate := 1.0
@@ -229,20 +256,47 @@ func (f *Fake) runEval(ctx context.Context, spec Spec, emit func(Event)) (Result
 		if err := ctx.Err(); err != nil {
 			return res, err
 		}
+		if StepSkipped(spec, i) {
+			res.Steps = append(res.Steps, domain.Step{Index: i, Bucket: st.Bucket,
+				Parallel: st.Parallel, Number: st.Number, Status: domain.StepSkipped})
+			emit(Event{Kind: EvStepFinished, At: time.Now().UTC(), Data: map[string]any{
+				"step_index": i, "status": string(domain.StepSkipped), "success_rate": 0.0,
+			}})
+			continue
+		}
+		stepCtx, stepCancel := StepRunContext(spec, ctx, i)
 		emit(Event{Kind: EvStepStarted, At: time.Now().UTC(), Data: map[string]any{
 			"step_index": i, "bucket": st.Bucket, "parallel": st.Parallel, "number": st.Number,
 		}})
 		steps := 5
+		stepCanceled := false
 		for p := 1; p <= steps; p++ {
 			select {
-			case <-ctx.Done():
-				return res, ctx.Err()
+			case <-stepCtx.Done():
+				stepCanceled = true
 			case <-time.After(time.Duration(f.StepMS/steps) * time.Millisecond):
+			}
+			if stepCanceled {
+				break
 			}
 			emit(Event{Kind: EvStepProgress, At: time.Now().UTC(), Data: map[string]any{
 				"step_index": i, "completed": p * 100 / steps, "total": 100,
 			}})
 		}
+		if stepCanceled {
+			stepCancel()
+			if err := ctx.Err(); err != nil {
+				return res, err
+			}
+			sr := 0.0
+			res.Steps = append(res.Steps, domain.Step{Index: i, Bucket: st.Bucket,
+				Parallel: st.Parallel, Number: st.Number, Status: domain.StepCanceled, SuccessRate: &sr})
+			emit(Event{Kind: EvStepFinished, At: time.Now().UTC(), Data: map[string]any{
+				"step_index": i, "status": string(domain.StepCanceled), "success_rate": 0.0,
+			}})
+			continue
+		}
+		stepCancel()
 		ok := rand.Float64() >= f.FailRate
 		score := 0.4 + rand.Float64()*0.55
 		if !ok {
@@ -283,12 +337,15 @@ func (f *Fake) runCache(ctx context.Context, spec Spec, emit func(Event)) (Resul
 		if err := ctx.Err(); err != nil {
 			return res, err
 		}
-		select {
-		case <-ctx.Done():
-			return res, ctx.Err()
-		case <-time.After(time.Duration(f.StepMS) * time.Millisecond):
+		if StepSkipped(spec, i) {
+			res.Steps = append(res.Steps, domain.Step{Index: st.Index, Bucket: st.Bucket,
+				Parallel: st.Parallel, Number: st.Number, Status: domain.StepSkipped})
+			emit(Event{Kind: EvStepFinished, At: time.Now().UTC(), Data: map[string]any{
+				"step_index": st.Index, "status": string(domain.StepSkipped), "success_rate": 0.0,
+			}})
+			continue
 		}
-
+		stepCtx, stepCancel := StepRunContext(spec, ctx, i)
 		sessions := st.Parallel
 		if sessions <= 0 {
 			sessions = 3
@@ -304,6 +361,26 @@ func (f *Fake) runCache(ctx context.Context, spec Spec, emit func(Event)) (Resul
 		emit(Event{Kind: EvStepStarted, At: time.Now().UTC(), Data: map[string]any{
 			"step_index": st.Index, "bucket": bucket, "parallel": sessions, "number": 0,
 		}})
+		stepCanceled := false
+		select {
+		case <-stepCtx.Done():
+			stepCanceled = true
+		case <-time.After(time.Duration(f.StepMS) * time.Millisecond):
+		}
+		if stepCanceled {
+			stepCancel()
+			if err := ctx.Err(); err != nil {
+				return res, err
+			}
+			sr := 0.0
+			res.Steps = append(res.Steps, domain.Step{Index: st.Index, Bucket: st.Bucket,
+				Parallel: st.Parallel, Number: st.Number, Status: domain.StepCanceled, SuccessRate: &sr})
+			emit(Event{Kind: EvStepFinished, At: time.Now().UTC(), Data: map[string]any{
+				"step_index": st.Index, "status": string(domain.StepCanceled), "success_rate": 0.0,
+			}})
+			continue
+		}
+		stepCancel()
 
 		first := 900.0 + rand.Float64()*300                 // 首轮 900~1200ms
 		steadyP50 := first * (1 - 0.5 - rand.Float64()*0.2) // 稳态改善 50~70%

@@ -455,7 +455,9 @@ gates:
    `每 session QPS` + 负载口径（等比放大 / 固定全局 QPS）；估算框显示档位数、每档 QPS、
    预计总时长/总请求数/token 消耗与容量反算说明；第 2 步会校验档位重复、每档 QPS、
    形状参数（shared+history > 0）
-4. 步骤表：单档一行；多档每档一行（`c1`/`c2`/`c4`，并发与请求数事后回填）
+4. 步骤表：单档一行；多档每档一行（`c1`/`c2`/`c4`，并发与请求数事后回填）；
+   每行带「操作」：**运行中 → 取消**（kill 当前档位后继续后面的档位）、
+   **待执行 → 跳过**（引擎轮到该档时直接跳过），用于剔除个别档位而不用停掉整个 run
 5. 结果页：
    - 单档：KPI 卡（前缀命中率、稳态 TTFT P50、首轮 TTFT、改善率、TPOT P50、
      解码速度、输出吞吐、成功率）+ 逐轮 TTFT 表 + 性能指标表 + 口径说明 +
@@ -492,6 +494,8 @@ gates:
 | 单测 | 档位 plan 校验：sessions 越界/重复、缺形状参数、总时长超限 → 400 |
 | 集成 | builtin 引擎：提交 cache run → SSE → `/results.cache` → artifacts 下载 |
 | 集成 | builtin 引擎多档：`ladder` 提交 → `steps_total=N`、`cache.tiers[]`、step 回填、逐档 gate |
+| 集成 | 单步操作：跳过待执行档位（skipped）/ 取消运行中档位（canceled）→ 其余档位照常出结果 |
+| 集成 | 单步状态冲突：运行中 skip / 待执行 cancel → 409；全部跳过 → run=canceled、`verdict=canceled` |
 | 真机 | `multi-round-chat 30s`：step 成功、稳态 TTFT < 首轮、改善率 > 0、CSV/JSON 可下载 |
 | 真机 | `cache-perf-sla-v1`：性能指标齐全、样本数不足时正确输出 `min_samples` 违规 |
 | 真机 | 多档 `ladder=[1,2,4]`：3 个 step 顺序成功、tiers 指标齐全、产物按 c1/c2/c4 前缀归档 |

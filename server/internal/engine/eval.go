@@ -194,6 +194,17 @@ func (e *EvalEngine) Run(ctx context.Context, spec Spec, emit func(Event)) (Resu
 		if err := ctx.Err(); err != nil {
 			return res, err
 		}
+		if StepSkipped(spec, i) {
+			res.Steps = append(res.Steps, domain.Step{
+				Index: i, Bucket: st.Bucket, Parallel: st.Parallel, Number: st.Number,
+				Status: domain.StepSkipped,
+			})
+			emit(Event{Kind: EvStepFinished, At: time.Now().UTC(), Data: map[string]any{
+				"step_index": i, "status": string(domain.StepSkipped), "success_rate": 0.0,
+			}})
+			continue
+		}
+		stepCtx, stepCancel := StepRunContext(spec, ctx, i)
 		emit(Event{Kind: EvStepStarted, At: time.Now().UTC(), Data: map[string]any{
 			"step_index": i, "bucket": st.Bucket, "parallel": st.Parallel, "number": st.Number,
 		}})
@@ -204,7 +215,7 @@ func (e *EvalEngine) Run(ctx context.Context, spec Spec, emit func(Event)) (Resu
 		}
 		started := time.Now()
 		args := e.evalArgs(spec, st, outDir)
-		cmd := exec.CommandContext(ctx, e.python, args...)
+		cmd := exec.CommandContext(stepCtx, e.python, args...)
 		cmd.Dir = e.workdir
 		cmd.Env = e.childEnv()
 		setPgid(cmd)
@@ -249,7 +260,7 @@ func (e *EvalEngine) Run(ctx context.Context, spec Spec, emit func(Event)) (Resu
 		go func() { waitErr <- cmd.Wait() }()
 		var runErr error
 		select {
-		case <-ctx.Done():
+		case <-stepCtx.Done():
 			killTree(cmd, true)
 			select {
 			case <-waitErr:
@@ -258,9 +269,24 @@ func (e *EvalEngine) Run(ctx context.Context, spec Spec, emit func(Event)) (Resu
 				<-waitErr
 			}
 			wg.Wait()
-			return res, ctx.Err()
+			stepCancel()
+			// 父 ctx 结束 = 整个 run 被取消/超时
+			if err := ctx.Err(); err != nil {
+				return res, err
+			}
+			// 只有本数据集被单独取消：记录 canceled，不产出数据集结果
+			sr := 0.0
+			res.Steps = append(res.Steps, domain.Step{
+				Index: i, Bucket: st.Bucket, Parallel: st.Parallel, Number: st.Number,
+				Status: domain.StepCanceled, SuccessRate: &sr,
+			})
+			emit(Event{Kind: EvStepFinished, At: time.Now().UTC(), Data: map[string]any{
+				"step_index": i, "status": string(domain.StepCanceled), "success_rate": 0.0,
+			}})
+			continue
 		case err := <-waitErr:
 			wg.Wait()
+			stepCancel()
 			runErr = err
 		}
 		if runErr != nil {

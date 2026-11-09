@@ -66,6 +66,24 @@ type Spec struct {
 	DatasetsDir      string
 	LongBuckets      map[string]bool
 	DatasetTokenizer string
+
+	// SkipStep / StepContext 由 runmgr 注入，支持运行中按 step 跳过或取消
+	// （未注入时为空，引擎按普通串行执行）。
+	SkipStep    func(index int) bool
+	StepContext func(parent context.Context, index int) (context.Context, context.CancelFunc)
+}
+
+// StepSkipped 报告第 index 个 step 是否已被用户标记跳过（引擎在启动该 step 前检查）。
+func StepSkipped(spec Spec, index int) bool {
+	return spec.SkipStep != nil && spec.SkipStep(index)
+}
+
+// StepRunContext 返回第 index 个 step 的执行 ctx；未注入控制器时直接用 parent。
+func StepRunContext(spec Spec, parent context.Context, index int) (context.Context, context.CancelFunc) {
+	if spec.StepContext == nil {
+		return parent, func() {}
+	}
+	return spec.StepContext(parent, index)
 }
 
 // Result 是引擎执行结果。

@@ -272,11 +272,22 @@ func (e *CacheEngine) Run(ctx context.Context, spec Spec, emit func(Event)) (Res
 		if ctx.Err() != nil {
 			break
 		}
+		if StepSkipped(spec, i) {
+			res.Steps = append(res.Steps, domain.Step{
+				Index: st.Index, Bucket: st.Bucket, Parallel: st.Parallel, Status: domain.StepSkipped,
+			})
+			emit(Event{Kind: EvStepFinished, At: time.Now().UTC(), Data: map[string]any{
+				"step_index": st.Index, "status": string(domain.StepSkipped), "success_rate": 0.0,
+			}})
+			continue
+		}
+		stepCtx, stepCancel := StepRunContext(spec, ctx, i)
 		tp := e.tierPlan(spec.Plan, i)
 		tierSpec := spec
 		tierSpec.Plan = tp
 
-		tr, err := e.runTier(ctx, tierSpec, st, logFile, emit)
+		tr, err := e.runTier(stepCtx, tierSpec, st, logFile, emit)
+		stepCancel()
 		res.Steps = append(res.Steps, tr.step)
 		if tr.metrics != nil {
 			tr.metrics.Bucket = st.Bucket
@@ -285,7 +296,8 @@ func (e *CacheEngine) Run(ctx context.Context, spec Spec, emit func(Event)) (Res
 			tiers = append(tiers, tr.metrics)
 		}
 		files = append(files, tr.files...)
-		if tr.note != "" {
+		// 只有真正失败才进 run 的 error 说明；用户主动取消的档位不算错误
+		if tr.note != "" && tr.step.Status == domain.StepFailed {
 			notes = append(notes, fmt.Sprintf("%s: %s", st.Bucket, tr.note))
 		}
 		if err != nil {
@@ -407,6 +419,9 @@ func (e *CacheEngine) runTier(ctx context.Context, spec Spec, st domain.StepSpec
 		wg.Wait()
 		tr.step = domain.Step{Index: st.Index, Bucket: st.Bucket, Status: domain.StepCanceled}
 		tr.note = "已取消"
+		emit(Event{Kind: EvStepFinished, At: time.Now().UTC(), Data: map[string]any{
+			"step_index": st.Index, "status": string(domain.StepCanceled), "success_rate": 0.0,
+		}})
 		return tr, nil
 	case err := <-waitErr:
 		wg.Wait()

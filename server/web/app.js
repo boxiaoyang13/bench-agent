@@ -1094,12 +1094,13 @@ function renderRun(run) {
 function renderStepsHead(cap) {
   const el = $('#steps-head');
   if (!el) return;
+  const op = '<th>操作</th>';
   el.innerHTML = cap === 'eval'
-    ? '<tr><th>#</th><th>数据集</th><th>并发</th><th>条数</th><th>状态</th><th class="num">得分</th><th class="num">耗时</th></tr>'
+    ? '<tr><th>#</th><th>数据集</th><th>并发</th><th>条数</th><th>状态</th><th class="num">得分</th><th class="num">耗时</th></tr>' + op
     : cap === 'cache'
-      ? '<tr><th>#</th><th>Workload</th><th>并发</th><th>请求数</th><th>状态</th><th class="num">成功率</th><th class="num">耗时</th></tr>'
+      ? '<tr><th>#</th><th>Workload</th><th>并发</th><th>请求数</th><th>状态</th><th class="num">成功率</th><th class="num">耗时</th></tr>' + op
       : '<tr><th>#</th><th>档位</th><th>并发</th><th>请求数</th><th>状态</th>'
-        + '<th class="num">成功率</th><th class="num">TTFT P50</th><th class="num">Output tps</th><th class="num">耗时</th></tr>';
+        + '<th class="num">成功率</th><th class="num">TTFT P50</th><th class="num">Output tps</th><th class="num">耗时</th></tr>' + op;
 }
 
 function statusText(s) {
@@ -1123,6 +1124,7 @@ function renderSteps(steps, capability) {
         <td class="st">${stepBadge(s.status)}</td>
         <td class="num sr">${s.score != null ? fmtNum(s.score) : '—'}</td>
         <td class="num dur">${s.duration_sec != null ? fmtDur(s.duration_sec) : '—'}</td>
+        ${stepActionCell(s, i)}
       </tr>`).join('');
     return;
   }
@@ -1136,6 +1138,7 @@ function renderSteps(steps, capability) {
         <td class="st">${stepBadge(s.status)}</td>
         <td class="num">${s.success_rate != null ? fmtPct(s.success_rate) : '—'}</td>
         <td class="num dur">${s.duration_sec != null ? fmtDur(s.duration_sec) : '—'}</td>
+        ${stepActionCell(s, i)}
       </tr>`).join('');
     return;
   }
@@ -1150,8 +1153,52 @@ function renderSteps(steps, capability) {
       <td class="num ttft">${s.ttft_p50_sec != null ? fmtNum(s.ttft_p50_sec) + 's' : '—'}</td>
       <td class="num tps">${s.output_tps != null ? fmtNum(s.output_tps) : '—'}</td>
       <td class="num dur">${s.duration_sec != null ? fmtDur(s.duration_sec) : '—'}</td>
+      ${stepActionCell(s, i)}
     </tr>`).join('');
 }
+
+// 单步操作：运行中 → 取消；待执行 → 跳过；其余 → —（仅在 run 未终态时可用）。
+function stepActionCell(step, i) {
+  const active = !TERMINAL.includes(state.run?.status || '');
+  if (!active) return '<td class="act muted">—</td>';
+  if (step.status === 'running') {
+    return `<td class="act"><button class="btn sm ghost" data-step-action="cancel" data-step-index="${i}"
+      title="中断该步骤并继续后面的步骤">取消</button></td>`;
+  }
+  if (step.status === 'pending' || !step.status) {
+    return `<td class="act"><button class="btn sm ghost" data-step-action="skip" data-step-index="${i}"
+      title="跳过该步骤，不影响其他步骤">跳过</button></td>`;
+  }
+  return '<td class="act muted">—</td>';
+}
+
+// 步骤表按钮（事件委托：表格会整体重渲染）
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest?.('[data-step-action]');
+  if (!btn) return;
+  const runId = state.run?.run_id;
+  if (!runId) return;
+  const idx = Number(btn.dataset.stepIndex);
+  const action = btn.dataset.stepAction;
+  btn.disabled = true;
+  try {
+    if (action === 'skip') {
+      const res = await api('POST', `/runs/${runId}/steps/${idx}/skip`);
+      const steps = state.run.steps || (state.run.steps = []);
+      const target = steps.find(x => x && Number(x.index ?? -1) === idx) || steps[idx];
+      if (target) Object.assign(target, res.step || { status: 'skipped' });
+      else if (steps[idx]) Object.assign(steps[idx], res.step || { status: 'skipped' });
+      renderRun(state.run);
+      toast(`已跳过 step ${idx + 1}（其余步骤继续执行）`);
+    } else {
+      await api('POST', `/runs/${runId}/steps/${idx}/cancel`);
+      toast(`已请求取消 step ${idx + 1}，当前请求中断后继续后续步骤`);
+    }
+  } catch (err) {
+    toast(err?.message || '单步操作失败', 'err');
+    btn.disabled = false;
+  }
+});
 
 function stepBadge(status) {
   const map = { pending: ['', '待执行'], running: ['info', '运行中'], succeeded: ['ok', '成功'], failed: ['err', '失败'], skipped: ['warn', '跳过'], canceled: ['warn', '已取消'] };
