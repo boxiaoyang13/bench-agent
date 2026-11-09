@@ -1094,13 +1094,15 @@ function renderRun(run) {
 function renderStepsHead(cap) {
   const el = $('#steps-head');
   if (!el) return;
-  const op = '<th>操作</th>';
+  // 注意：操作列必须拼在 </tr> 之前，否则浏览器会把游离的 <th> 包成第二行，
+  // 导致表头多一行、并发/请求数等列全部错位。
+  const op = '<th class="act">操作</th>';
   el.innerHTML = cap === 'eval'
-    ? '<tr><th>#</th><th>数据集</th><th>并发</th><th>条数</th><th>状态</th><th class="num">得分</th><th class="num">耗时</th></tr>' + op
+    ? '<tr><th>#</th><th>数据集</th><th>并发</th><th>条数</th><th>状态</th><th class="num">得分</th><th class="num">耗时</th>' + op + '</tr>'
     : cap === 'cache'
-      ? '<tr><th>#</th><th>Workload</th><th>并发</th><th>请求数</th><th>状态</th><th class="num">成功率</th><th class="num">耗时</th></tr>' + op
+      ? '<tr><th>#</th><th>Workload</th><th>并发</th><th>请求数</th><th>状态</th><th class="num">成功率</th><th class="num">耗时</th>' + op + '</tr>'
       : '<tr><th>#</th><th>档位</th><th>并发</th><th>请求数</th><th>状态</th>'
-        + '<th class="num">成功率</th><th class="num">TTFT P50</th><th class="num">Output tps</th><th class="num">耗时</th></tr>' + op;
+        + '<th class="num">成功率</th><th class="num">TTFT P50</th><th class="num">Output tps</th><th class="num">耗时</th>' + op + '</tr>';
 }
 
 function statusText(s) {
