@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -298,6 +299,95 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleDeleteRun 硬删除一条终态 run（含 steps / 产物记录 / 事件 / runs/<id> 目录）。
+func (s *Server) handleDeleteRun(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("run_id")
+	run, err := s.mgr.Get(r.Context(), id, false)
+	if err != nil {
+		writeProblem(w, r, errProblem(err))
+		return
+	}
+	if !run.Status.Terminal() {
+		p := domain.NewProblem(409, "conflict",
+			fmt.Sprintf("run 正在%s，请先取消并等待进入终态", runStatusText(run.Status)))
+		writeProblem(w, r, p)
+		return
+	}
+	if err := s.mgr.Delete(r.Context(), id); err != nil {
+		writeProblem(w, r, errProblem(err))
+		return
+	}
+	s.st.Audit(r.Context(), actorName(r), "run.delete", id, string(run.Capability))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handlePurgeRuns 批量清理终态 run（默认 canceled + failed）。支持 dry_run 先看命中数。
+type purgeRequest struct {
+	RunIDs     []string `json:"run_ids,omitempty"` // 勾选删除：显式 id 列表
+	Statuses   []string `json:"statuses,omitempty"`
+	Capability string   `json:"capability,omitempty"`
+	Before     string   `json:"before,omitempty"` // RFC3339；缺省=不限
+	DryRun     bool     `json:"dry_run,omitempty"`
+}
+
+func (s *Server) handlePurgeRuns(w http.ResponseWriter, r *http.Request) {
+	var req purgeRequest
+	if r.ContentLength > 0 {
+		if !s.decode(w, r, &req) {
+			return
+		}
+	}
+	f := runmgr.PurgeFilter{Statuses: req.Statuses, Capability: req.Capability, DryRun: req.DryRun, RunIDs: req.RunIDs}
+	if req.Before != "" {
+		t, err := time.Parse(time.RFC3339, req.Before)
+		if err != nil {
+			writeProblem(w, r, domain.NewProblem(400, "validation_failed", "before 必须是 RFC3339 时间: "+err.Error()))
+			return
+		}
+		f.Before = &t
+	}
+	res, err := s.mgr.Purge(r.Context(), f)
+	if err != nil {
+		writeProblem(w, r, errProblem(err))
+		return
+	}
+	if !res.DryRun {
+		s.st.Audit(r.Context(), actorName(r), "run.purge", "",
+			fmt.Sprintf("deleted=%d statuses=%v capability=%s", res.Deleted, req.Statuses, req.Capability))
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// handleRerunRun 用原记录的目标与参数重跑一份（历史页「重测」按钮）。
+func (s *Server) handleRerunRun(w http.ResponseWriter, r *http.Request) {
+	oldID := r.PathValue("run_id")
+	run, err := s.mgr.Rerun(r.Context(), oldID, actorName(r))
+	if err != nil {
+		writeProblem(w, r, errProblem(err))
+		return
+	}
+	s.st.Audit(r.Context(), actorName(r), "run.rerun", run.ID, "from="+oldID)
+	full, err := s.mgr.Get(r.Context(), run.ID, true)
+	if err != nil {
+		full = run
+	}
+	writeJSON(w, http.StatusAccepted, full)
+}
+
+func runStatusText(st domain.RunStatus) string {
+	switch st {
+	case domain.StatusQueued:
+		return "排队"
+	case domain.StatusPreparing:
+		return "准备中"
+	case domain.StatusRunning:
+		return "运行"
+	case domain.StatusReporting:
+		return "生成报告"
+	}
+	return string(st)
+}
+
 // handleRunResults 返回结构化指标 + 验收结论。
 func (s *Server) handleRunResults(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("run_id")
@@ -510,7 +600,11 @@ func (s *Server) handleDownloadArtifact(w http.ResponseWriter, r *http.Request) 
 		ctype = "application/octet-stream"
 	}
 	w.Header().Set("Content-Type", ctype)
-	w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+urlEncode(a.Filename))
+	// Content-Disposition 同时给 ASCII fallback 与 RFC 5987 的 filename*：
+	// 部分反向代理/网关不接受非 ASCII 头值，只给 filename* 时会被它们变成“下载失败”。
+	w.Header().Set("Content-Disposition", "attachment; filename=\""+asciiFallbackName(a.Filename)+"\"; "+
+		"filename*=UTF-8''"+urlEncode(a.Filename))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	http.ServeContent(w, r, a.Filename, st.ModTime(), f)
 }
 
@@ -521,6 +615,29 @@ func nullable(s string) any {
 		return nil
 	}
 	return s
+}
+
+// asciiFallbackName 生成 Content-Disposition 里的 ASCII 文件名（非 ASCII 字符用 '_' 顶替，
+// 保留扩展名），供不支持 RFC 5987 filename* 的代理/客户端使用。
+func asciiFallbackName(name string) string {
+	if name == "" {
+		return "download"
+	}
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	var b strings.Builder
+	for _, r := range base {
+		if r < 0x20 || r > 0x7e || r == '"' || r == '\\' {
+			b.WriteByte('_')
+			continue
+		}
+		b.WriteRune(r)
+	}
+	out := strings.Trim(b.String(), "_")
+	if out == "" {
+		out = "report"
+	}
+	return out + ext
 }
 
 func urlEncode(s string) string {

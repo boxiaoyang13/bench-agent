@@ -383,6 +383,8 @@
     <div class="run-head-actions">
       <span class="status-pill" id="run-status">queued</span>
       <button class="btn danger sm" id="btn-cancel">取消</button>
+      <button class="btn ghost sm" id="btn-rerun-run" hidden>重测</button>
+      <button class="btn ghost sm" id="btn-delete-run" hidden>删除记录</button>
       <button class="btn ghost sm" id="btn-back-new">新建测试</button>
     </div>
   </div>
@@ -433,13 +435,20 @@
           <option value="">全部状态</option>
           <option>succeeded</option><option>partial</option><option>failed</option><option>canceled</option>
         </select>
+        <select id="h-capability">
+          <option value="">全部类型</option>
+          <option value="perf">性能压测</option><option value="eval">效果评测</option>
+          <option value="cache">缓存测试</option>
+        </select>
         <button class="btn ghost sm" id="btn-refresh">刷新</button>
+        <button class="btn danger sm" id="btn-delete-selected" hidden>删除选中</button>
       </div>
     </div>
     <table class="tbl" id="history-table">
       <thead><tr>
+        <th class="chk"><input type="checkbox" id="h-select-all" title="全选当前列表（仅终态记录可删）"></th>
         <th>创建时间</th><th>模型</th><th>类型</th><th>状态</th>
-        <th class="num">步数</th><th class="num">成功率</th><th>结论</th><th></th>
+        <th class="num">步数</th><th class="num">成功率</th><th>结论</th><th>操作</th>
       </tr></thead>
       <tbody></tbody>
     </table>

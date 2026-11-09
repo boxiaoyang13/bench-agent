@@ -238,8 +238,18 @@ details.advanced[open]{padding-bottom:14px}
 .artifact-list .size{margin-left:auto;color:var(--muted);font-size:12px}
 
 /* ---------- 历史 ---------- */
-.filters{display:flex;gap:8px}
+.filters{display:flex;gap:8px;flex-wrap:wrap}
 .filters select{width:auto}
+
+/* 历史记录：勾选列 + 行内操作列 */
+th.chk,td.chk{width:34px;text-align:center;padding-right:0}
+th.chk input,td.chk input{cursor:pointer;accent-color:var(--accent)}
+td.chk input:disabled{cursor:not-allowed;opacity:.4}
+#history-table tbody tr:has(.row-chk:checked){background:var(--accent-bg)}
+td.act{white-space:nowrap}
+td.act>*{margin-right:8px}
+td.act .btn.link{padding:0}
+td.act .btn.link.danger{color:var(--err)}
 
 /* ---------- 能力清单 ---------- */
 .tool-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}

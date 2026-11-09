@@ -149,13 +149,15 @@ make run   CONFIG=./config/thvv.dev.yaml     # http://127.0.0.1:18080/ui/
 | Target CRUD + `probe`（tokenizer 自适应推断、api_key 只写、AES-GCM 落库） | ✅ |
 | `POST /v1/runs` 单档 / 全档矩阵（并发裁剪、TPM 预算、早停、冷却） | ✅ |
 | 状态机 + 队列 + 同 target 串行 + 取消（SIGTERM 进程组） | ✅ |
+| 记录删除：`DELETE /v1/runs/{id}`（连产物目录一起删）+ `POST /v1/runs/purge`（批量，支持 dry_run） | ✅ |
+| 一键重测：`POST /v1/runs/{id}/rerun`（复用 target + plan + judge 凭据，新 run 标 `rerun_of`） | ✅ |
 | `GET /v1/runs/{id}` / `results` / `results/failures` / `artifacts` / `artifacts/{id}` | ✅ |
 | SSE 进度流（`Last-Event-ID` 断点续传 + 心跳） | ✅ |
 | 报告：HTML / 45 列 xlsx / 失败 CSV / SLA json | ✅ |
 | `capability=eval` 效果评测（17 数据集，Step=数据集，产物 eval_report_v2.html/CSV/JSON/tar.gz） | ✅ |
 | eval 分数验收 `eval-sla-v1`（对齐《效果验收标准.xlsx》，支持 `baseline_by` 按模型覆盖） | ✅ |
 | 缓存测试（lmcache bench multi-round-chat，`cache-sla-v1` 稳态 TTFT + 改善率验收，见 `docs/CACHE.md`） | ✅ |
-| Web 页面（登录、三步向导、运行监控、结果、历史、能力清单） | ✅ |
+| Web 页面（登录、三步向导、运行监控、结果、历史（勾选后批量删除 / 单条删除 / 重测）、能力清单） | ✅ |
 | 引擎：`builtin` 模拟 / `subprocess` evalscope | ✅（subprocess 已端到端联调，见下） |
 | `capability=functional` | ⏳ 预留（返回 `501 not_implemented` + `available_at`） |
 | `kind: http` 外部工具代理 | ⏳ v1.1 |

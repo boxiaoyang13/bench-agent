@@ -599,6 +599,54 @@ func (c *Config) setByPath(parts []string, val string) error {
 		if len(parts) >= 2 && parts[1] == "access_log" {
 			return setBool(&c.Observability.AccessLog)
 		}
+	case "store":
+		// store.sqlite.path —— 临时实例/联调时最常需要覆盖（否则会连到生产库）
+		if len(parts) >= 3 && parts[1] == "sqlite" {
+			switch parts[2] {
+			case "path":
+				c.Store.SQLite.Path = Path(val)
+				return nil
+			case "busy_timeout":
+				return setDur(&c.Store.SQLite.BusyTimeout)
+			case "max_open_conns":
+				return setInt(&c.Store.SQLite.MaxOpenConns)
+			case "wal":
+				return setBool(&c.Store.SQLite.WAL)
+			}
+		}
+	case "paths":
+		if len(parts) >= 2 {
+			switch parts[1] {
+			case "runs_dir":
+				c.Paths.RunsDir = Path(val)
+				return nil
+			case "logs_dir":
+				c.Paths.LogsDir = Path(val)
+				return nil
+			case "datasets_dir":
+				c.Paths.DatasetsDir = Path(val)
+				return nil
+			case "cache_dir":
+				c.Paths.CacheDir = Path(val)
+				return nil
+			case "templates_dir":
+				c.Paths.TemplatesDir = Path(val)
+				return nil
+			}
+		}
+	}
+	// server.ui.* 没有单独子 switch 便利，这里补上（开发时用磁盘上的 web/ 目录）
+	if len(parts) >= 3 && parts[0] == "server" && parts[1] == "ui" {
+		switch parts[2] {
+		case "dir":
+			c.Server.UI.Dir = val
+			return nil
+		case "path":
+			c.Server.UI.Path = val
+			return nil
+		case "enabled":
+			return setBool(&c.Server.UI.Enabled)
+		}
 	}
 	// 其余路径（引擎深层次字段）走 YAML 或 ${} 展开，不在环境变量里做
 	return nil

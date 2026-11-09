@@ -164,12 +164,49 @@ type CacheSteadyStats struct {
 	TTFTImprovement float64 `json:"ttft_improvement,omitempty"` // 1 - steady_p50 / first_mean
 }
 
-// JudgeSpec 是评测用 LLM Judge 的凭据（只在该 run 内存在，不落 Target）。
+// JudgeSpec 是 LLM Judge 的凭据与地址。
+//
+// 凭据规则与 Target.api_key 一致：**明文只在内存**。对外的 JSON 里永远只出现
+// `api_key_hint`（后 4 位掩码），落库走 runs.judge_key_enc 的 AES-GCM 密文列。
+// 因此 APIKey 标 `json:"-"`，进出 JSON 由本类型的 Marshal/Unmarshal 单独处理。
 type JudgeSpec struct {
 	Model   string `json:"model,omitempty"`
 	BaseURL string `json:"base_url,omitempty"`
-	APIKey  string `json:"api_key,omitempty"`
+
+	// APIKey 是明文，仅存在于进程内存（提交时 → 执行子进程）；永不落盘、永不回显。
+	APIKey string `json:"-"`
+	// APIKeyHint 是展示用掩码（••••••••abcd），可落盘、可回显。
+	APIKeyHint string `json:"api_key_hint,omitempty"`
 }
+
+// MarshalJSON 只输出非敏感字段（契约：响应体不含明文凭据）。
+func (j JudgeSpec) MarshalJSON() ([]byte, error) {
+	type out struct {
+		Model      string `json:"model,omitempty"`
+		BaseURL    string `json:"base_url,omitempty"`
+		APIKeyHint string `json:"api_key_hint,omitempty"`
+	}
+	return json.Marshal(out{Model: j.Model, BaseURL: j.BaseURL, APIKeyHint: j.APIKeyHint})
+}
+
+// UnmarshalJSON 接受请求里的 `api_key`（写入用），也兼容带 `api_key_hint` 的读回。
+func (j *JudgeSpec) UnmarshalJSON(b []byte) error {
+	var raw struct {
+		Model      string `json:"model,omitempty"`
+		BaseURL    string `json:"base_url,omitempty"`
+		APIKey     string `json:"api_key,omitempty"`
+		APIKeyHint string `json:"api_key_hint,omitempty"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	j.Model, j.BaseURL, j.APIKeyHint = raw.Model, raw.BaseURL, raw.APIKeyHint
+	j.APIKey = raw.APIKey
+	return nil
+}
+
+// HasKey 表示是否带可用凭据（明文或掩码二者之一即可表示已配置）。
+func (j *JudgeSpec) HasKey() bool { return j != nil && (j.APIKey != "" || j.APIKeyHint != "") }
 
 type RequestDefaults struct {
 	Temperature       any `json:"temperature,omitempty"`
@@ -516,10 +553,12 @@ type Run struct {
 	Engine     *EngineInfo       `json:"engine,omitempty"`
 	Error      *Problem          `json:"error"`
 	Labels     map[string]string `json:"labels,omitempty"`
-	CreatedAt  time.Time         `json:"created_at"`
-	StartedAt  *time.Time        `json:"started_at"`
-	FinishedAt *time.Time        `json:"finished_at"`
-	Links      map[string]string `json:"links,omitempty"`
+	// JudgeKeyEnc 是 judge 凭据的 AES-GCM 密文，只在库与内存间流转，永不序列化。
+	JudgeKeyEnc []byte            `json:"-"`
+	CreatedAt   time.Time         `json:"created_at"`
+	StartedAt   *time.Time        `json:"started_at"`
+	FinishedAt  *time.Time        `json:"finished_at"`
+	Links       map[string]string `json:"links,omitempty"`
 }
 
 // ---------------- Artifact ----------------

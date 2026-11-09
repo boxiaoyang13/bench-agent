@@ -94,6 +94,19 @@ func run() error {
 		return fmt.Errorf("初始化凭据加密失败: %w", err)
 	}
 
+	// 一次性清扫：早期版本把 plan.judge.api_key 明文落在 plan_json 里。
+	// 现在改成加密进 runs.judge_key_enc + 只回掩码，启动时把存量明文处理掉。
+	{
+		scrubCtx, scrubCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		n, err := st.ScrubLegacyJudgeKeys(scrubCtx, box.Encrypt, secret.Hint)
+		scrubCancel()
+		if err != nil {
+			logger.Warn("清扫历史 judge 明文凭据失败", "err", err)
+		} else if n > 0 {
+			logger.Info("已加密历史 judge 凭据", "runs", n)
+		}
+	}
+
 	reg := engine.NewRegistry(cfg)
 	mgr := runmgr.New(cfg, st, reg, box, logger)
 

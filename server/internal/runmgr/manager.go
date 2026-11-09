@@ -180,17 +180,29 @@ func (m *Manager) Submit(ctx context.Context, req SubmitRequest) (*domain.Run, e
 	}
 	plan.StepsTotal = len(steps)
 
+	// Judge 凭据：明文只内存（plan.Judge.APIKey，执行时进子进程），落库只存密文 + 掩码。
+	var judgeKeyEnc []byte
+	if plan.Judge != nil && plan.Judge.APIKey != "" {
+		enc, err := m.box.Encrypt(plan.Judge.APIKey)
+		if err != nil {
+			return nil, err
+		}
+		judgeKeyEnc = enc
+		plan.Judge.APIKeyHint = secret.Hint(plan.Judge.APIKey)
+	}
+
 	run := &domain.Run{
-		ID:         newID("run"),
-		Status:     domain.StatusQueued,
-		Tool:       req.Tool,
-		Capability: req.Capability,
-		Target:     req.Target.Snapshot(false),
-		Plan:       plan,
-		Gate:       req.Gate,
-		Report:     normalizeReport(req.ReportSpec, m.cfg),
-		Labels:     req.Labels,
-		CreatedAt:  time.Now().UTC(),
+		ID:          newID("run"),
+		Status:      domain.StatusQueued,
+		Tool:        req.Tool,
+		Capability:  req.Capability,
+		Target:      req.Target.Snapshot(false),
+		Plan:        plan,
+		Gate:        req.Gate,
+		Report:      normalizeReport(req.ReportSpec, m.cfg),
+		Labels:      req.Labels,
+		JudgeKeyEnc: judgeKeyEnc,
+		CreatedAt:   time.Now().UTC(),
 		Progress: domain.Progress{
 			Phase: string(domain.StatusQueued), StepsTotal: len(steps), Percent: 0,
 		},
@@ -299,6 +311,15 @@ func (m *Manager) Cancel(ctx context.Context, runID string) (*domain.Run, error)
 		now := time.Now().UTC()
 		_ = m.st.UpdateRun(ctx, runID, store.RunState{Status: domain.StatusCanceled, FinishedAt: &now})
 		m.emit(ctx, runID, EvFinished, map[string]any{"status": string(domain.StatusCanceled), "finished_at": now})
+		// 同步内存里的 liveRun，否则 worker 出队时看到旧状态，会把已取消的 run 跑起来。
+		if lr := m.liveRun(runID); lr != nil {
+			lr.mu.Lock()
+			lr.run.Status = domain.StatusCanceled
+			lr.run.FinishedAt = &now
+			lr.run.Progress.Phase = string(domain.StatusCanceled)
+			lr.run.Progress.Percent = 100
+			lr.mu.Unlock()
+		}
 	}
 	run.Status = domain.StatusCanceled
 	return run, nil
@@ -329,8 +350,36 @@ func (m *Manager) worker(ctx context.Context, id int) {
 		if ctx.Err() != nil {
 			return
 		}
+		// 排队期间可能已被取消（POST /cancel）：不要再去拉起引擎。
+		if lr := m.liveRun(runID); lr != nil {
+			lr.mu.Lock()
+			st := lr.run.Status
+			lr.mu.Unlock()
+			if st.Terminal() {
+				m.log.Info("run 在排队期间已终态，跳过执行", "run_id", runID, "status", st)
+				m.mu.Lock()
+				delete(m.live, runID)
+				m.mu.Unlock()
+				continue
+			}
+		}
 		m.execute(ctx, runID)
 	}
+}
+
+// skipIfDone 在 run 已进入终态时把它从活跃表移除并返回 true（不再拉起引擎）。
+func (m *Manager) skipIfDone(lr *liveRun, why string) bool {
+	lr.mu.Lock()
+	st := lr.run.Status
+	lr.mu.Unlock()
+	if !st.Terminal() {
+		return false
+	}
+	m.log.Info("run 已终态，跳过执行", "run_id", lr.run.ID, "status", st, "when", why)
+	m.mu.Lock()
+	delete(m.live, lr.run.ID)
+	m.mu.Unlock()
+	return true
 }
 
 func (m *Manager) execute(ctx context.Context, runID string) {
@@ -341,15 +390,11 @@ func (m *Manager) execute(ctx context.Context, runID string) {
 	}
 	run := lr.run
 
-	// 同一 target 串行
-	sem := m.targetSemaphore(run.Target.TargetID)
-	select {
-	case sem <- struct{}{}:
-		defer func() { <-sem }()
-	case <-ctx.Done():
+	if m.skipIfDone(lr, "排队前已终态") {
 		return
 	}
 
+	// 先登记 cancel（排队等信号量期间也能被 POST /cancel 立刻打断），再取 target 信号量
 	runCtx, cancel := context.WithTimeout(ctx, m.cfg.Limits.MaxRunDuration)
 	m.mu.Lock()
 	m.canc[runID] = cancel
@@ -360,6 +405,19 @@ func (m *Manager) execute(ctx context.Context, runID string) {
 		delete(m.canc, runID)
 		m.mu.Unlock()
 	}()
+
+	// 同一 target 串行
+	sem := m.targetSemaphore(run.Target.TargetID)
+	select {
+	case sem <- struct{}{}:
+		defer func() { <-sem }()
+	case <-runCtx.Done():
+		return
+	}
+	// 等同一个 target 的上一个 run 期间也可能被取消，必须再确认一次状态。
+	if m.skipIfDone(lr, "等信号量期间已终态") {
+		return
+	}
 
 	// 1) preparing
 	m.setStatus(runCtx, lr, domain.StatusPreparing)
@@ -383,6 +441,14 @@ func (m *Manager) execute(ctx context.Context, runID string) {
 		m.finish(runCtx, lr, domain.StatusFailed, domain.NewProblem(500, "internal_error", err.Error()))
 		return
 	}
+	// judge 凭据同样只在内存：提交时带明文，重启后从 judge_key_enc 解回来。
+	lr.mu.Lock()
+	if run.Plan.Judge != nil && run.Plan.Judge.APIKey == "" && len(run.JudgeKeyEnc) > 0 {
+		if k, derr := m.box.Decrypt(run.JudgeKeyEnc); derr == nil {
+			run.Plan.Judge.APIKey = k
+		}
+	}
+	lr.mu.Unlock()
 	spec := engine.Spec{
 		RunID:      runID,
 		Capability: run.Capability,
@@ -436,6 +502,7 @@ func (m *Manager) execute(ctx context.Context, runID string) {
 	}
 
 	// 3) 结果处理
+	secrets := []string{apiKey, judgeKeyOf(spec)}
 	switch {
 	case errors.Is(runErr, context.Canceled):
 		m.settleUnfinishedSteps(runCtx, lr)
@@ -446,25 +513,49 @@ func (m *Manager) execute(ctx context.Context, runID string) {
 	case errors.Is(runCtx.Err(), context.DeadlineExceeded):
 		m.settleUnfinishedSteps(runCtx, lr)
 		m.report(runCtx, lr, res)
-		m.finish(runCtx, lr, domain.StatusFailed, domain.NewProblem(504, "engine_timeout", "超过单次运行时长上限"))
+		head := fmt.Sprintf("超过单次运行时长上限 %s；%s", m.cfg.Limits.MaxRunDuration, progressHeadline(lr))
+		m.finish(runCtx, lr, domain.StatusFailed,
+			problemWithLog(504, "engine_timeout", head, res.LogPath, secrets...))
 		return
 	case runErr != nil:
 		m.settleUnfinishedSteps(runCtx, lr)
 		m.report(runCtx, lr, res)
-		m.finish(runCtx, lr, domain.StatusFailed, domain.NewProblem(500, "engine_failed", runErr.Error()))
+		head := fmt.Sprintf("引擎执行失败：%s；%s", sanitizeOneLine(runErr.Error()), progressHeadline(lr))
+		m.finish(runCtx, lr, domain.StatusFailed,
+			problemWithLog(500, "engine_failed", head, res.LogPath, secrets...))
 		return
 	}
 
+	// 引擎可能在取消后仍然“欢快”返回 nil（例如子进程已全部完成），别把 canceled 覆盖成 succeeded。
+	lr.mu.Lock()
+	canceledDuringRun := lr.run.Status == domain.StatusCanceled
+	lr.mu.Unlock()
+
 	m.report(runCtx, lr, res)
 	status := domain.StatusSucceeded
+	var failProb *domain.Problem
+	if canceledDuringRun {
+		status = domain.StatusCanceled
+	}
 	switch lr.run.Capability {
 	case domain.CapEval:
 		ok, total := evalSuccessCount(res.Eval)
 		switch {
+		case canceledDuringRun:
+			// 保留 canceled，不据数据集结果改写终态
 		case ok == 0 && total > 0:
 			status = domain.StatusFailed
+			head := evalFailureHeadline(res) + "；" + progressHeadline(lr)
+			failProb = problemWithLog(500, "eval_failed", head, res.LogPath, secrets...)
 		case ok < total:
 			status = domain.StatusPartial
+			// partial 不算失败，但要把没跑成的数据集标出来，便于只重跑这几项。
+			lr.mu.Lock()
+			if lr.run.Summary == nil {
+				lr.run.Summary = map[string]any{}
+			}
+			lr.run.Summary["failed_datasets"] = partialNotice(res)
+			lr.mu.Unlock()
 		}
 	case domain.CapCache:
 		// 全部请求失败 → failed；部分失败 → partial（gate 另行判定）
@@ -483,7 +574,15 @@ func (m *Manager) execute(ctx context.Context, runID string) {
 			status = domain.StatusPartial
 		}
 	}
-	m.finish(runCtx, lr, status, nil)
+	m.finish(runCtx, lr, status, failProb)
+}
+
+// judgeKeyOf 取 spec 里的 judge 明文（仅用于日志脱敏）。
+func judgeKeyOf(spec engine.Spec) string {
+	if spec.Plan.Judge == nil {
+		return ""
+	}
+	return spec.Plan.Judge.APIKey
 }
 
 // onEngineEvent 把引擎事件翻译成 run 事件并落库。
@@ -633,6 +732,21 @@ func (m *Manager) report(ctx context.Context, lr *liveRun, res engine.Result) {
 	}
 	summary := report.BuildSummary(steps, metrics, gate)
 
+	// 有档位全失败（成功率≈0）时，自己再探一次上游：evalscope 1.9.x 不落 error 列，
+	// 否则只能看到「成功率 0%」，看不出是 429/502/连接重置还是鉴权失败。
+	if apiKey, kerr := m.targetKey(ctx, lr.run); kerr == nil {
+		if m.maybeProbeUpstream(ctx, lr, apiKey) {
+			lr.mu.Lock()
+			if p, ok := lr.run.Summary["upstream_probe"]; ok {
+				summary["upstream_probe"] = p
+			}
+			if b, ok := lr.run.Summary["zero_success_buckets"]; ok {
+				summary["zero_success_buckets"] = b
+			}
+			lr.mu.Unlock()
+		}
+	}
+
 	lr.mu.Lock()
 	lr.run.GateResult = gate
 	lr.run.Summary = summary
@@ -663,17 +777,23 @@ func (m *Manager) report(ctx context.Context, lr *liveRun, res engine.Result) {
 	m.writeReportArtifacts(ctx, run, steps, metrics, gate, failures, formats)
 
 	// 原始 db 与日志（仅在首次跑完时归档）
+	// 注意：必须走 addArtifactFile 流式复制 —— perf 的 benchmark_data.db 常有几百 MB，
+	// 以前用 os.ReadFile 整个读进内存（既绕过了 artifact_max_bytes 上限，也容易 OOM）。
 	artDir := filepath.Join(string(m.cfg.Paths.RunsDir), run.ID, "artifacts")
 	for _, p := range res.DBPaths {
-		if b, err := os.ReadFile(p); err == nil {
-			m.addArtifact(ctx, run.ID, "benchmark_data.db", domain.ArtRawDB, "application/x-sqlite3", b, artDir)
+		if _, err := os.Stat(p); err == nil {
+			m.addArtifactFile(ctx, run.ID, engine.FileArtifact{
+				Kind: domain.ArtRawDB, Filename: "benchmark_data.db", Path: p,
+				ContentType: "application/x-sqlite3",
+			}, artDir)
 			break
 		}
 	}
 	if res.LogPath != "" {
-		if b, err := os.ReadFile(res.LogPath); err == nil {
-			m.addArtifact(ctx, run.ID, "run.log", domain.ArtRunLog, "text/plain; charset=utf-8", b, artDir)
-		}
+		m.addArtifactFile(ctx, run.ID, engine.FileArtifact{
+			Kind: domain.ArtRunLog, Filename: "run.log", Path: res.LogPath,
+			ContentType: "text/plain; charset=utf-8",
+		}, artDir)
 	}
 }
 
@@ -941,6 +1061,12 @@ func (m *Manager) finish(ctx context.Context, lr *liveRun, status domain.RunStat
 
 func (m *Manager) setStatus(ctx context.Context, lr *liveRun, st domain.RunStatus) {
 	lr.mu.Lock()
+	// 终态不可逆：公司内取消（queued→canceled）与引擎刚启动的 preparing 会抢跑，
+	// 这里兜底，避免把已取消的 run 又推回 running/succeeded。
+	if lr.run.Status.Terminal() && !st.Terminal() {
+		lr.mu.Unlock()
+		return
+	}
 	lr.run.Status = st
 	lr.run.Progress.Phase = string(st)
 	total := lr.run.Progress.StepsTotal

@@ -15,7 +15,7 @@
 | **执行一律异步** | `bench-all` 单次可能跑数小时（1m 档 + 120s 档间冷却），`POST /v1/runs` 立即返回 `run_id`，进度用 SSE |
 | **能力（capability）与工具（tool）解耦** | 协议只认 `tool` + `capability` + `plan`，`thvv` 是第一个工具，后续接入其他工具/自研引擎不需要改协议 |
 | **预留但不空转** | `eval` / `functional` 的端点、状态机、结果结构现在就有，未实现的返回 `501 not_implemented` + `available_at` 提示 |
-| **凭据只进不出** | `api_key` 写入后只回 `api_key_hint`（后 4 位），任何 GET 响应体与日志中不出现明文 |
+| **凭据只进不出** | `api_key`（target 与 `plan.judge`）写入后只回 `api_key_hint`（后 4 位），任何 GET 响应体与日志中不出现明文 |
 | **结果与协议解耦** | 结构化指标走 `/results`（JSON），交付物走 `/artifacts`（HTML/xlsx/CSV 下载），两者都从 `benchmark_data.db` 派生 |
 | **幂等** | `POST /v1/runs`、`POST /v1/targets` 支持 `Idempotency-Key`，24h 内重放返回原对象 |
 
@@ -98,7 +98,8 @@ Authorization: Bearer <api_token>
 | `quota_exceeded` | 429 | ✅ | 服务端并发 run 超限，响应含 `Retry-After` |
 | `upstream_rate_limited` | 429 | ✅ | 被测端 429（不视为 run 失败，计入成功率） |
 | `engine_failed` | 500 | ✅ | 引擎进程退出码非 0 |
-| `engine_timeout` | 504 | ✅ | 引擎整体超时 |
+| `eval_failed` | 500 | ✅ | eval 全部数据集失败（无非空样本 / 无报告），`detail` 含失败数据集与日志摘要 |
+| `engine_timeout` | 504 | ✅ | 引擎整体超时（`detail` 含已完成步数、当前档位/数据集、日志摘要） |
 | `internal_error` | 500 | ✅ | 其他 |
 
 > `Retry-After` 单位秒。所有 429/500/504 都会带。
@@ -468,6 +469,9 @@ Catalog (buckets / datasets / suites, 只读)
 - `limit`：每数据集条数，0 = 全量（若数据集配置了 `default_limit` 则用它）。
 - `repeats` / `eval_batch_size`：0 = 数据集默认；上限 50 / 256。
 - `judge`：所选数据集含 `needs_judge=true`（hle / simple_qa）时 `api_key` 必填，否则 400。
+  `api_key` 是**只写字段**：落库走 AES-GCM 密文（`runs.judge_key_enc`），任何 GET/SSE 响应只回
+  `api_key_hint`（如 `••••••••-7e0`），`model` / `base_url` 照常回显。未配置时由服务端
+  `engines.<tool>.capabilities.eval.judge` 补齐。
 - `provider_name`：缺省取 target.vendor，再缺省 `unknown`。
 - **Step = 数据集**：`steps_total = len(datasets)`，一个数据集一个子进程。
 - 结果在 `GET /v1/runs/{id}/results` 的 `eval` 字段（见 §5.9）；`metrics` 为空。
@@ -524,6 +528,26 @@ Catalog (buckets / datasets / suites, 只读)
 }
 ```
 
+`error` 非空即代表失败终态（`status=failed`），且**不必翻 run.log 就能定位原因**：
+`detail` 里带「失败范围 + 引擎日志摘要」。示例：
+
+```json
+// eval 全部数据集失败（例如端点不支持多模态、鉴权失败）
+"error": {
+  "type": "https://thvv.dev/errors/eval_failed", "status": 500, "code": "eval_failed",
+  "detail": "2/2 个数据集评测失败（aime26、gpqa_diamond），没有产出有效样本或报告；已完成 2/2 步\n日志摘要：HTTP 400：model is not a multimodal model ×5706 次；ignore_errors 容错跳过 951 条样本"
+}
+
+// 超过单次运行时长上限
+"error": {
+  "type": "https://thvv.dev/errors/engine_timeout", "status": 504, "code": "engine_timeout",
+  "detail": "超过单次运行时长上限 12h0m0s；已完成 4/15 步，当前 mmlu_pro（并发 30）"
+}
+```
+
+- `detail` 已脱敏（target/judge 的 key 一律 `***`）、压成单行并截断到 1.6KB
+- `status=partial` 不算失败（`error=null`），失败的数据集名单在 `summary.failed_datasets`
+
 > `steps[]` 仅在 `include=steps` 查询参数下返回（`GET /v1/runs/{id}?include=steps`），默认省略以免响应过大。
 
 ### 5.6 状态机
@@ -562,6 +586,54 @@ queued ──► preparing ──► running ──► reporting ──► succe
 `202 Accepted` → `{"run_id":"...","status":"canceled","canceled_at":"..."}`
 
 语义：幂等；对终态 run 调用返回 `200` + 当前状态（不报错）。实现上对引擎进程发 `SIGTERM`，10s 后 `SIGKILL`，并保留已产出的 step 结果（可对 `partial` run 生成报告）。
+
+### 5.8.1 `DELETE /v1/runs/{run_id}` — 删除一条记录
+
+- 仅 `operator`/`admin`（写操作）。
+- 只能删**终态** run（`succeeded` / `partial` / `failed` / `canceled`）；仍在排队/运行的返回
+  `409 conflict`，提示先取消。
+- 删除范围：`runs` / `steps` / `artifacts` / `run_events` 四张表 + 磁盘上的
+  `runs/<run_id>/`（含 HTML/xlsx/CSV/原始 `benchmark_data.db`/`run.log`）。
+- 响应：`204 No Content`；不存在 → `404 not_found`。不可恢复（审计日志里留一条 `run.delete`）。
+
+### 5.8.2 `POST /v1/runs/{run_id}/rerun` — 一键重测
+
+用原记录的 **target + capability + plan + gate + report** 新建一个 run（原记录保留）：
+
+- 响应 `202 Accepted`，body 是**新** run 对象；新 run 的 `labels.rerun_of` = 原 run_id
+- 只允许对终态 run 重测（运行中 → `400 validation_failed`，提示先取消）
+- `target` 已被删除 → `400`（detail 说明「原端点已被删除」）
+- 内联 target（`target.ephemeral=true`，凭据未持久化）→ `409 conflict`
+- `plan.judge.api_key` 从 `runs.judge_key_enc` 解回明文后重新加密落到新 run，响应里仍只有 `api_key_hint`
+- 审计留 `run.rerun`（detail=`from=<原 run_id>`）
+
+### 5.8.3 `POST /v1/runs/purge` — 批量清理
+
+```json
+{ "run_ids": ["run_...","run_..."], "dry_run": false }
+```
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `run_ids` | 空 | **勾选删除**：显式指定要删的 run；给出时忽略 `statuses/capability/before`，不存在的 id 忽略，运行中的计入 `skipped_active` |
+| `statuses` | `["failed","canceled"]` | 只允许终态；非终态 → `400 validation_failed` |
+| `capability` | 空 | `perf` / `eval` / `cache` 过滤 |
+| `before` | 空 | 只删该时间（RFC3339，按 `created_at`）之前的记录 |
+| `dry_run` | `false` | `true` 时只返回将命中的 `run_ids`，不真删 |
+
+响应：
+
+```json
+{ "deleted": 12, "dry_run": false, "run_ids": ["run_..."], "skipped_active": 0 }
+```
+
+Web 界面「历史记录」页的入口：
+
+- **勾选删除**：行首复选框（表头可全选当前列表，运行中的行禁用）→ 工具栏出现
+  「删除选中 (N)」→ 确认后调 `POST /v1/runs/purge {run_ids:[...]}`
+- 行内「删除」按钮：单条 `DELETE /v1/runs/{id}`
+
+> 按状态批量删（`statuses` + `dry_run`）只保留在 API 侧给自动化/运维用，Web 界面不提供入口。
 
 ### 5.9 `GET /v1/runs/{run_id}/results` — 结构化指标
 

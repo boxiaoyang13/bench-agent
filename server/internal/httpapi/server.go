@@ -74,6 +74,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET "+bp+"/runs", s.handleListRuns)
 	mux.HandleFunc("GET "+bp+"/runs/{run_id}", s.handleGetRun)
 	mux.HandleFunc("POST "+bp+"/runs/{run_id}/cancel", s.handleCancelRun)
+	mux.HandleFunc("DELETE "+bp+"/runs/{run_id}", s.handleDeleteRun)
+	mux.HandleFunc("POST "+bp+"/runs/{run_id}/rerun", s.handleRerunRun)
+	mux.HandleFunc("POST "+bp+"/runs/purge", s.handlePurgeRuns)
 	mux.HandleFunc("GET "+bp+"/runs/{run_id}/events", s.handleRunEvents)
 	mux.HandleFunc("GET "+bp+"/runs/{run_id}/results", s.handleRunResults)
 	mux.HandleFunc("GET "+bp+"/runs/{run_id}/results/failures", s.handleRunFailures)
@@ -374,6 +377,8 @@ func errProblem(err error) *domain.Problem {
 		p := domain.NewProblem(429, "quota_exceeded", "服务端并发/队列已满，请稍后重试")
 		p.Retryable = true
 		return p
+	case errors.Is(err, runmgr.ErrEphemeralRerun):
+		return domain.NewProblem(409, "conflict", err.Error())
 	}
 	return domain.NewProblem(500, "internal_error", fmt.Sprintf("%v", err))
 }

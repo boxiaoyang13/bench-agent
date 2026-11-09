@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -186,6 +187,9 @@ func TestEnvOverrides(t *testing.T) {
 	t.Setenv("THVV_LIMITS__MAX_CONCURRENT_RUNS", "7")
 	t.Setenv("THVV_SERVER__LISTEN", "0.0.0.0:9999")
 	t.Setenv("THVV_OBSERVABILITY__LOG_LEVEL", "debug")
+	t.Setenv("THVV_STORE__SQLITE__PATH", "/tmp/alt-thvv.db")
+	t.Setenv("THVV_PATHS__RUNS_DIR", "/tmp/alt-runs")
+	t.Setenv("THVV_SERVER__UI__DIR", "../web")
 
 	cfg, err := Load(LoadOptions{Path: p})
 	if err != nil {
@@ -199,6 +203,17 @@ func TestEnvOverrides(t *testing.T) {
 	}
 	if cfg.Observability.LogLevel != "debug" {
 		t.Fatalf("log_level 覆盖失败: %s", cfg.Observability.LogLevel)
+	}
+	// 临时实例隔离用：库路径 / runs 目录 / 磁盘 UI 必须能覆盖（否则误连生产库）
+	if got := string(cfg.Store.SQLite.Path); got != "/tmp/alt-thvv.db" {
+		t.Fatalf("store.sqlite.path 覆盖失败: %s", got)
+	}
+	if got := string(cfg.Paths.RunsDir); got != "/tmp/alt-runs" {
+		t.Fatalf("paths.runs_dir 覆盖失败: %s", got)
+	}
+	// ui.dir 会按配置文件目录解析成绝对路径，这里只验证「覆盖生效」
+	if !strings.HasSuffix(cfg.Server.UI.Dir, "web") {
+		t.Fatalf("server.ui.dir 覆盖失败: %s", cfg.Server.UI.Dir)
 	}
 }
 

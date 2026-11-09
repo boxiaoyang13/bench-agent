@@ -364,8 +364,11 @@ gates:
    `swebench`/`ms-enclave`；未安装时该 Step 失败并把 `run_eval.py` 的报错原样留下。
 2. **多模态数据集**（MSR-VTT 等）默认关思考、`max_tokens=8192`，由 `run_eval.py` 决定；
    视频文件缺失会失败，错误同样落在日志与 artifacts。
-3. **Judge**：`hle`/`simple_qa` 必须提供 judge key；key 只存在 Run plan 中，
-   不落 Target、不写日志（日志里已脱敏），但会随 `metrics.json` 之外的内存结构传递。
+3. **Judge**：`hle`/`simple_qa` 必须提供 judge key；key 只存在 Run plan 中的内存明文，
+   落库走 AES-GCM（`runs.judge_key_enc`），任何响应/SSE 只回 `api_key_hint`（后 4 位），
+   日志里已脱敏；启动时会清扫早期版本遗留的 `plan_json` 明文（见 store.ScrubLegacyJudgeKeys）。
+   数据集本身不支持多模态时（如 `hallusion_bench` 配纯文本模型），全部样本会 400 被静默跳过，
+   最终 `status=failed` + `error.code=eval_failed`，`detail` 里会点名数据集与 HTTP 错误。
 4. **分数口径**：直接采信 `eval_summary.json.score`；
 5. **分数验收**：`eval-sla-v1` 默认模板按《效果验收标准.xlsx》的 glm-5.3 基线 -4% 设下限，见 §9.1；同一个数据集多 repeats 的聚合由
    Python 侧负责，Go 不再二次计算。

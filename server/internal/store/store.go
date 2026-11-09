@@ -27,7 +27,8 @@ type Store struct {
 
 // Open 打开（并初始化）SQLite 库。
 func Open(path string, busyTimeout time.Duration, maxConns int) (*Store, error) {
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(%d)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)",
+	// secure_delete：库里有（加密后的）凭据与请求体，删除/更新后的旧页不允许留在文件里。
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(%d)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=secure_delete(1)",
 		path, busyTimeout.Milliseconds())
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -78,6 +79,7 @@ func (s *Store) migrate() error {
 			target_id TEXT,
 			target_json TEXT NOT NULL,
 			plan_json TEXT NOT NULL,
+			judge_key_enc BLOB,
 			gate_json TEXT,
 			report_json TEXT,
 			status TEXT NOT NULL,
@@ -150,6 +152,22 @@ func (s *Store) migrate() error {
 		if _, err := s.db.Exec(q); err != nil {
 			return fmt.Errorf("migrate: %w\nSQL: %s", err, q)
 		}
+	}
+	// 旧库补列：judge 凭据密文（v1 曾把明文写进 plan_json.judge.api_key）。
+	if err := s.addColumnIfMissing("runs", "judge_key_enc", "BLOB"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// addColumnIfMissing 补列（SQLite 不支持 ADD COLUMN IF NOT EXISTS）。
+func (s *Store) addColumnIfMissing(table, column, typ string) error {
+	q := "ALTER TABLE " + table + " ADD COLUMN " + column + " " + typ
+	if _, err := s.db.Exec(q); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			return nil
+		}
+		return fmt.Errorf("migrate %s.%s: %w", table, column, err)
 	}
 	return nil
 }
@@ -282,10 +300,10 @@ func scanTarget(sc scanner) (*domain.Target, error) {
 
 func (s *Store) CreateRun(ctx context.Context, r *domain.Run, createdBy, idemKey string) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO runs
-		(run_id,tool,capability,target_id,target_json,plan_json,gate_json,report_json,status,steps_total,steps_done,
-		 labels_json,target_vendor,target_model,created_by,idempotency_key,created_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		r.ID, r.Tool, string(r.Capability), r.Target.TargetID, jsonOf(r.Target), jsonOf(r.Plan),
+		(run_id,tool,capability,target_id,target_json,plan_json,judge_key_enc,gate_json,report_json,status,
+		 steps_total,steps_done,labels_json,target_vendor,target_model,created_by,idempotency_key,created_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.ID, r.Tool, string(r.Capability), r.Target.TargetID, jsonOf(r.Target), jsonOf(r.Plan), r.JudgeKeyEnc,
 		jsonOf(r.Gate), jsonOf(r.Report), string(r.Status), r.Progress.StepsTotal, r.Progress.StepsDone,
 		jsonOf(r.Labels), r.Target.Vendor, r.Target.Model, createdBy, nullIfEmpty(idemKey), ts(r.CreatedAt))
 	if err != nil && strings.Contains(err.Error(), "UNIQUE") {
@@ -326,14 +344,14 @@ func (s *Store) UpdateRun(ctx context.Context, runID string, st RunState) error 
 func (s *Store) GetRun(ctx context.Context, runID string) (*domain.Run, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT run_id,tool,capability,target_json,plan_json,gate_json,report_json,
 		status,steps_total,steps_done,gate_result_json,summary_json,error_json,engine_json,labels_json,
-		created_at,started_at,finished_at FROM runs WHERE run_id=?`, runID)
+		created_at,started_at,finished_at,judge_key_enc FROM runs WHERE run_id=?`, runID)
 	return scanRun(row)
 }
 
 func (s *Store) GetRunByIdempotencyKey(ctx context.Context, key string) (*domain.Run, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT run_id,tool,capability,target_json,plan_json,gate_json,report_json,
 		status,steps_total,steps_done,gate_result_json,summary_json,error_json,engine_json,labels_json,
-		created_at,started_at,finished_at FROM runs WHERE idempotency_key=?`, key)
+		created_at,started_at,finished_at,judge_key_enc FROM runs WHERE idempotency_key=?`, key)
 	return scanRun(row)
 }
 
@@ -391,7 +409,7 @@ func (s *Store) ListRuns(ctx context.Context, f RunFilter) ([]*domain.Run, strin
 		}
 	}
 	q := `SELECT run_id,tool,capability,target_json,plan_json,gate_json,report_json,status,steps_total,steps_done,
-		gate_result_json,summary_json,error_json,engine_json,labels_json,created_at,started_at,finished_at FROM runs`
+		gate_result_json,summary_json,error_json,engine_json,labels_json,created_at,started_at,finished_at,judge_key_enc FROM runs`
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
@@ -431,7 +449,7 @@ func scanRun(sc scanner) (*domain.Run, error) {
 	var startedAt, finishedAt sql.NullString
 	err := sc.Scan(&r.ID, &r.Tool, &capability, &targetJSON, &planJSON, &gateJSON, &reportJSON, &status,
 		&r.Progress.StepsTotal, &r.Progress.StepsDone, &gateResJSON, &summaryJSON, &errJSON,
-		&engineJSON, &labelsJSON, &createdAt, &startedAt, &finishedAt)
+		&engineJSON, &labelsJSON, &createdAt, &startedAt, &finishedAt, &r.JudgeKeyEnc)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -580,6 +598,134 @@ func (s *Store) GetArtifact(ctx context.Context, id string) (*domain.Artifact, s
 	a.CreatedAt = parseTS(createdAt)
 	a.DownloadURL = "/v1/artifacts/" + a.ID
 	return &a, runID, nil
+}
+
+// ---------------- 凭据清扫 ----------------
+
+// ScrubLegacyJudgeKeys 清理历史遗留的明文 judge 凭据。
+//
+// v1 早期版本把 plan.judge.api_key 明文写进了 runs.plan_json，并由 GET /v1/runs
+// 原样回显。现在 judge 凭据只允许以密文存在于 runs.judge_key_enc，因此启动时
+// 做一次一次性清扫：把明文加密进新列、重写 plan_json（只留 api_key_hint），
+// 并把 run_events 里快照中的明文一并抹掉。返回处理过的 run 数。
+func (s *Store) ScrubLegacyJudgeKeys(ctx context.Context, encrypt func(string) ([]byte, error), hint func(string) string) (int, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT run_id, plan_json FROM runs WHERE plan_json LIKE '%"judge"%'`)
+	if err != nil {
+		return 0, err
+	}
+	type legacyRun struct{ id, plan string }
+	var todo []legacyRun
+	for rows.Next() {
+		var lr legacyRun
+		if err := rows.Scan(&lr.id, &lr.plan); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		todo = append(todo, lr)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	n := 0
+	for _, lr := range todo {
+		var p domain.Plan
+		if err := json.Unmarshal([]byte(lr.plan), &p); err != nil || p.Judge == nil || p.Judge.APIKey == "" {
+			continue
+		}
+		plain := p.Judge.APIKey
+		enc, err := encrypt(plain)
+		if err != nil {
+			return n, err
+		}
+		p.Judge.APIKey = "" // MarshalJSON 本就不会输出，这里显式清掉避免内存残留
+		if p.Judge.APIKeyHint == "" {
+			p.Judge.APIKeyHint = hint(plain)
+		}
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE runs SET plan_json=?, judge_key_enc=? WHERE run_id=?`,
+			jsonOf(p), enc, lr.id); err != nil {
+			return n, err
+		}
+		// SSE 回放快照里也可能留了明文
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE run_events SET data_json=replace(data_json, ?, '***') WHERE run_id=? AND data_json LIKE ?`,
+			plain, lr.id, "%"+plain+"%"); err != nil {
+			return n, err
+		}
+		n++
+	}
+	if n > 0 {
+		// 被覆盖的旧页会留在 WAL / page freeblock 里：checkpoint + VACUUM 把含明文的旧页真正丢掉。
+		if _, err := s.db.ExecContext(ctx, `PRAGMA secure_delete=ON`); err != nil {
+			return n, err
+		}
+		if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+			return n, err
+		}
+		if _, err := s.db.ExecContext(ctx, `VACUUM`); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
+}
+
+// ---------------- 删除 run ----------------
+
+// DeleteRun 硬删除一条 run 及其 steps / artifacts / events。
+// 产物文件在 runs/<id>/ 下的清理由 runmgr 负责（store 不碰文件系统）。
+func (s *Store) DeleteRun(ctx context.Context, runID string) error {
+	// 并发删除（批量清理 + 其他 run 正在写库）会短时拿到 SQLITE_BUSY，重试几次再报错。
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		if err = s.deleteRunOnce(ctx, runID); !isBusy(err) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(time.Duration(20*(attempt+1)) * time.Millisecond):
+		}
+	}
+	return err
+}
+
+func isBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "sqlite_busy") || strings.Contains(s, "database is locked")
+}
+
+func (s *Store) deleteRunOnce(ctx context.Context, runID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// 先确认存在（避免静默成功）
+	var one int
+	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM runs WHERE run_id=?`, runID).Scan(&one); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	for _, q := range []string{
+		`DELETE FROM steps WHERE run_id=?`,
+		`DELETE FROM artifacts WHERE run_id=?`,
+		`DELETE FROM run_events WHERE run_id=?`,
+		`DELETE FROM runs WHERE run_id=?`,
+	} {
+		if _, err := tx.ExecContext(ctx, q, runID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // ---------------- Events ----------------

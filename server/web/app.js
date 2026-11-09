@@ -27,6 +27,7 @@ const state = {
   run: null,
   unsub: null,
   historyCursor: null,
+  historySelected: new Set(),  // 历史页勾选中的 run_id（仅终态可删）
 };
 
 /* ---------------------------------------------------------------- 工具 */
@@ -71,6 +72,58 @@ function toast(msg, kind = '') {
   $('#toasts').appendChild(el);
   setTimeout(() => el.remove(), kind === 'err' ? 7000 : 3600);
 }
+
+
+/* ---------------------------------------------------------------- 产物下载
+ * 不用 <a download href>：走 proxy / 隧道时相对路径、cookie 与 Content-Disposition
+ * 都可能出问题，且失败时浏览器只给一句「下载失败」，拿不到原因。
+ * 这里统一用 fetch（与会话同源，自动带 cookie），非 2xx 时把 problem+json 的
+ * detail 直接弹出来，便于定位。
+ */
+async function downloadArtifact(url, filename, size) {
+  const full = url.startsWith('/') ? url : API_BASE + url;
+  // 大文件（原始 db 动辄上百 MB）交给浏览器原生下载：流式落盘，不吃内存、可断点续传
+  if (size > 32 * 1024 * 1024) {
+    const a = document.createElement('a');
+    a.href = full;
+    a.download = filename || '';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    return;
+  }
+  try {
+    const res = await fetch(full, { credentials: 'same-origin' });
+    if (!res.ok) {
+      let detail = `HTTP ${res.status}`;
+      try {
+        const p = await res.json();
+        detail = p.detail || p.title || detail;
+      } catch { /* 非 JSON 响应 */ }
+      toast(`下载失败：${detail}`, 'err');
+      return;
+    }
+    const blob = await res.blob();
+    if (!blob.size) { toast('下载失败：文件为空（产物可能已被清理）', 'err'); return; }
+    const a = document.createElement('a');
+    const href = URL.createObjectURL(blob);
+    a.href = href;
+    a.download = filename || 'download';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(href), 4000);
+  } catch (err) {
+    toast(`下载失败：${err.message || err}`, 'err');
+  }
+}
+
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-dl]');
+  if (!btn) return;
+  e.preventDefault();
+  downloadArtifact(btn.dataset.dl, btn.dataset.name, Number(btn.dataset.size) || 0);
+});
 
 /* ---------------------------------------------------------------- API */
 class ApiError extends Error {
@@ -952,6 +1005,10 @@ function renderRun(run) {
   pill.textContent = statusText(run.status);
   pill.className = 'status-pill ' + run.status;
   $('#btn-cancel').disabled = TERMINAL.includes(run.status);
+  const delBtn = $('#btn-delete-run');
+  if (delBtn) delBtn.hidden = !TERMINAL.includes(run.status);
+  const rerunBtn = $('#btn-rerun-run');
+  if (rerunBtn) rerunBtn.hidden = !TERMINAL.includes(run.status);
 
   const p = run.progress || {};
   const total = p.steps_total || run.plan?.steps_total || 0;
@@ -1144,6 +1201,16 @@ $('#btn-cancel')?.addEventListener('click', async () => {
 
 $('#btn-back-new')?.addEventListener('click', () => { state.step = 1; location.hash = '#/new'; });
 
+$('#btn-delete-run')?.addEventListener('click', () => {
+  if (!state.run) return;
+  deleteRun(state.run.run_id, `${state.run.target?.model || ''} ${state.run.run_id}`);
+});
+
+$('#btn-rerun-run')?.addEventListener('click', () => {
+  if (!state.run) return;
+  rerunRun(state.run.run_id, `${state.run.target?.model || ''} ${state.run.run_id}`);
+});
+
 // 从导航进入「新建测试」时回到第一步
 $('#nav')?.addEventListener('click', e => {
   if (e.target.closest('a')?.dataset.route === 'new') state.step = 1;
@@ -1212,7 +1279,7 @@ function renderResults(results, artifacts) {
       <span class="kind">${esc(a.kind)}</span>
       <span class="name">${esc(a.filename)}</span>
       <span class="size">${fmtBytes(a.size_bytes)}</span>
-      <a class="btn sm ghost" href="${esc(a.download_url)}" download>下载</a>
+      <button class="btn sm ghost" data-dl="${esc(a.download_url)}" data-name="${esc(a.filename)}" data-size="${a.size_bytes || 0}">下载</button>
     </li>`).join('') : '<li class="muted">暂无产物</li>';
 }
 
@@ -1278,7 +1345,7 @@ function renderCacheResults(results, artifacts) {
       <span class="kind">${esc(a.kind)}</span>
       <span class="name">${esc(a.filename)}</span>
       <span class="size">${fmtBytes(a.size_bytes)}</span>
-      <a class="btn sm ghost" href="${esc(a.download_url)}" download>下载</a>
+      <button class="btn sm ghost" data-dl="${esc(a.download_url)}" data-name="${esc(a.filename)}" data-size="${a.size_bytes || 0}">下载</button>
     </li>`).join('') : '<li class="muted">暂无产物</li>';
 }
 
@@ -1351,7 +1418,7 @@ function renderEvalResults(results, artifacts) {
       <span class="kind">${esc(a.kind)}</span>
       <span class="name">${esc(a.filename)}</span>
       <span class="size">${fmtBytes(a.size_bytes)}</span>
-      <a class="btn sm ghost" href="${esc(a.download_url)}" download>下载</a>
+      <button class="btn sm ghost" data-dl="${esc(a.download_url)}" data-name="${esc(a.filename)}" data-size="${a.size_bytes || 0}">下载</button>
     </li>`).join('') : '<li class="muted">暂无产物</li>';
 }
 
@@ -1359,11 +1426,17 @@ function renderEvalResults(results, artifacts) {
  * 历史
  * ============================================================== */
 async function loadHistory(reset) {
-  if (reset) { state.historyCursor = null; $('#history-table tbody').innerHTML = ''; }
+  if (reset) {
+    state.historyCursor = null;
+    state.historySelected.clear();
+    $('#history-table tbody').innerHTML = '';
+  }
   const params = new URLSearchParams({ limit: '20' });
   if (state.historyCursor) params.set('cursor', state.historyCursor);
   const st = $('#h-status').value;
   if (st) params.set('status', st);
+  const cap = $('#h-capability')?.value;
+  if (cap) params.set('capability', cap);
   try {
     const res = await api('GET', '/runs?' + params);
     state.historyCursor = res.next_cursor;
@@ -1383,7 +1456,11 @@ async function loadHistory(reset) {
       } else if (g) {
         verdict = g.passed ? '<span class="badge ok">通过</span>' : '<span class="badge err">未达标</span>';
       }
-      return `<tr>
+      const terminal = TERMINAL.includes(r.status);
+      const checked = state.historySelected.has(r.run_id) ? 'checked' : '';
+      return `<tr data-row="${esc(r.run_id)}">
+        <td class="chk"><input type="checkbox" class="row-chk" data-id="${esc(r.run_id)}" ${checked}
+          ${terminal ? '' : 'disabled title="运行中的任务不能删除"'}></td>
         <td class="muted">${new Date(r.created_at).toLocaleString()}</td>
         <td><b>${esc(r.target?.model || '—')}</b><br><span class="hint">${esc(r.target?.vendor || '')}</span></td>
         <td>${r.capability === 'perf' ? '性能压测' : r.capability === 'eval' ? '效果评测' : r.capability === 'cache' ? '缓存测试' : '功能测试'}</td>
@@ -1396,15 +1473,107 @@ async function loadHistory(reset) {
               : r.summary?.ttft_improvement != null ? '改善 ' + fmtPct(r.summary.ttft_improvement) : '—')
             : (r.summary?.success_rate != null ? fmtPct(r.summary.success_rate) : '—')}</td>
         <td>${verdict}</td>
-        <td><a href="#/run/${esc(r.run_id)}">查看</a></td>
+        <td class="act">
+          <a href="#/run/${esc(r.run_id)}">查看</a>
+          ${TERMINAL.includes(r.status)
+            ? `<button class="btn link" data-rerun="${esc(r.run_id)}" title="用相同端点与参数再跑一遍">重测</button>
+               <button class="btn link danger" data-del="${esc(r.run_id)}" data-label="${esc(r.target?.model || '')} ${esc(r.created_at)}">删除</button>`
+            : `<span class="hint" title="运行中的任务请先取消">运行中</span>`}
+        </td>
       </tr>`;
     }).join('');
-    $('#history-table tbody').insertAdjacentHTML('beforeend', rows || '<tr><td colspan="8" class="muted">暂无记录</td></tr>');
+    $('#history-table tbody').insertAdjacentHTML('beforeend', rows || '<tr><td colspan="9" class="muted">暂无记录</td></tr>');
+    syncHistorySelection();
   } catch (err) { toast(err.message, 'err'); }
 }
 
+// 单条删除（历史列表 + 详情页共用）
+async function deleteRun(runId, label) {
+  if (!confirm(`确定删除这条记录？\n\n${label || runId}\n\n会同时删除它的步骤、事件与已归档产物（HTML/xlsx/CSV/原始 db），不可恢复。`)) return;
+  try {
+    await api('DELETE', `/runs/${runId}`);
+    toast('已删除');
+    if (state.run?.run_id === runId) { state.run = null; location.hash = '#/history'; }
+    else loadHistory(true);
+  } catch (err) { toast(err.message, 'err'); }
+}
+
+// ---- 勾选批量删除 ----
+function syncHistorySelection() {
+  const boxes = Array.from(document.querySelectorAll('#history-table .row-chk'));
+  const all = boxes.filter(b => !b.disabled);
+  const picked = all.filter(b => b.checked).length;
+  const master = $('#h-select-all');
+  if (master) {
+    master.checked = all.length > 0 && picked === all.length;
+    master.indeterminate = picked > 0 && picked < all.length;
+    master.disabled = all.length === 0;
+  }
+  const btn = $('#btn-delete-selected');
+  if (btn) {
+    btn.hidden = state.historySelected.size === 0;
+    btn.textContent = `删除选中 (${state.historySelected.size})`;
+  }
+}
+
+$('#history-table')?.addEventListener('change', (e) => {
+  const box = e.target.closest('.row-chk');
+  if (!box) return;
+  if (box.checked) state.historySelected.add(box.dataset.id);
+  else state.historySelected.delete(box.dataset.id);
+  syncHistorySelection();
+});
+
+$('#h-select-all')?.addEventListener('change', (e) => {
+  const on = e.target.checked;
+  document.querySelectorAll('#history-table .row-chk').forEach(box => {
+    if (box.disabled) return;
+    box.checked = on;
+    if (on) state.historySelected.add(box.dataset.id);
+    else state.historySelected.delete(box.dataset.id);
+  });
+  syncHistorySelection();
+});
+
+$('#btn-delete-selected')?.addEventListener('click', async () => {
+  const ids = Array.from(state.historySelected);
+  if (!ids.length) return;
+  if (!confirm(`确定删除勾选的 ${ids.length} 条记录？\n\n会同时删除它们的步骤、事件与已归档产物（HTML/xlsx/CSV/原始 db），不可恢复。`)) return;
+  try {
+    const res = await api('POST', '/runs/purge', { run_ids: ids });
+    const skipped = res.skipped_active ? `，${res.skipped_active} 条运行中已跳过` : '';
+    toast(`已删除 ${res.deleted} 条记录${skipped}`);
+    state.historySelected.clear();
+    loadHistory(true);
+  } catch (err) { toast(err.message, 'err'); }
+});
+
+// 重测：用原记录的目标与参数新建一个 run，成功后跳到新任务页
+async function rerunRun(runId, label) {
+  if (!confirm(`用相同端点与参数重测这条记录？\n\n${label || runId}\n\n会新建一个任务（原记录保留），并排队执行。`)) return;
+  try {
+    const run = await api('POST', `/runs/${runId}/rerun`);
+    toast(`已提交重测：${run.run_id}`);
+    location.hash = `#/run/${run.run_id}`;
+  } catch (err) { toast(err.message, 'err'); }
+}
+
+// 列表操作（事件委派，避免每行绑监听）
+$('#history-table')?.addEventListener('click', (e) => {
+  const rerun = e.target.closest('[data-rerun]');
+  if (rerun) {
+    const row = rerun.closest('tr');
+    const label = row ? row.querySelector('td:nth-child(3) b')?.textContent : '';
+    rerunRun(rerun.dataset.rerun, label);
+    return;
+  }
+  const del = e.target.closest('[data-del]');
+  if (del) deleteRun(del.dataset.del, del.dataset.label);
+});
+
 $('#btn-refresh')?.addEventListener('click', () => loadHistory(true));
 $('#h-status')?.addEventListener('change', () => loadHistory(true));
+$('#h-capability')?.addEventListener('change', () => loadHistory(true));
 $('#btn-more')?.addEventListener('click', () => loadHistory(false));
 
 /* ================================================================

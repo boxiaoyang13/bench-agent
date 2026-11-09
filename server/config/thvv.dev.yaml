@@ -12,16 +12,17 @@
 # 说明:
 #   * Python 工具链在 <repo>/thvv（含 perf/ eval/ configs/ quickstart.sh）
 #   * venv 在 <repo>/.venv（不在 thvv/ 下），所以 roots.bin 走自定义根 venv
+#   * 本机布局：/data/bench/TokenHub-Vendor-Verifier/{thvv,.venv} + /data/bench/bench-cache
 #   * 如需换机器：THVV_HOME / THVV_VENV 覆盖即可，YAML 不用改
 # ==============================================================================
 version: 1
 
 roots:
-  thvv: "${THVV_HOME:-/infer-data/bench/TokenHub-Vendor-Verifier/thvv}"
+  thvv: "${THVV_HOME:-/data/bench/TokenHub-Vendor-Verifier/thvv}"
   data: "${THVV_DATA:-../data}"
-  venv: "${THVV_VENV:-/infer-data/bench/TokenHub-Vendor-Verifier/.venv}"
+  venv: "${THVV_VENV:-/data/bench/TokenHub-Vendor-Verifier/.venv}"
   bin: "venv:bin"
-  bench-cache: "${THVV_CACHE_HOME:-/infer-data/bench/bench-cache}"
+  bench-cache: "${THVV_CACHE_HOME:-/data/bench/bench-cache}"
 
 server:
   listen: "0.0.0.0:18080"   # 对外监听；仅本机用可改回 127.0.0.1:18080
@@ -151,6 +152,15 @@ limits:
   max_concurrent_runs: 2
   max_queued_runs: 16
   max_parallel_runs_per_target: 1
+  # 原始 benchmark_data.db 归档上限：全档位压测的 db 常有 200~500MB，默认 200MB 会把它判为超限跳过
+  artifact_max_bytes: 1073741824   # 1GiB
+  # 单 run 上限：全量 15 个数据集（含 mmlu_pro 的 12032 题）实测需要 25h+，
+  # 12h 默认值会把它抬掉（见 run_cba1aaf48f59e298）。本机验收取 24h。
+  max_run_duration: 36h
+
+# 本机联调：允许被测端点解析到内网/回环（本地 mock 端点必需）。对外部署请设为 false。
+security:
+  allow_private_targets: true
 
 observability:
   log_level: debug
