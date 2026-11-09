@@ -286,19 +286,48 @@
       </div>
 
       <div class="grid-3">
+        <label class="field">负载模式
+          <select id="c-shape-mode">
+            <option value="manual">手动（填每轮输入 / 输出）</option>
+            <option value="hitrate">按目标命中率自动推导</option>
+          </select>
+          <small>两种模式互斥：命中率模式会隐藏并自动计算「每轮输入 / 输出」</small>
+        </label>
+        <label class="field">目标命中率方向
+          <select id="c-hitrate-dir" disabled>
+            <option value="min">下限（至少达到）</option>
+            <option value="max">上限（不超过）</option>
+          </select>
+        </label>
+        <label class="field">目标命中率
+          <select id="c-hitrate" disabled>
+            <option value="0.5">50%</option>
+            <option value="0.6">60%</option>
+            <option value="0.7">70%</option>
+            <option value="0.75">75%</option>
+            <option value="0.8" selected>80%</option>
+            <option value="0.85">85%</option>
+            <option value="0.9">90%</option>
+            <option value="0.95">95%</option>
+          </select>
+          <small>方向二选一（min 或 max）；实际命中率仍以探针观测为准</small>
+        </label>
+      </div>
+
+      <div class="grid-3">
         <label class="field">System Prompt（token）
           <input id="c-shared" type="number" value="2000" min="0">
         </label>
         <label class="field">预填历史（token）
           <input id="c-history" type="number" value="10000" min="0">
         </label>
-        <label class="field">每轮输入（token）
+        <label class="field" id="c-input-wrap">每轮输入（token）
           <input id="c-input" type="number" value="50" min="1">
         </label>
       </div>
 
       <div class="grid-3">
-        <label class="field">每轮输出（token）
+        <label class="field" id="c-output-wrap">每轮输出（token）
           <input id="c-output" type="number" value="200" min="1">
         </label>
         <label class="field">KV 容量（GB）

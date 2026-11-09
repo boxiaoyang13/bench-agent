@@ -167,6 +167,7 @@ engines:
   "seed": 42,
   "no_warmup": false,
   "ignore_eos": false,
+  "prefix_hit_rate_min": 0.8,
   "ladder": [
     { "sessions": 1, "qps": 0.5 },
     { "sessions": 2, "qps": 1.0 },
@@ -193,6 +194,14 @@ engines:
 7. `steps_total` = 1（单档）或档位数；总时长按 `档数 × (duration_sec + 120s 预热预算)`
    校验 `limits.max_run_duration`（默认 12h），超限 → 400
 8. 单档（ladder 为空）语义与 v1 完全一致，`steps_total = 1`
+9. **目标命中率模式（可选）**：`prefix_hit_rate_min` / `prefix_hit_rate_max` 只能设一个（互斥，
+   同时设置 → 400）；设置后服务端按近似模型反推并回填 `user_input_length` / `output_length`，
+   手动值被覆盖（UI 上两种模式互斥）。近似模型：稳态命中率 ≈ 已缓存前缀 / (前缀 + 每轮新增)，
+   因此每轮新增 ≈ `(shared_prompt + chat_history) × (1-h) / h`；输出优先 200 token（不够则收缩），
+   其余给每轮输入。`max` 方向目标取 `max − 3pp`（命中率随累计轮次增长会略升，留余量）。
+   要求 `shared + history > 0`，且反推每轮 token ≤ 1M（目标过低 → 400）
+10. 目标命中率模式**只改变负载形状，不改变验收阈值**：gate 仍用所选模板的
+    `prefix_hit_rate_min`（`cache-sla-v1` / `cache-perf-sla-v1` 默认 0.50）；实际命中率以探针观测为准
 
 ### 3.3 Step 与 Run 结果
 
@@ -458,21 +467,25 @@ gates:
 1. 「测试计划」能力切换新增第三项：`性能压测 / 效果评测 / 缓存测试`（来自 `/v1/tools` 聚合）
 2. cache 面板：时长、QPS、prompt/历史/输入/输出 token 长度、KV 容量与 tokens/GB、
    预热开关（默认开）、随机种子（高级）
-3. 并发档位（方案 B）：`并发档位（session 数）` 逗号分隔（留空=单档，如 `1,2,4`）+
+3. 负载模式（手动 / 目标命中率，**互斥**）：
+   - 手动：填「每轮输入 / 每轮输出」
+   - 目标命中率：`方向`（下限 / 上限，二选一）+ `目标命中率` 下拉（50%~95%）；
+     选后「每轮输入 / 每轮输出」置灰，服务端按目标反推并回填；估算框/确认页展示反推结果
+4. 并发档位（方案 B）：`并发档位（session 数）` 逗号分隔（留空=单档，如 `1,2,4`）+
    `每 session QPS` + 负载口径（等比放大 / 固定全局 QPS）；估算框显示档位数、每档 QPS、
    预计总时长/总请求数/token 消耗与容量反算说明；第 2 步会校验档位重复、每档 QPS、
    形状参数（shared+history > 0）
-4. 步骤表：单档一行；多档每档一行（`c1`/`c2`/`c4`，并发与请求数事后回填）；
+5. 步骤表：单档一行；多档每档一行（`c1`/`c2`/`c4`，并发与请求数事后回填）；
    每行带「操作」：**运行中 → 取消**（kill 当前档位后继续后面的档位）、
    **待执行 → 跳过**（引擎轮到该档时直接跳过），用于剔除个别档位而不用停掉整个 run
-5. 结果页：
+6. 结果页：
    - 单档：KPI 卡（前缀命中率、稳态 TTFT P50、首轮 TTFT、改善率、TPOT P50、
      解码速度、输出吞吐、成功率）+ 逐轮 TTFT 表 + 性能指标表（含 TPS/TPM 口径）+
      口径说明 + 违规明细 + 产物下载
    - 多档：KPI 卡（档位数、前缀命中率、总请求数、加权 TTFT/TPOT、总吞吐、验收）+
      **并发档位曲线表**（档位 / QPS / 请求数 / 成功率 / 稳态 TTFT P50 / 平均命中率 /
      TPOT P50 / 解码速度 TPS / 输出吞吐 TPS / 输出吞吐 TPM=TPS×60）+ 违规明细（带档位列）
-6. 历史列表：`能力` 列显示 `缓存测试`；多档显示 `分档 N（最大 M 并发）`，结论列同 eval
+7. 历史列表：`能力` 列显示 `缓存测试`；多档显示 `分档 N（最大 M 并发）`，结论列同 eval
 
 ---
 
@@ -503,6 +516,8 @@ gates:
 | 集成 | builtin 引擎多档：`ladder` 提交 → `steps_total=N`、`cache.tiers[]`、step 回填、逐档 gate |
 | 集成 | 单步操作：跳过待执行档位（skipped）/ 取消运行中档位（canceled）→ 其余档位照常出结果 |
 | 集成 | 单步状态冲突：运行中 skip / 待执行 cancel → 409；全部跳过 → run=canceled、`verdict=canceled` |
+| 单测 | 目标命中率反推：min 80% → 输入 2800/输出 200；max 80% → 输入 3384；极高目标收缩输出；互斥/缺形状/越界 → 400 |
+| 集成 | plan 带 `prefix_hit_rate_min/max` → 反推结果回填到 `plan.user_input_length/output_length` |
 | 真机 | `multi-round-chat 30s`：step 成功、稳态 TTFT < 首轮、改善率 > 0、CSV/JSON 可下载 |
 | 真机 | `cache-perf-sla-v1`：性能指标齐全、样本数不足时正确输出 `min_samples` 违规 |
 | 真机 | 多档 `ladder=[1,2,4]`：3 个 step 顺序成功、tiers 指标齐全、产物按 c1/c2/c4 前缀归档 |
@@ -575,6 +590,19 @@ plan 增加 `ladder` 多档，一次 run 顺序跑完，输出「TTFT/TPOT/吞�
 7. `web`：计划页并发档位输入（每 session QPS / 负载口径）、预估与校验、确认页；
    结果页多档曲线表（带档位违规列）；历史列表显示分档
 8. 测试：plan 校验、多档展开/回填、聚合口径、逐档 gate、builtin 多档全链路（§10 全表）
+
+## 11.4 目标命中率反推负载（v1.2.1）
+
+页面提供「手动 / 目标命中率」两种互斥的负载模式，目标命中率模式下不再手填每轮输入/输出：
+
+1. `domain/httpapi`：`plan.prefix_hit_rate_min` / `prefix_hit_rate_max`（0 = 未设置）
+2. `runmgr/cache.go`：`deriveCacheHitRateShape` —— min/max 互斥校验、按
+   `new ≈ (shared+history) × (1-h)/h` 反推、输出优先 200、`max` 方向减 3pp 余量，
+   结果回填 `user_input_length` / `output_length`；反推后仍走原有 0..1M 校验
+3. `web`：cache 面板新增「负载模式 / 方向 / 目标命中率」下拉；命中率模式置灰
+   每轮输入/输出，估算框与确认页展示反推值；第 2 步校验 shared+history > 0
+4. 验收阈值不变：仍由所选 gate 模板的 `prefix_hit_rate_min` 判定（本模式只影响负载形状）
+5. 测试：反推口径（min/max/边界/互斥）、plan 回填集成测试
 
 ## 12. 后续（v1.3）
 

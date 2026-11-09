@@ -271,6 +271,10 @@ type Plan struct {
 	// 并发档位（方案 B）：非空时按档位展开多 step；每档 sessions 反算 KV 容量，
 	// qps 缺省继承 p.QPS；duration_sec 为「每档」时长。
 	CacheLadder []CacheTier `json:"ladder,omitempty"`
+	// 目标命中率（可选；与手动 user_input_length / output_length 互斥）。
+	// 只能设置 min 或 max 其中一个，服务端据此反推每轮输入/输出长度（见 normalizeCachePlan）。
+	HitRateMin float64 `json:"prefix_hit_rate_min,omitempty"`
+	HitRateMax float64 `json:"prefix_hit_rate_max,omitempty"`
 	// 请求形状（MRC）
 	SharedPromptLen int `json:"shared_prompt_length,omitempty"`
 	ChatHistoryLen  int `json:"chat_history_length,omitempty"`

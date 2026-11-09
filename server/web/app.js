@@ -571,7 +571,7 @@ function syncCapabilityUI() {
   $('#g-tpm').closest('.field').hidden = state.capability !== 'perf';
   updateEstimate();
   updateEvalEstimate();
-  updateCacheEstimate();
+  updateCacheShapeMode();
 }
 
 $$('#cap-seg .seg-item').forEach(btn => btn.addEventListener('click', () => {
@@ -706,12 +706,31 @@ function parseLadderSessions(raw) {
     .filter(v => Number.isInteger(v) && v > 0);
 }
 
+// 目标命中率模式（与手动「每轮输入/输出」互斥）：返回 null 表示手动模式。
+function cacheHitRateTarget() {
+  if ($('#c-shape-mode')?.value !== 'hitrate') return null;
+  const dir = $('#c-hitrate-dir')?.value === 'max' ? 'max' : 'min';
+  const val = Number($('#c-hitrate')?.value) || 0.8;
+  // 上限留 3pp 余量：实际命中率随累计轮次增长会略升（与服务端 deriveCacheHitRateShape 一致）
+  const h = dir === 'max' ? Math.max(0.05, val - 0.03) : val;
+  return { dir, val, h };
+}
+
+// 与服务端同一近似模型：new ≈ base × (1-h)/h，输出优先用默认 200，剩余给每轮输入。
+function deriveCacheShape(base, h) {
+  if (!(base > 0) || !(h > 0) || h >= 1) return null;
+  const newTokens = Math.max(2, Math.round(base * (1 - h) / h));
+  const out = Math.min(200, newTokens - 1);
+  return { input: Math.max(1, newTokens - out), output: Math.max(1, out) };
+}
+
 function cachePlan() {
   const num = (sel) => Number($(sel).value) || 0;
   const seed = num('#c-seed');
   const sessions = parseLadderSessions($('#c-ladder')?.value);
   const scaleQPS = $('#c-ladder-mode')?.value !== 'fixed';
   const perSessionQPS = Number($('#c-ladder-qps')?.value) || 0;
+  const target = cacheHitRateTarget();
   const plan = {
     mode: 'single',
     workload: 'multi-round-chat',
@@ -721,11 +740,17 @@ function cachePlan() {
     tokens_per_gb_kvcache: num('#c-tpg'),
     shared_prompt_length: num('#c-shared'),
     chat_history_length: num('#c-history'),
-    user_input_length: num('#c-input'),
-    output_length: num('#c-output'),
     no_warmup: $('#c-warmup').value === 'false',
     ...(seed ? { seed } : {}),
   };
+  if (target) {
+    // 命中率模式：只传目标，服务端反推并回填每轮输入/输出
+    if (target.dir === 'max') plan.prefix_hit_rate_max = target.val;
+    else plan.prefix_hit_rate_min = target.val;
+  } else {
+    plan.user_input_length = num('#c-input');
+    plan.output_length = num('#c-output');
+  }
   if (sessions.length) {
     plan.ladder = sessions.map(n => ({
       sessions: n,
@@ -743,12 +768,28 @@ function updateCacheEstimate() {
   const plan = cachePlan();
   const perSession = plan.shared_prompt_length + plan.chat_history_length;
   const users = perSession > 0 ? Math.floor(plan.kv_cache_volume_gb * plan.tokens_per_gb_kvcache / perSession) : 0;
+  const target = cacheHitRateTarget();
+  let inLen = plan.user_input_length || 0;
+  let outLen = plan.output_length || 0;
+  let shapeNote = '';
+  if (target) {
+    const derived = deriveCacheShape(perSession, target.h);
+    if (!derived) {
+      box.innerHTML = '⚠ 目标命中率模式需要先填写 System Prompt / 预填历史（用于估算已缓存前缀）。';
+      return;
+    }
+    inLen = derived.input;
+    outLen = derived.output;
+    shapeNote = `<br>目标命中率<b>${target.dir === 'min' ? '下限' : '上限'} ${fmtPct(target.val, 0)}</b>` +
+      ` → 自动推导每轮输入约 <b>${inLen.toLocaleString()}</b> / 输出约 <b>${outLen.toLocaleString()}</b> token` +
+      `（服务端按同一口径反推并回填 plan）。`;
+  }
   const ladder = plan.ladder || [];
   if (ladder.length) {
     const totalDuration = ladder.length * plan.duration_sec;
     const totalReq = ladder.reduce((acc, t) => acc + Math.round((t.qps || plan.qps) * plan.duration_sec), 0);
     const totalTokens = ladder.reduce((acc, t) =>
-      acc + Math.round((t.qps || plan.qps) * plan.duration_sec * (perSession + plan.output_length)), 0);
+      acc + Math.round((t.qps || plan.qps) * plan.duration_sec * (perSession + outLen)), 0);
     const desc = ladder.map(t => `c${t.sessions}@${t.qps || plan.qps}qps`).join(' / ');
     box.innerHTML = `并发档位 <b>${ladder.length}</b> 档（${esc(desc)}，按 session 数升序顺序执行）；` +
       `预计执行时长约 <b>${fmtDur(totalDuration)}</b>（不含每档预热），预计请求数约 <b>${totalReq}</b>；` +
@@ -756,22 +797,44 @@ function updateCacheEstimate() {
       (perSession > 0
         ? `<br>每档容量 = session 数 × 单会话 ${perSession} token ÷ ${plan.tokens_per_gb_kvcache}（服务端反算并回填）；`
         : '<br>⚠ 并发档位需要填写 System Prompt / 预填历史，才能反算每档 KV 容量；') +
+      shapeNote +
       (plan.no_warmup ? '<br>⚠ 预热已关闭：为冷启动口径，验收不判改善率。' : '');
     return;
   }
-  const estTokens = Math.round(plan.qps * plan.duration_sec * (perSession + plan.output_length));
+  const estTokens = Math.round(plan.qps * plan.duration_sec * (perSession + outLen));
   box.innerHTML = `并发 session 数约 <b>${Math.max(1, users)}</b>（由 KV 容量推导）；` +
     `预计请求数约 <b>${Math.round(plan.qps * plan.duration_sec)}</b>（性能验收建议 ≥100 稳态样本）；` +
     `预计消耗约 <b>${estTokens.toLocaleString()}</b> token（QPS × 时长 × 单请求 token）。` +
+    shapeNote +
     (plan.no_warmup ? '<br>⚠ 预热已关闭：为冷启动口径，验收不判改善率。' : '');
 }
 
+// 手动 / 命中率 两种负载模式互斥：命中率模式下禁用「每轮输入/输出」。
+function updateCacheShapeMode() {
+  const hit = $('#c-shape-mode')?.value === 'hitrate';
+  for (const sel of ['#c-hitrate-dir', '#c-hitrate']) {
+    const el = $(sel);
+    if (el) el.disabled = !hit;
+  }
+  for (const [sel, wrap] of [['#c-input', '#c-input-wrap'], ['#c-output', '#c-output-wrap']]) {
+    const el = $(sel);
+    if (el) {
+      el.disabled = hit;
+      el.placeholder = hit ? '自动推导' : '';
+    }
+    $(wrap)?.classList.toggle('muted', hit);
+  }
+  updateCacheEstimate();
+}
+
 ['#c-duration', '#c-qps', '#c-ladder', '#c-ladder-qps', '#c-ladder-mode',
-  '#c-volume', '#c-tpg', '#c-shared', '#c-history', '#c-input', '#c-output', '#c-warmup']
+  '#c-volume', '#c-tpg', '#c-shared', '#c-history', '#c-input', '#c-output',
+  '#c-hitrate-dir', '#c-hitrate', '#c-warmup']
   .forEach(sel => {
     $(sel)?.addEventListener('input', updateCacheEstimate);
     $(sel)?.addEventListener('change', updateCacheEstimate);
   });
+$('#c-shape-mode')?.addEventListener('change', updateCacheShapeMode);
 
 function buildPlan() {
   if (state.capability === 'eval') return evalPlan();
@@ -863,6 +926,18 @@ $('#btn-to-step3')?.addEventListener('click', () => {
   } else if (state.capability === 'cache') {
     const dur = Number($('#c-duration').value) || 0;
     if (dur < 10 || dur > 3600) { toast('测试时长需在 10~3600 秒', 'err'); return; }
+    const target = cacheHitRateTarget();
+    if (target) {
+      const base = (Number($('#c-shared').value) || 0) + (Number($('#c-history').value) || 0);
+      if (base <= 0) {
+        toast('目标命中率模式需要 System Prompt + 预填历史 > 0（用于估算已缓存前缀）', 'err'); return;
+      }
+      const derived = deriveCacheShape(base, target.h);
+      if (!derived) { toast('目标命中率参数非法', 'err'); return; }
+      if (derived.input + derived.output > 1_000_000) {
+        toast('目标命中率过低：反推每轮 token 超过 1M，请提高目标命中率', 'err'); return;
+      }
+    }
     const ladder = cachePlan().ladder || [];
     if (ladder.length) {
       if (ladder.length > 20) { toast('并发档位最多 20 档', 'err'); return; }
@@ -927,6 +1002,11 @@ function renderConfirm() {
     const plan = payload.plan;
     const perSession = plan.shared_prompt_length + plan.chat_history_length;
     const users = perSession > 0 ? Math.max(1, Math.floor(plan.kv_cache_volume_gb * plan.tokens_per_gb_kvcache / perSession)) : '—';
+    const target = cacheHitRateTarget();
+    const derived = target ? deriveCacheShape(perSession, target.h) : null;
+    const shapeRow = target && derived
+      ? `自动推导：每轮输入 ${derived.input} / 输出 ${derived.output} token`
+      : `${plan.user_input_length} / ${plan.output_length} token`;
     const ladder = plan.ladder || [];
     const totalReq = ladder.length
       ? ladder.reduce((acc, t) => acc + Math.round((t.qps || plan.qps) * plan.duration_sec), 0)
@@ -941,7 +1021,10 @@ function renderConfirm() {
         : `${plan.duration_sec}s / ${plan.qps}`],
       ['并发 session', ladder.length ? '各档由容量反算（见 ladder）' : `${users}（容量推导）`],
       ['预计请求数', `${totalReq}（性能验收建议每档 ≥100）`],
-      ['Prompt / 历史 / 输入 / 输出', `${plan.shared_prompt_length} / ${plan.chat_history_length} / ${plan.user_input_length} / ${plan.output_length} token`],
+      ['负载模式', target
+        ? `目标命中率${target.dir === 'min' ? '下限' : '上限'} ${fmtPct(target.val, 0)}（与手动输入/输出互斥；实际以探针为准）`
+        : '手动（填每轮输入/输出）'],
+      ['Prompt / 历史 / 输入 / 输出', `${plan.shared_prompt_length} / ${plan.chat_history_length} / ${shapeRow}`],
       ['预热', plan.no_warmup ? '关闭（冷启动口径）' : '开启'],
       ['验收', payload.gate
         ? `${payload.gate.profile}（${payload.gate.profile.includes('perf') ? '缓存收益 + 稳态性能' : '缓存收益'}）`

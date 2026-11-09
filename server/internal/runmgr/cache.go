@@ -25,6 +25,7 @@ const (
 	cacheMaxTiers       = 20  // 并发档位上限
 	cacheStepBudgetSec  = 120 // 每档预留的预热 + 进程启停预算（用于总时长校验）
 	cacheMaxSessions    = 10000
+	cacheHitRateMargin  = 0.03 // 「上限」目标的反推余量（实际命中率随轮次增长会略升）
 )
 
 func (m *Manager) cacheCapability(tool string) *config.Capability {
@@ -105,6 +106,13 @@ func (m *Manager) normalizeCachePlan(tool string, p domain.Plan) (domain.Plan, [
 	if p.TokensPerGBKV < 1024 || p.TokensPerGBKV > 10_000_000 {
 		return p, nil, invalid("tokens_per_gb_kvcache 非法（1024..10000000）")
 	}
+	// 目标命中率模式（与手动 user_input_length / output_length 互斥）：
+	// 由 min 或 max 反推每轮输入/输出长度，覆盖手动值。
+	if p.HitRateMin > 0 || p.HitRateMax > 0 {
+		if derr := deriveCacheHitRateShape(&p); derr != nil {
+			return p, nil, derr
+		}
+	}
 	for _, v := range []struct {
 		name string
 		v    int
@@ -136,6 +144,55 @@ func (m *Manager) normalizeCachePlan(tool string, p domain.Plan) (domain.Plan, [
 		}
 	}
 	return p, steps, nil
+}
+
+// deriveCacheHitRateShape 按目标命中率反推每轮输入/输出长度（MRC 负载形状）。
+//
+// 近似模型：稳态命中率 ≈ 已缓存前缀 / (前缀 + 每轮新增 token)，其中
+// 已缓存前缀 ≈ shared_prompt + chat_history，每轮新增 ≈ user_input + output。
+// 因此 new ≈ base × (1-h) / h；输出优先用默认 200，剩余给每轮输入（至少各 1）。
+//
+//   - prefix_hit_rate_min / max 只能设置一个（互斥）
+//   - 设 max 时目标取 max - 3pp：命中率随累计轮次增长会略升，留余量避免越上限
+//   - 推导结果写回 plan，run.plan 里能看到实际生效的 input/output 长度
+func deriveCacheHitRateShape(p *domain.Plan) error {
+	if p.HitRateMin > 0 && p.HitRateMax > 0 {
+		return invalid("prefix_hit_rate_min 与 prefix_hit_rate_max 互斥，只能设置一个")
+	}
+	h := p.HitRateMin
+	mode := "min"
+	if p.HitRateMax > 0 {
+		mode = "max"
+		h = p.HitRateMax - cacheHitRateMargin
+	}
+	if h <= 0 || h >= 0.999 {
+		return invalid("目标命中率非法（%s 需在 (0, 0.999) 内）", mode)
+	}
+	base := p.SharedPromptLen + p.ChatHistoryLen
+	if base <= 0 {
+		return invalid("目标命中率需要 shared_prompt_length + chat_history_length > 0（用于估算已缓存前缀）")
+	}
+	newTokens := int(math.Round(float64(base) * (1 - h) / h))
+	if newTokens < 2 {
+		newTokens = 2
+	}
+	if newTokens > 1_000_000 {
+		return invalid("目标命中率过低：反推每轮需 %d token（超过 1M），请提高目标命中率或减小 shared/history", newTokens)
+	}
+	out := 200 // lmcache 默认每轮输出
+	if newTokens-1 < out {
+		out = newTokens - 1
+	}
+	if out < 1 {
+		out = 1
+	}
+	in := newTokens - out
+	if in < 1 {
+		in = 1
+	}
+	p.UserInputLen = in
+	p.OutputLen = out
+	return nil
 }
 
 // expandCacheLadder 把 plan.ladder 展开成多个 step，并把 sessions 反算成 KV 容量回填。

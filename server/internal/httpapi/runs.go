@@ -53,6 +53,8 @@ type planDTO struct {
 	Seed            *int               `json:"seed,omitempty"`
 	NoWarmup        bool               `json:"no_warmup,omitempty"`
 	IgnoreEOS       bool               `json:"ignore_eos,omitempty"`
+	HitRateMin      float64            `json:"prefix_hit_rate_min,omitempty"`
+	HitRateMax      float64            `json:"prefix_hit_rate_max,omitempty"`
 	SharedPromptLen int                `json:"shared_prompt_length,omitempty"`
 	ChatHistoryLen  int                `json:"chat_history_length,omitempty"`
 	UserInputLen    int                `json:"user_input_length,omitempty"`
@@ -73,6 +75,7 @@ func (d planDTO) toDomain() domain.Plan {
 		QPS: d.QPS, DurationSec: d.CacheDuration, Seed: d.Seed, NoWarmup: d.NoWarmup,
 		IgnoreEOS: d.IgnoreEOS, SharedPromptLen: d.SharedPromptLen, ChatHistoryLen: d.ChatHistoryLen,
 		UserInputLen: d.UserInputLen, OutputLen: d.OutputLen, CacheLadder: d.Ladder,
+		HitRateMin: d.HitRateMin, HitRateMax: d.HitRateMax,
 	}
 }
 
