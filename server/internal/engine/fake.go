@@ -451,8 +451,8 @@ func (f *Fake) runCache(ctx context.Context, spec Spec, emit func(Event)) (Resul
 	case len(tiers) == 1 && len(spec.Steps) == 1:
 		res.Cache = tiers[0]
 	case len(tiers) > 0:
+		// 顶层命中率由 aggregateCacheTiers 取跨档平均，不要再 attachProbe 覆盖
 		agg := aggregateCacheTiers(tiers)
-		attachProbe(agg, tiers[0].ProbeRounds)
 		agg.Tiers = tiers
 		res.Cache = agg
 	default:

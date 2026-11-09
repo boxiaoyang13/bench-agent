@@ -1427,8 +1427,8 @@ function renderCacheResults(results, artifacts) {
   const kpis = isMulti
     ? [
       ['并发档位', `${s.tiers_count ?? c.tiers.length} 档`, `最大 ${s.max_sessions ?? '—'} session`],
-      ['前缀命中率', s.prefix_hit_rate != null ? fmtPct(s.prefix_hit_rate) : '—',
-        s.cache_field_reported === false ? '⚠ 端点未上报 cached_tokens' : 'cached/prompt（探针直采）'],
+      ['平均命中率', s.prefix_hit_rate != null ? fmtPct(s.prefix_hit_rate) : '—',
+        s.cache_field_reported === false ? '⚠ 端点未上报 cached_tokens' : 'cached/prompt（探针直采，跨档平均）'],
       ['总请求数', s.total_requests ?? '—', `成功率 ${s.success_rate != null ? fmtPct(s.success_rate) : '—'}`],
       ['TTFT 均值', numOr(s.mean_ttft_ms, 'ms'), '全档加权（成功请求）'],
       ['TPOT 均值', numOr(s.tpot_mean_ms, 'ms'), '全档加权（输出 token）'],
@@ -1454,17 +1454,18 @@ function renderCacheResults(results, artifacts) {
   // 多档：并发-性能曲线表（每档一行）
   const tierRows = isMulti ? c.tiers.map(t => {
     const tss = t.steady_state || {};
+    const outTPM = t.output_throughput > 0 ? t.output_throughput * 60 : 0;
     return `<tr>
       <td><b>${esc(t.bucket || '—')}</b><br><span class="hint">${t.sessions ?? '—'} session</span></td>
       <td class="num">${fmtNum(t.qps)}</td>
       <td class="num">${t.total_requests ?? '—'}</td>
       <td class="num">${t.success_rate != null ? fmtPct(t.success_rate) : '—'}</td>
       <td class="num">${tss.ttft_p50_ms != null ? fmtNum(tss.ttft_p50_ms) + 'ms' : '—'}</td>
-      <td class="num">${tss.ttft_improvement != null ? fmtPct(tss.ttft_improvement) : '—'}</td>
+      <td class="num">${t.prefix_hit_rate != null ? fmtPct(t.prefix_hit_rate) : '—'}</td>
       <td class="num">${tss.tpot_p50_ms > 0 ? fmtNum(tss.tpot_p50_ms) + 'ms' : '—'}</td>
-      <td class="num">${tss.decode_speed_p50 > 0 ? fmtNum(tss.decode_speed_p50) + ' t/s' : '—'}</td>
-      <td class="num">${t.output_throughput > 0 ? fmtNum(t.output_throughput) + ' t/s' : '—'}</td>
-      <td class="num">${tss.requests ?? '—'}</td></tr>`;
+      <td class="num">${tss.decode_speed_p50 > 0 ? fmtNum(tss.decode_speed_p50) : '—'}</td>
+      <td class="num">${t.output_throughput > 0 ? fmtNum(t.output_throughput) : '—'}</td>
+      <td class="num">${outTPM > 0 ? fmtNum(outTPM, 0) : '—'}</td></tr>`;
   }).join('') : '';
 
   const roundRows = isMulti ? '' : (c.rounds || []).map(r => `
@@ -1485,7 +1486,8 @@ function renderCacheResults(results, artifacts) {
     ['稳态 TTFT P90 / P99', `${numOr(s.ttft_steady_p90_ms, 'ms')} / ${numOr(s.ttft_steady_p99_ms, 'ms')}`],
     ['请求时延 P50 / P90 / P99', `${numOr(c.request_latency_p50_ms, 'ms')} / ${numOr(c.request_latency_p90_ms, 'ms')} / ${numOr(c.request_latency_p99_ms, 'ms')}`],
     ['TPOT P50 / P90（稳态）', `${numOr(ss.tpot_p50_ms, 'ms')} / ${numOr(ss.tpot_p90_ms, 'ms')}`],
-    ['输入 / 输出吞吐', `${numOr(c.input_throughput || s.input_throughput, ' t/s')} / ${numOr(c.output_throughput || s.output_throughput, ' t/s')}`],
+    ['输入 / 输出吞吐 (TPS)', `${numOr(c.input_throughput || s.input_throughput, ' t/s')} / ${numOr(c.output_throughput || s.output_throughput, ' t/s')}`],
+    ['输出吞吐 (TPM)', (c.output_throughput || s.output_throughput) > 0 ? fmtNum((c.output_throughput || s.output_throughput) * 60, 0) + ' t/min' : '—'],
     ['样本数（总 / 稳态）', `${s.total_requests ?? '—'} / ${s.samples_steady ?? ss.requests ?? '—'}`],
   ].map(([k, v]) => `<tr><td>${esc(k)}</td><td class="num">${esc(v)}</td></tr>`).join('');
   $('#gate-body').innerHTML = `
@@ -1495,9 +1497,9 @@ function renderCacheResults(results, artifacts) {
       ${g ? `验收模板 ${esc(g.profile)} · 违规 ${(g.violations || []).length} 项` : '未启用验收'}</p>
     ${isMulti ? `<h4 style="margin-top:12px">并发档位（前缀缓存命中态）</h4>
       <table class="tbl"><thead><tr><th>档位</th><th class="num">QPS</th><th class="num">请求数</th>
-      <th class="num">成功率</th><th class="num">稳态 TTFT P50</th><th class="num">改善率</th>
-      <th class="num">TPOT P50</th><th class="num">解码速度</th><th class="num">输出吞吐</th>
-      <th class="num">稳态样本</th></tr></thead><tbody>${tierRows}</tbody></table>
+      <th class="num">成功率</th><th class="num">稳态 TTFT P50</th><th class="num">平均命中率</th>
+      <th class="num">TPOT P50</th><th class="num">解码速度 (TPS)</th><th class="num">输出吞吐 (TPS)</th>
+      <th class="num">输出吞吐 (TPM)</th></tr></thead><tbody>${tierRows}</tbody></table>
       <p class="muted">各档按并发升序顺序执行；性能数字为「前缀缓存命中态」表观性能，
         与性能压测的冷启动口径不可直接横比，且各档之间共享同一被测端点（顺序执行，不并发）。</p>` : ''}
     ${probeRows ? `<h4 style="margin-top:12px">前缀命中率探针（原始 usage）</h4>

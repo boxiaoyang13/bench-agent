@@ -282,12 +282,14 @@ func TestAggregateCacheTiers(t *testing.T) {
 			TotalRequests: 10, SuccessReqs: 10, FailedReqs: 0, SuccessRate: 1,
 			ElapsedSec: 10, MeanTTFTMS: 500, MeanDecodeSpeed: 100,
 			InputTokens: 10000, OutputTokens: 1000, DecodeSpeedP50: 100,
+			PrefixHitRate: fp64(0.90), CacheFieldReported: true,
 		},
 		{
 			Bucket: "c4", Sessions: 4, QPS: 4, NumSessions: 4,
 			TotalRequests: 20, SuccessReqs: 18, FailedReqs: 2, SuccessRate: 0.9,
 			ElapsedSec: 20, MeanTTFTMS: 800, MeanDecodeSpeed: 50,
 			InputTokens: 50000, OutputTokens: 3000, DecodeSpeedP50: 50,
+			PrefixHitRate: fp64(0.50), CacheFieldReported: false,
 		},
 	}
 	agg := aggregateCacheTiers(tiers)
@@ -314,4 +316,13 @@ func TestAggregateCacheTiers(t *testing.T) {
 	if agg.Tiers != nil {
 		t.Fatalf("聚合函数不应写 Tiers")
 	}
+	// 平均命中率 = (0.90 + 0.50) / 2 = 0.70；只有一档上报 cached_tokens → 不能宣称已上报
+	if agg.PrefixHitRate == nil || *agg.PrefixHitRate < 0.6999 || *agg.PrefixHitRate > 0.7001 {
+		t.Fatalf("平均命中率聚合错误: %v", agg.PrefixHitRate)
+	}
+	if agg.CacheFieldReported {
+		t.Fatalf("并非所有档位都上报 cached_tokens，应为 false")
+	}
 }
+
+func fp64(v float64) *float64 { return &v }

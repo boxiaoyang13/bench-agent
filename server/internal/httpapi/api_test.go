@@ -999,10 +999,11 @@ func TestCacheLadderFlow(t *testing.T) {
 		Cache   *struct {
 			TotalRequests int `json:"total_requests"`
 			Tiers         []struct {
-				Bucket      string  `json:"bucket"`
-				Sessions    int     `json:"sessions"`
-				QPS         float64 `json:"qps"`
-				NumSessions int     `json:"num_sessions"`
+				Bucket        string   `json:"bucket"`
+				Sessions      int      `json:"sessions"`
+				QPS           float64  `json:"qps"`
+				NumSessions   int      `json:"num_sessions"`
+				PrefixHitRate *float64 `json:"prefix_hit_rate"`
 			} `json:"tiers"`
 			SteadyState *struct {
 				TTFTp50MS float64 `json:"ttft_p50_ms"`
@@ -1033,6 +1034,20 @@ func TestCacheLadderFlow(t *testing.T) {
 	}
 	if res.Cache.Tiers[1].Bucket != "c4" || res.Cache.Tiers[1].Sessions != 4 || res.Cache.Tiers[1].QPS != 4 {
 		t.Fatalf("c4 档指标错误: %+v", res.Cache.Tiers[1])
+	}
+	// 每档都有自己的前缀命中率探针（用于「平均命中率」列），跨档平均在顶层
+	for _, tier := range res.Cache.Tiers {
+		if tier.PrefixHitRate == nil {
+			t.Fatalf("档位 %s 缺 prefix_hit_rate: %+v", tier.Bucket, tier)
+		}
+	}
+	if res.Summary["prefix_hit_rate"] == nil {
+		t.Fatalf("summary 缺跨档平均命中率: %v", res.Summary)
+	}
+	// 顶层命中率 = 各档命中率的简单平均
+	wantAvg := (*res.Cache.Tiers[0].PrefixHitRate + *res.Cache.Tiers[1].PrefixHitRate) / 2
+	if got := res.Summary["prefix_hit_rate"].(float64); got < wantAvg-1e-6 || got > wantAvg+1e-6 {
+		t.Fatalf("跨档平均命中率错误: got %v want %v", got, wantAvg)
 	}
 	if res.Summary["tiers_count"].(float64) != 2 {
 		t.Fatalf("summary.tiers_count 错误: %v", res.Summary)

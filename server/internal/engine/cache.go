@@ -181,26 +181,17 @@ type tierResult struct {
 	files   []FileArtifact
 }
 
-// attachProbe 把前缀命中率探针结果挂到汇总指标上（探针整 run 只跑一次）。
-func attachProbe(m *domain.CacheMetrics, rounds []domain.CacheProbeRound) {
-	if m == nil || len(rounds) == 0 {
-		return
-	}
-	m.ProbeRounds = rounds
-	if hr, reported := DeriveProbeHitRate(rounds); len(rounds) > 1 {
-		m.PrefixHitRate = &hr
-		m.CacheFieldReported = reported
-	}
-}
-
 // aggregateCacheTiers 把多档结果聚合成顶层指标（明细留在 Tiers）。
 //
 // 顶层只做「可加」的聚合：请求数 / token 数 / 时长 / 成功数；
-// 均值按样本加权（TTFT 按成功请求、decode speed 按输出 token），吞吐按总 token / 总时长。
+// 均值按样本加权（TTFT 按成功请求、decode speed 按输出 token），吞吐按总 token / 总时长；
+// 前缀命中率取各档的简单平均（只统计上报了 cached_tokens 的档位）。
 // 分位数无法跨档合并，只在各档 Tiers 内保留。
 func aggregateCacheTiers(tiers []*domain.CacheMetrics) *domain.CacheMetrics {
 	agg := &domain.CacheMetrics{Workload: "multi-round-chat"}
 	var ttftWeighted, dsWeighted float64
+	var hitSum float64
+	var hitTiers, reportedTiers int
 	for _, t := range tiers {
 		if t == nil {
 			continue
@@ -216,6 +207,18 @@ func aggregateCacheTiers(tiers []*domain.CacheMetrics) *domain.CacheMetrics {
 		if agg.Model == "" {
 			agg.Model = t.Model
 		}
+		if t.PrefixHitRate != nil {
+			hitSum += *t.PrefixHitRate
+			hitTiers++
+			if t.CacheFieldReported {
+				reportedTiers++
+			}
+		}
+	}
+	if hitTiers > 0 {
+		avg := hitSum / float64(hitTiers)
+		agg.PrefixHitRate = &avg
+		agg.CacheFieldReported = reportedTiers == hitTiers
 	}
 	if agg.TotalRequests > 0 {
 		agg.SuccessRate = float64(agg.SuccessReqs) / float64(agg.TotalRequests)
@@ -250,17 +253,6 @@ func (e *CacheEngine) Run(ctx context.Context, spec Spec, emit func(Event)) (Res
 	cacheRoot := filepath.Join(spec.WorkDir, "cache")
 	if err := os.MkdirAll(cacheRoot, 0o755); err != nil {
 		return res, err
-	}
-
-	// 前缀命中率探针：整 run 只跑一次（在全部档位之前），抓原始 usage（含 cached_tokens）。
-	// lmcache bench 的 CSV 不含该字段；探针失败不阻断 bench。
-	probeRounds, probeErr := e.probePrefixCache(ctx, spec, cacheRoot)
-	for _, pr := range probeRounds {
-		fmt.Fprintf(logFile, "[probe] round=%d prompt=%d cached=%d hit=%.1f%% ttft=%.0fms\n",
-			pr.Round, pr.PromptTokens, pr.CachedTokens, pr.HitRate*100, pr.ReqMS)
-	}
-	if probeErr != nil {
-		fmt.Fprintf(logFile, "[probe] 探针未完成: %v（不影响 bench）\n", probeErr)
 	}
 
 	var (
@@ -314,23 +306,13 @@ func (e *CacheEngine) Run(ctx context.Context, spec Spec, emit func(Event)) (Res
 		}
 	}
 
-	// 探针原始文件归档（文件名保持与 v1 一致）。
-	if p := filepath.Join(cacheRoot, "prefix_usage.csv"); fileExists(p) {
-		files = append(files, FileArtifact{
-			Kind: domain.ArtBenchCSV, Filename: "multi-round-chat-prefix_usage.csv",
-			Path: p, ContentType: "text/csv; charset=utf-8",
-		})
-	}
 	res.Files = files
 
 	switch {
 	case len(tiers) == 1 && len(spec.Steps) == 1:
-		m := tiers[0]
-		attachProbe(m, probeRounds)
-		res.Cache = m
+		res.Cache = tiers[0]
 	case len(tiers) > 0:
 		agg := aggregateCacheTiers(tiers)
-		attachProbe(agg, probeRounds)
 		agg.Tiers = tiers
 		res.Cache = agg
 	default:
@@ -360,6 +342,26 @@ func (e *CacheEngine) runTier(ctx context.Context, spec Spec, st domain.StepSpec
 	emit(Event{Kind: EvStepStarted, At: time.Now().UTC(), Data: map[string]any{
 		"step_index": st.Index, "bucket": st.Bucket, "parallel": st.Parallel, "number": 0,
 	}})
+
+	// 前缀命中率探针：每档 bench 之前各跑一次（用本档的 token 形状），
+	// 抓原始 usage 里的 cached_tokens —— lmcache bench 的 CSV 不含该字段。
+	// 探针失败不阻断 bench；探针请求本身不计入该档 bench 指标。
+	probeRounds, probeErr := e.probePrefixCache(ctx, spec, outDir)
+	for _, pr := range probeRounds {
+		fmt.Fprintf(logFile, "[probe] round=%d prompt=%d cached=%d hit=%.1f%% ttft=%.0fms\n",
+			pr.Round, pr.PromptTokens, pr.CachedTokens, pr.HitRate*100, pr.ReqMS)
+	}
+	if probeErr != nil {
+		fmt.Fprintf(logFile, "[probe] 探针未完成: %v（不影响 bench）\n", probeErr)
+	}
+	if err := ctx.Err(); err != nil {
+		tr.step = domain.Step{Index: st.Index, Bucket: st.Bucket, Status: domain.StepCanceled}
+		tr.note = "已取消"
+		emit(Event{Kind: EvStepFinished, At: time.Now().UTC(), Data: map[string]any{
+			"step_index": st.Index, "status": string(domain.StepCanceled), "success_rate": 0.0,
+		}})
+		return tr, nil
+	}
 
 	args := e.benchArgs(spec, outDir)
 	cmd := exec.CommandContext(ctx, e.cli, args...)
@@ -435,7 +437,7 @@ func (e *CacheEngine) runTier(ctx context.Context, spec Spec, st domain.StepSpec
 		_ = exp.Run()
 	}
 
-	metrics, ferr := readBenchResults(outDir, nil)
+	metrics, ferr := readBenchResults(outDir, probeRounds)
 	status := domain.StepSucceeded
 	errMsg := ""
 	if ferr != nil {
@@ -846,6 +848,7 @@ func collectCacheFiles(prefix, dir string) []FileArtifact {
 		{"bench_results.csv", domain.ArtBenchCSV, "text/csv; charset=utf-8"},
 		{"bench_summary.json", domain.ArtBenchSummary, "application/json"},
 		{"resolved_config.json", domain.ArtBenchConfig, "application/json"},
+		{"prefix_usage.csv", domain.ArtBenchCSV, "text/csv; charset=utf-8"},
 	}
 	var out []FileArtifact
 	for _, c := range names {

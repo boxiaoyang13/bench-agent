@@ -282,17 +282,22 @@ Step（多档）：`bucket = "c<sessions>"`（如 `c4`）、`parallel = 该档�
         "elapsed_sec": 30.0,
         "steady_state": {"requests": 12, "ttft_p50_ms": 447.7,
                           "tpot_p50_ms": 7.4, "decode_speed_p50": 134.0},
+        "prefix_hit_rate": 0.93, "cache_field_reported": true,
         "output_throughput": 61.8,
+        "probe_rounds": [{"round": 0, "prompt_tokens": 12000, "cached_tokens": 0}],
         "rounds": [{"round": 0, "requests": 1, "ttft_mean_ms": 1055.0}]
       },
       { "bucket": "c2", "sessions": 2, "qps": 1.0, "...": "同结构" },
       { "bucket": "c4", "sessions": 4, "qps": 2.0, "...": "同结构" }
     ],
-    "probe_rounds": [{"round": 0, "prompt_tokens": 12000, "cached_tokens": 0}],
     "prefix_hit_rate": 0.91, "cache_field_reported": true
   }
 }
 ```
+
+> 多档时**每档各自跑一次前缀命中率探针**（bench 前，独立于 bench 统计），结果挂在各档
+> `tiers[].prefix_hit_rate` / `tiers[].probe_rounds` 上；顶层 `prefix_hit_rate` 是跨档
+> **简单平均**（只对上报了 cached_tokens 的档位求平均），`cache_field_reported` 要求所有档位都上报。
 
 聚合口径：
 
@@ -314,21 +319,22 @@ POST /v1/runs (tool=lmcache, capability=cache)
 
 worker:
   ├─ 解密 target 凭据
-  ├─ 前缀命中率探针（整 run 一次，写 <runDir>/cache/prefix_usage.csv）
   └─ for 每个 step（档位）:
        ├─ 生效 plan = base + ladder[i]（kv 容量 / qps）
+       ├─ 前缀命中率探针（每档一次，写 <runDir>/cache/<bucket>/prefix_usage.csv）
        ├─ spawn: lmcache bench engine ... --output-dir <runDir>/cache/<bucket>
        │    env: OPENAI_API_KEY=<target key>，PATH 前置 .venv/bin
        ├─ stdout → 日志 + SSE；进度解析（MRC 无逐请求输出，只推阶段事件）
        ├─ 进程结束 → --export-config + 读 bench_summary.json / bench_results.csv
-       ├─ 派生该档 rounds / first-round / steady / 性能指标
+       ├─ 派生该档 rounds / first-round / steady / 性能 / 命中率指标
        └─ 回填该 step（parallel = 实测 session 数，number = 请求数）
   ├─ 多档：聚合顶层指标（Tiers 明细保留）→ run.summary + metrics.json
   └─ 归档 artifacts → run.succeeded/failed/partial
 ```
 
-档位**顺序**执行（不并发）：避免相邻档位互相抢带宽/缓存导致曲线失真。探针在全部档位之前
-只跑一次，其结果挂到顶层结果上（各档 bench 自带 warmup，探针只影响首档前的缓存状态）。
+档位**顺序**执行（不并发）：避免相邻档位互相抢带宽/缓存导致曲线失真。每档 bench 前各跑
+一次前缀命中率探针（探针请求不计入该档 bench 指标）；bench 自带 warmup，因此探针只影响
+该档 bench 启动前的缓存状态，不影响判定口径。
 
 取消：SIGTERM 进程组（httpx 客户端随进程终止），step 标 `canceled`；
 CSV/JSON 已落盘的部分照常归档（`--json` 下 summary 在结束时才写，取消可能只有 CSV——
@@ -356,22 +362,23 @@ data:runs/<run_id>/
 ├── metrics.json                     # { "cache": {...} }（§3.3 结构；多档含 tiers[]）
 ├── logs/<run_id>-cache.log          # 引擎原始输出（脱敏，按档位分段）
 ├── cache/
-│   ├── prefix_usage.csv             # 前缀命中率探针原始数据（整 run 一份）
 │   ├── multi-round-chat/            # 单档：--output-dir（原始）
 │   │   ├── bench_results.csv
 │   │   ├── bench_summary.json
-│   │   └── resolved_config.json
+│   │   ├── resolved_config.json
+│   │   └── prefix_usage.csv         # 该档前缀命中率探针原始数据
 │   └── c1/  c4/  …                  # 多档：每档一个 --output-dir
 │       ├── bench_results.csv
 │       ├── bench_summary.json
-│       └── resolved_config.json
+│       ├── resolved_config.json
+│       └── prefix_usage.csv
 └── artifacts/
     ├── multi-round-chat-prefix_usage.csv
     ├── multi-round-chat-bench_results.csv                  # 单档
     ├── multi-round-chat-bench_summary.json
     ├── multi-round-chat-resolved_config.json
-    ├── c1-bench_results.csv / c1-bench_summary.json / c1-resolved_config.json
-    ├── c4-bench_results.csv / c4-bench_summary.json / c4-resolved_config.json
+    ├── c1-bench_results.csv / c1-bench_summary.json / c1-resolved_config.json / c1-prefix_usage.csv
+    ├── c4-bench_results.csv / c4-bench_summary.json / c4-resolved_config.json / c4-prefix_usage.csv
     └── run.log
 ```
 
@@ -418,13 +425,13 @@ gates:
 > 性能口径：这些数字是「前缀缓存命中态」的表观性能，不是冷启动/独占压测性能；
 > 与 `perf-sla-v1` 的数字不可直接横比。阈值只是默认值，各部署按被测模型覆盖。
 
-前缀命中率探针（Go 直采）：
+前缀命中率探针（Go 直采，每档一次）：
 
-- bench 之前对端点发 1 次冷 + 4 次增长请求（同 workload 的 token 形状），
+- 每档 bench **之前**对端点发 1 次冷 + 4 次增长请求（同 workload 的 token 形状），
   抓 `usage.prompt_tokens_details.cached_tokens`
-- 结果：`cache.probe_rounds[]`（逐轮原始 usage）、`cache.prefix_hit_rate`（稳态）、
-  `cache.cache_field_reported`（端点是否上报该字段）
-- 产物：`prefix_usage.csv`（round / prompt_tokens / cached_tokens / hit_rate / req_ms）
+- 结果：该档的 `tiers[].probe_rounds[]`（逐轮原始 usage）、`tiers[].prefix_hit_rate`（稳态平均）、
+  `tiers[].cache_field_reported`（端点是否上报该字段）；顶层 `prefix_hit_rate` 为跨档平均
+- 产物：每档 `prefix_usage.csv`（round / prompt_tokens / cached_tokens / hit_rate / req_ms）
 - 探针失败不阻断 bench
 
 判定（`report.EvaluateCacheGate`）：
@@ -460,11 +467,11 @@ gates:
    **待执行 → 跳过**（引擎轮到该档时直接跳过），用于剔除个别档位而不用停掉整个 run
 5. 结果页：
    - 单档：KPI 卡（前缀命中率、稳态 TTFT P50、首轮 TTFT、改善率、TPOT P50、
-     解码速度、输出吞吐、成功率）+ 逐轮 TTFT 表 + 性能指标表 + 口径说明 +
-     违规明细 + 产物下载
+     解码速度、输出吞吐、成功率）+ 逐轮 TTFT 表 + 性能指标表（含 TPS/TPM 口径）+
+     口径说明 + 违规明细 + 产物下载
    - 多档：KPI 卡（档位数、前缀命中率、总请求数、加权 TTFT/TPOT、总吞吐、验收）+
-     **并发档位曲线表**（档位 / QPS / 请求数 / 成功率 / 稳态 TTFT P50 / 改善率 /
-     TPOT P50 / 解码速度 / 输出吞吐 / 稳态样本）+ 违规明细（带档位列）
+     **并发档位曲线表**（档位 / QPS / 请求数 / 成功率 / 稳态 TTFT P50 / 平均命中率 /
+     TPOT P50 / 解码速度 TPS / 输出吞吐 TPS / 输出吞吐 TPM=TPS×60）+ 违规明细（带档位列）
 6. 历史列表：`能力` 列显示 `缓存测试`；多档显示 `分档 N（最大 M 并发）`，结论列同 eval
 
 ---
@@ -560,7 +567,8 @@ plan 增加 `ladder` 多档，一次 run 顺序跑完，输出「TTFT/TPOT/吞�
    + 反算每档 KV 容量（`ceil(sessions × 单会话 token / tokens_per_gb)`）+ 总时长上限校验；
    `reportCache` summary 增加 `tiers_count` / `max_sessions`，gate 逐档判定
 4. `engine/cache.go`：`Run` 改为多档循环（每档一个子进程、独立 `cache/<bucket>` 目录、
-   独立 `--export-config` 与产物前缀），探针整 run 一次；`aggregateCacheTiers` 聚合顶层指标
+   独立 `--export-config` 与产物前缀），探针每档一次（命中率可逐档对比）；`aggregateCacheTiers`
+   聚合顶层指标（命中率取跨档平均）
 5. `report/gate.go`：`EvaluateCacheGate` 识别 `m.Tiers` 逐档判定，违规带 `tier`，
    `tier_summary` 每档一行；单档行为不变
 6. `engine/fake.go`：builtin 引擎按档位模拟（每档独立 step），用于 UI 联调与集成测试
