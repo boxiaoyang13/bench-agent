@@ -558,12 +558,14 @@ func (m *Manager) execute(ctx context.Context, runID string) {
 			lr.mu.Unlock()
 		}
 	case domain.CapCache:
-		// 全部请求失败 → failed；部分失败 → partial（gate 另行判定）
+		// 全部请求失败 → failed；部分请求/档位失败 → partial（gate 另行判定）
 		if res.Cache != nil && res.Cache.TotalRequests > 0 {
 			switch {
 			case res.Cache.SuccessReqs == 0:
 				status = domain.StatusFailed
 			case res.Cache.FailedReqs > 0:
+				status = domain.StatusPartial
+			case hasFailedStep(lr):
 				status = domain.StatusPartial
 			}
 		} else {

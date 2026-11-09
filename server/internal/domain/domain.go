@@ -109,6 +109,16 @@ type BucketOverride struct {
 
 // ---------------- cache（capability=cache） ----------------
 
+// CacheTier 是并发档位（plan.ladder[]）。
+//
+// MRC 不直接接受并发数：session 数由 kv-cache-volume 与单会话 token 数推导，
+// 因此规范化时会把 sessions 反算成 KVCacheVolumeGB 回填到这里（见 runmgr）。
+type CacheTier struct {
+	Sessions        int     `json:"sessions"`                     // 目标并发 session 数
+	QPS             float64 `json:"qps,omitempty"`                // 该档全局 QPS；0 = 继承 plan.qps
+	KVCacheVolumeGB float64 `json:"kv_cache_volume_gb,omitempty"` // 规范化后回填：sessions × 单会话 token / tokens_per_gb
+}
+
 // CacheRoundStats 是 multi-round-chat 单轮（跨 session 聚合）的统计。
 type CacheRoundStats struct {
 	Round           int     `json:"round"`
@@ -127,9 +137,16 @@ type CacheProbeRound struct {
 }
 
 // CacheMetrics 是一次 cache run 的结果（bench_summary.json + CSV 派生）。
+//
+// 单档 run 直接使用顶层字段；多档 run（plan.ladder 非空）顶层为跨档聚合，
+// 每档的完整指标在 Tiers 里（Tiers 元素不再嵌套 Tiers）。
 type CacheMetrics struct {
 	Workload      string            `json:"workload"`
 	Model         string            `json:"model,omitempty"`
+	Bucket        string            `json:"bucket,omitempty"`   // 多档档位标识（c1/c2/c4…）
+	Sessions      int               `json:"sessions,omitempty"` // 该档计划并发 session 数
+	QPS           float64           `json:"qps,omitempty"`      // 该档计划 QPS
+	Tiers         []*CacheMetrics   `json:"tiers,omitempty"`    // 多档：每档完整指标
 	NumSessions   int               `json:"num_sessions,omitempty"`
 	TotalRequests int               `json:"total_requests"`
 	SuccessReqs   int               `json:"successful_requests"`
@@ -251,6 +268,9 @@ type Plan struct {
 	Seed            *int    `json:"seed,omitempty"`
 	NoWarmup        bool    `json:"no_warmup,omitempty"`
 	IgnoreEOS       bool    `json:"ignore_eos,omitempty"`
+	// 并发档位（方案 B）：非空时按档位展开多 step；每档 sessions 反算 KV 容量，
+	// qps 缺省继承 p.QPS；duration_sec 为「每档」时长。
+	CacheLadder []CacheTier `json:"ladder,omitempty"`
 	// 请求形状（MRC）
 	SharedPromptLen int `json:"shared_prompt_length,omitempty"`
 	ChatHistoryLen  int `json:"chat_history_length,omitempty"`

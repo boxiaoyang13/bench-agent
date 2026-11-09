@@ -45,18 +45,19 @@ type planDTO struct {
 	ThinkingType  string            `json:"thinking_type,omitempty"`
 
 	// cache（tool=lmcache）
-	Workload        string  `json:"workload,omitempty"`
-	KVCacheVolumeGB float64 `json:"kv_cache_volume_gb,omitempty"`
-	TokensPerGBKV   int     `json:"tokens_per_gb_kvcache,omitempty"`
-	QPS             float64 `json:"qps,omitempty"`
-	CacheDuration   int     `json:"duration_sec,omitempty"`
-	Seed            *int    `json:"seed,omitempty"`
-	NoWarmup        bool    `json:"no_warmup,omitempty"`
-	IgnoreEOS       bool    `json:"ignore_eos,omitempty"`
-	SharedPromptLen int     `json:"shared_prompt_length,omitempty"`
-	ChatHistoryLen  int     `json:"chat_history_length,omitempty"`
-	UserInputLen    int     `json:"user_input_length,omitempty"`
-	OutputLen       int     `json:"output_length,omitempty"`
+	Workload        string             `json:"workload,omitempty"`
+	KVCacheVolumeGB float64            `json:"kv_cache_volume_gb,omitempty"`
+	TokensPerGBKV   int                `json:"tokens_per_gb_kvcache,omitempty"`
+	QPS             float64            `json:"qps,omitempty"`
+	CacheDuration   int                `json:"duration_sec,omitempty"`
+	Seed            *int               `json:"seed,omitempty"`
+	NoWarmup        bool               `json:"no_warmup,omitempty"`
+	IgnoreEOS       bool               `json:"ignore_eos,omitempty"`
+	SharedPromptLen int                `json:"shared_prompt_length,omitempty"`
+	ChatHistoryLen  int                `json:"chat_history_length,omitempty"`
+	UserInputLen    int                `json:"user_input_length,omitempty"`
+	OutputLen       int                `json:"output_length,omitempty"`
+	Ladder          []domain.CacheTier `json:"ladder,omitempty"` // 并发档位（方案 B）
 }
 
 func (d planDTO) toDomain() domain.Plan {
@@ -71,7 +72,7 @@ func (d planDTO) toDomain() domain.Plan {
 		Workload: d.Workload, KVCacheVolumeGB: d.KVCacheVolumeGB, TokensPerGBKV: d.TokensPerGBKV,
 		QPS: d.QPS, DurationSec: d.CacheDuration, Seed: d.Seed, NoWarmup: d.NoWarmup,
 		IgnoreEOS: d.IgnoreEOS, SharedPromptLen: d.SharedPromptLen, ChatHistoryLen: d.ChatHistoryLen,
-		UserInputLen: d.UserInputLen, OutputLen: d.OutputLen,
+		UserInputLen: d.UserInputLen, OutputLen: d.OutputLen, CacheLadder: d.Ladder,
 	}
 }
 

@@ -196,9 +196,13 @@ function bucketTokens(label) {
 
 /** 与服务端 steps_total 同一算法（纯函数，用于提交前预估与校验） */
 function computeSteps(plan) {
-  // 缓存测试：单步骤
+  // 缓存测试：单档 = 1 步；并发档位 = 每档 1 步
   if (plan.workload) {
-    return { total: 1, perStep: [{ bucket: plan.workload }], skipped: [] };
+    const ladder = Array.isArray(plan.ladder) ? plan.ladder : [];
+    const perStep = ladder.length
+      ? ladder.map(t => ({ bucket: 'c' + t.sessions, parallel: t.sessions, number: 0 }))
+      : [{ bucket: plan.workload }];
+    return { total: perStep.length, perStep, skipped: [] };
   }
   // 效果评测：一个数据集一个步骤
   if (Array.isArray(plan.datasets)) {
@@ -697,10 +701,18 @@ function evalPlan() {
   return plan;
 }
 
+function parseLadderSessions(raw) {
+  return String(raw || '').split(/[,，\s]+/).map(v => Number(v))
+    .filter(v => Number.isInteger(v) && v > 0);
+}
+
 function cachePlan() {
   const num = (sel) => Number($(sel).value) || 0;
   const seed = num('#c-seed');
-  return {
+  const sessions = parseLadderSessions($('#c-ladder')?.value);
+  const scaleQPS = $('#c-ladder-mode')?.value !== 'fixed';
+  const perSessionQPS = Number($('#c-ladder-qps')?.value) || 0;
+  const plan = {
     mode: 'single',
     workload: 'multi-round-chat',
     duration_sec: num('#c-duration'),
@@ -714,6 +726,13 @@ function cachePlan() {
     no_warmup: $('#c-warmup').value === 'false',
     ...(seed ? { seed } : {}),
   };
+  if (sessions.length) {
+    plan.ladder = sessions.map(n => ({
+      sessions: n,
+      ...(scaleQPS && perSessionQPS > 0 ? { qps: Math.round(n * perSessionQPS * 1000) / 1000 } : {}),
+    }));
+  }
+  return plan;
 }
 
 function updateCacheEstimate() {
@@ -724,12 +743,35 @@ function updateCacheEstimate() {
   const plan = cachePlan();
   const perSession = plan.shared_prompt_length + plan.chat_history_length;
   const users = perSession > 0 ? Math.floor(plan.kv_cache_volume_gb * plan.tokens_per_gb_kvcache / perSession) : 0;
+  const ladder = plan.ladder || [];
+  if (ladder.length) {
+    const totalDuration = ladder.length * plan.duration_sec;
+    const totalReq = ladder.reduce((acc, t) => acc + Math.round((t.qps || plan.qps) * plan.duration_sec), 0);
+    const totalTokens = ladder.reduce((acc, t) =>
+      acc + Math.round((t.qps || plan.qps) * plan.duration_sec * (perSession + plan.output_length)), 0);
+    const desc = ladder.map(t => `c${t.sessions}@${t.qps || plan.qps}qps`).join(' / ');
+    box.innerHTML = `并发档位 <b>${ladder.length}</b> 档（${esc(desc)}，按 session 数升序顺序执行）；` +
+      `预计执行时长约 <b>${fmtDur(totalDuration)}</b>（不含每档预热），预计请求数约 <b>${totalReq}</b>；` +
+      `预计消耗约 <b>${totalTokens.toLocaleString()}</b> token。` +
+      (perSession > 0
+        ? `<br>每档容量 = session 数 × 单会话 ${perSession} token ÷ ${plan.tokens_per_gb_kvcache}（服务端反算并回填）；`
+        : '<br>⚠ 并发档位需要填写 System Prompt / 预填历史，才能反算每档 KV 容量；') +
+      (plan.no_warmup ? '<br>⚠ 预热已关闭：为冷启动口径，验收不判改善率。' : '');
+    return;
+  }
   const estTokens = Math.round(plan.qps * plan.duration_sec * (perSession + plan.output_length));
   box.innerHTML = `并发 session 数约 <b>${Math.max(1, users)}</b>（由 KV 容量推导）；` +
     `预计请求数约 <b>${Math.round(plan.qps * plan.duration_sec)}</b>（性能验收建议 ≥100 稳态样本）；` +
     `预计消耗约 <b>${estTokens.toLocaleString()}</b> token（QPS × 时长 × 单请求 token）。` +
     (plan.no_warmup ? '<br>⚠ 预热已关闭：为冷启动口径，验收不判改善率。' : '');
 }
+
+['#c-duration', '#c-qps', '#c-ladder', '#c-ladder-qps', '#c-ladder-mode',
+  '#c-volume', '#c-tpg', '#c-shared', '#c-history', '#c-input', '#c-output', '#c-warmup']
+  .forEach(sel => {
+    $(sel)?.addEventListener('input', updateCacheEstimate);
+    $(sel)?.addEventListener('change', updateCacheEstimate);
+  });
 
 function buildPlan() {
   if (state.capability === 'eval') return evalPlan();
@@ -821,6 +863,21 @@ $('#btn-to-step3')?.addEventListener('click', () => {
   } else if (state.capability === 'cache') {
     const dur = Number($('#c-duration').value) || 0;
     if (dur < 10 || dur > 3600) { toast('测试时长需在 10~3600 秒', 'err'); return; }
+    const ladder = cachePlan().ladder || [];
+    if (ladder.length) {
+      if (ladder.length > 20) { toast('并发档位最多 20 档', 'err'); return; }
+      const seen = new Set();
+      for (const t of ladder) {
+        if (seen.has(t.sessions)) { toast('并发档位重复：' + t.sessions, 'err'); return; }
+        seen.add(t.sessions);
+      }
+      if ($('#c-ladder-mode')?.value !== 'fixed' && !(Number($('#c-ladder-qps')?.value) > 0)) {
+        toast('请填写每 session QPS', 'err'); return;
+      }
+      if ((Number($('#c-shared').value) || 0) + (Number($('#c-history').value) || 0) <= 0) {
+        toast('并发档位需要 System Prompt + 预填历史 > 0（用于反算 KV 容量）', 'err'); return;
+      }
+    }
   } else if (state.mode === 'matrix' && !state.matrixBuckets.length) {
     toast('请至少选择一个档位', 'err'); return;
   }
@@ -870,11 +927,20 @@ function renderConfirm() {
     const plan = payload.plan;
     const perSession = plan.shared_prompt_length + plan.chat_history_length;
     const users = perSession > 0 ? Math.max(1, Math.floor(plan.kv_cache_volume_gb * plan.tokens_per_gb_kvcache / perSession)) : '—';
+    const ladder = plan.ladder || [];
+    const totalReq = ladder.length
+      ? ladder.reduce((acc, t) => acc + Math.round((t.qps || plan.qps) * plan.duration_sec), 0)
+      : Math.round(plan.qps * plan.duration_sec);
     rows = [
       ['能力', '缓存测试（multi-round-chat）'],
-      ['时长 / QPS', `${plan.duration_sec}s / ${plan.qps}`],
-      ['并发 session', `${users}（容量推导）`],
-      ['预计请求数', `${Math.round(plan.qps * plan.duration_sec)}（性能验收建议 ≥100）`],
+      ['并发档位', ladder.length
+        ? `${ladder.length} 档：${ladder.map(t => `c${t.sessions}@${t.qps || plan.qps}qps`).join(' / ')}`
+        : '单档'],
+      ['时长 / QPS', ladder.length
+        ? `每档 ${plan.duration_sec}s（共约 ${fmtDur(ladder.length * plan.duration_sec)}）/ 按档位`
+        : `${plan.duration_sec}s / ${plan.qps}`],
+      ['并发 session', ladder.length ? '各档由容量反算（见 ladder）' : `${users}（容量推导）`],
+      ['预计请求数', `${totalReq}（性能验收建议每档 ≥100）`],
       ['Prompt / 历史 / 输入 / 输出', `${plan.shared_prompt_length} / ${plan.chat_history_length} / ${plan.user_input_length} / ${plan.output_length} token`],
       ['预热', plan.no_warmup ? '关闭（冷启动口径）' : '开启'],
       ['验收', payload.gate
@@ -1305,37 +1371,68 @@ function renderCacheResults(results, artifacts) {
   badge.className = 'badge ' + cls;
   badge.textContent = text;
 
+  const isMulti = Array.isArray(c.tiers) && c.tiers.length > 0;
   const imp = s.ttft_improvement;
   const ss = c.steady_state || {};
   const numOr = (v, unit) => (v != null && v > 0 ? fmtNum(v) + unit : '—');
-  const kpis = [
-    ['前缀命中率', s.prefix_hit_rate != null ? fmtPct(s.prefix_hit_rate) : '—',
-      s.cache_field_reported === false ? '⚠ 端点未上报 cached_tokens' : 'cached/prompt（探针直采）'],
-    ['稳态 TTFT P50', s.ttft_steady_p50_ms != null ? fmtNum(s.ttft_steady_p50_ms) + 'ms' : '—', '前缀命中下的首 token'],
-    ['首轮 TTFT', s.ttft_first_round_ms != null ? fmtNum(s.ttft_first_round_ms) + 'ms' : '—', '冷/半冷缓存'],
-    ['TTFT 改善率', imp != null ? fmtPct(imp) : '—', '1 − 稳态P50/首轮均值'],
-    ['TPOT P50', numOr(ss.tpot_p50_ms, 'ms'), '稳态，每输出 token'],
-    ['解码速度 P50', numOr(ss.decode_speed_p50, ' t/s'), '稳态，主要反映生成性能'],
-    ['输出吞吐', numOr(c.output_throughput || s.output_throughput, ' t/s'), '全 run'],
-    ['成功率', s.success_rate != null ? fmtPct(s.success_rate) : '—', `${s.successful_requests ?? '—'}/${s.total_requests ?? '—'} 请求`],
-  ];
+  const kpis = isMulti
+    ? [
+      ['并发档位', `${s.tiers_count ?? c.tiers.length} 档`, `最大 ${s.max_sessions ?? '—'} session`],
+      ['前缀命中率', s.prefix_hit_rate != null ? fmtPct(s.prefix_hit_rate) : '—',
+        s.cache_field_reported === false ? '⚠ 端点未上报 cached_tokens' : 'cached/prompt（探针直采）'],
+      ['总请求数', s.total_requests ?? '—', `成功率 ${s.success_rate != null ? fmtPct(s.success_rate) : '—'}`],
+      ['TTFT 均值', numOr(s.mean_ttft_ms, 'ms'), '全档加权（成功请求）'],
+      ['TPOT 均值', numOr(s.tpot_mean_ms, 'ms'), '全档加权（输出 token）'],
+      ['输入吞吐', numOr(s.input_throughput, ' t/s'), '总 token / 总时长'],
+      ['输出吞吐', numOr(s.output_throughput, ' t/s'), '总 token / 总时长'],
+      ['验收', g ? (g.passed ? '通过' : `违规 ${(g.violations || []).length} 项`) : '未判定',
+        g ? g.profile : '—'],
+    ]
+    : [
+      ['前缀命中率', s.prefix_hit_rate != null ? fmtPct(s.prefix_hit_rate) : '—',
+        s.cache_field_reported === false ? '⚠ 端点未上报 cached_tokens' : 'cached/prompt（探针直采）'],
+      ['稳态 TTFT P50', s.ttft_steady_p50_ms != null ? fmtNum(s.ttft_steady_p50_ms) + 'ms' : '—', '前缀命中下的首 token'],
+      ['首轮 TTFT', s.ttft_first_round_ms != null ? fmtNum(s.ttft_first_round_ms) + 'ms' : '—', '冷/半冷缓存'],
+      ['TTFT 改善率', imp != null ? fmtPct(imp) : '—', '1 − 稳态P50/首轮均值'],
+      ['TPOT P50', numOr(ss.tpot_p50_ms, 'ms'), '稳态，每输出 token'],
+      ['解码速度 P50', numOr(ss.decode_speed_p50, ' t/s'), '稳态，主要反映生成性能'],
+      ['输出吞吐', numOr(c.output_throughput || s.output_throughput, ' t/s'), '全 run'],
+      ['成功率', s.success_rate != null ? fmtPct(s.success_rate) : '—', `${s.successful_requests ?? '—'}/${s.total_requests ?? '—'} 请求`],
+    ];
   $('#run-kpis').innerHTML = kpis.map(([k, v, sub]) =>
     `<div class="kpi"><div class="k">${esc(k)}</div><div class="v">${esc(v)}<small> ${esc(sub)}</small></div></div>`).join('');
 
-  const roundRows = (c.rounds || []).map(r => `
+  // 多档：并发-性能曲线表（每档一行）
+  const tierRows = isMulti ? c.tiers.map(t => {
+    const tss = t.steady_state || {};
+    return `<tr>
+      <td><b>${esc(t.bucket || '—')}</b><br><span class="hint">${t.sessions ?? '—'} session</span></td>
+      <td class="num">${fmtNum(t.qps)}</td>
+      <td class="num">${t.total_requests ?? '—'}</td>
+      <td class="num">${t.success_rate != null ? fmtPct(t.success_rate) : '—'}</td>
+      <td class="num">${tss.ttft_p50_ms != null ? fmtNum(tss.ttft_p50_ms) + 'ms' : '—'}</td>
+      <td class="num">${tss.ttft_improvement != null ? fmtPct(tss.ttft_improvement) : '—'}</td>
+      <td class="num">${tss.tpot_p50_ms > 0 ? fmtNum(tss.tpot_p50_ms) + 'ms' : '—'}</td>
+      <td class="num">${tss.decode_speed_p50 > 0 ? fmtNum(tss.decode_speed_p50) + ' t/s' : '—'}</td>
+      <td class="num">${t.output_throughput > 0 ? fmtNum(t.output_throughput) + ' t/s' : '—'}</td>
+      <td class="num">${tss.requests ?? '—'}</td></tr>`;
+  }).join('') : '';
+
+  const roundRows = isMulti ? '' : (c.rounds || []).map(r => `
     <tr><td class="num">${r.round}</td><td class="num">${r.requests}</td>
       <td class="num">${fmtNum(r.ttft_mean_ms)}ms</td>
       <td class="num">${fmtNum(r.input_tokens_mean)}</td></tr>`).join('');
+  const hasTier = (g?.violations || []).some(v => v.tier);
   const violRows = (g?.violations || []).map(v => `
-    <tr><td>${esc(v.rule)}</td><td class="num">${fmtNum(v.actual)}</td>
+    <tr>${hasTier ? `<td>${esc(v.tier || '—')}</td>` : ''}<td>${esc(v.rule)}</td><td class="num">${fmtNum(v.actual)}</td>
       <td class="num">${fmtNum(v.threshold)}</td><td class="muted">${esc(v.message || '')}</td></tr>`).join('');
   const probeRows = (c.probe_rounds || []).map(r => `
     <tr><td class="num">${r.round}</td><td class="num">${r.prompt_tokens}</td>
       <td class="num">${r.cached_tokens}</td>
       <td class="num">${r.hit_rate != null ? fmtPct(r.hit_rate) : '—'}</td>
       <td class="num">${r.req_ms ? fmtNum(r.req_ms) + 'ms' : '—'}</td></tr>`).join('');
-  // 性能维度（总是渲染，缺失显示 —；口径见下方说明）
-  const perfRows = [
+  // 单档性能明细（多档时由上面的曲线表覆盖）
+  const perfRows = isMulti ? '' : [
     ['稳态 TTFT P90 / P99', `${numOr(s.ttft_steady_p90_ms, 'ms')} / ${numOr(s.ttft_steady_p99_ms, 'ms')}`],
     ['请求时延 P50 / P90 / P99', `${numOr(c.request_latency_p50_ms, 'ms')} / ${numOr(c.request_latency_p90_ms, 'ms')} / ${numOr(c.request_latency_p99_ms, 'ms')}`],
     ['TPOT P50 / P90（稳态）', `${numOr(ss.tpot_p50_ms, 'ms')} / ${numOr(ss.tpot_p90_ms, 'ms')}`],
@@ -1344,8 +1441,16 @@ function renderCacheResults(results, artifacts) {
   ].map(([k, v]) => `<tr><td>${esc(k)}</td><td class="num">${esc(v)}</td></tr>`).join('');
   $('#gate-body').innerHTML = `
     <p class="muted">workload ${esc(c.workload || 'multi-round-chat')} · ${esc(c.model || '')} ·
-      ${c.num_sessions ? c.num_sessions + ' 个并发 session · ' : ''}${s.total_requests ?? '—'} 个请求。
+      ${isMulti ? `${c.tiers.length} 个并发档位 · ` : (c.num_sessions ? c.num_sessions + ' 个并发 session · ' : '')}
+      ${s.total_requests ?? '—'} 个请求。
       ${g ? `验收模板 ${esc(g.profile)} · 违规 ${(g.violations || []).length} 项` : '未启用验收'}</p>
+    ${isMulti ? `<h4 style="margin-top:12px">并发档位（前缀缓存命中态）</h4>
+      <table class="tbl"><thead><tr><th>档位</th><th class="num">QPS</th><th class="num">请求数</th>
+      <th class="num">成功率</th><th class="num">稳态 TTFT P50</th><th class="num">改善率</th>
+      <th class="num">TPOT P50</th><th class="num">解码速度</th><th class="num">输出吞吐</th>
+      <th class="num">稳态样本</th></tr></thead><tbody>${tierRows}</tbody></table>
+      <p class="muted">各档按并发升序顺序执行；性能数字为「前缀缓存命中态」表观性能，
+        与性能压测的冷启动口径不可直接横比，且各档之间共享同一被测端点（顺序执行，不并发）。</p>` : ''}
     ${probeRows ? `<h4 style="margin-top:12px">前缀命中率探针（原始 usage）</h4>
       <table class="tbl"><thead><tr><th class="num">轮次</th><th class="num">prompt_tokens</th>
       <th class="num">cached_tokens</th><th class="num">命中率</th><th class="num">请求耗时</th>
@@ -1353,12 +1458,12 @@ function renderCacheResults(results, artifacts) {
       <p class="muted">探针在 bench 前直连端点抓取 usage.prompt_tokens_details.cached_tokens；原始文件见 prefix_usage.csv</p>` : ''}
     ${roundRows ? `<h4 style="margin-top:12px">bench 逐轮 TTFT</h4><table class="tbl"><thead><tr><th class="num">轮次</th><th class="num">请求数</th>
       <th class="num">TTFT 均值</th><th class="num">输入 token 均值</th></tr></thead><tbody>${roundRows}</tbody></table>` : ''}
-    <h4 style="margin-top:16px">性能指标（前缀缓存命中态）</h4>
-    <table class="tbl"><thead><tr><th>指标</th><th class="num">数值</th></tr></thead><tbody>${perfRows}</tbody></table>
-    <p class="muted">TTFT 受前缀缓存影响大；TPOT / 解码速度 / 输出吞吐主要反映模型生成性能。
-      性能结论需足够稳态样本（建议 ≥100，可延长时长或提高 QPS），且与性能压测的冷启动口径不可直接横比。</p>
+    ${perfRows ? `<h4 style="margin-top:16px">性能指标（前缀缓存命中态）</h4>
+      <table class="tbl"><thead><tr><th>指标</th><th class="num">数值</th></tr></thead><tbody>${perfRows}</tbody></table>
+      <p class="muted">TTFT 受前缀缓存影响大；TPOT / 解码速度 / 输出吞吐主要反映模型生成性能。
+        性能结论需足够稳态样本（建议 ≥100，可延长时长或提高 QPS），且与性能压测的冷启动口径不可直接横比。</p>` : ''}
     ${violRows ? `<h4 style="margin-top:16px">违规明细</h4><table class="tbl"><thead><tr>
-      <th>规则</th><th class="num">实测</th><th class="num">阈值</th><th>说明</th>
+      ${hasTier ? '<th>档位</th>' : ''}<th>规则</th><th class="num">实测</th><th class="num">阈值</th><th>说明</th>
     </tr></thead><tbody>${violRows}</tbody></table>` : ''}`;
 
   $('#artifact-list').innerHTML = artifacts.length ? artifacts.map(a => `
@@ -1490,8 +1595,10 @@ async function loadHistory(reset) {
         <td class="num">${r.capability === 'eval'
           ? (r.summary?.score_avg != null ? '均分 ' + fmtNum(r.summary.score_avg, 3) : '—')
           : r.capability === 'cache'
-            ? (r.summary?.prefix_hit_rate != null ? '命中 ' + fmtPct(r.summary.prefix_hit_rate)
-              : r.summary?.ttft_improvement != null ? '改善 ' + fmtPct(r.summary.ttft_improvement) : '—')
+            ? (r.summary?.tiers_count
+              ? '分档 ' + r.summary.tiers_count + (r.summary.max_sessions ? '（最大 ' + r.summary.max_sessions + ' 并发）' : '')
+              : r.summary?.prefix_hit_rate != null ? '命中 ' + fmtPct(r.summary.prefix_hit_rate)
+                : r.summary?.ttft_improvement != null ? '改善 ' + fmtPct(r.summary.ttft_improvement) : '—')
             : (r.summary?.success_rate != null ? fmtPct(r.summary.success_rate) : '—')}</td>
         <td>${verdict}</td>
         <td class="act">

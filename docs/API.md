@@ -739,6 +739,11 @@ Web 界面「历史记录」页的入口：
 > 口径与完整字段见 [`CACHE.md`](./CACHE.md) §3.3；性能数字是「前缀缓存命中态」的表观性能，
 > 与 perf 的冷启动口径不可直接横比。
 
+**多档（并发档位，方案 B）**：`plan.ladder` 非空时一次 run 顺序执行多档，`steps_total = 档数`，
+`summary.tiers_count` / `summary.max_sessions` 给出档位概览，每档完整指标在 `cache.tiers[]`
+（元素不嵌套 `tiers`，`bucket` 形如 `c1`/`c4`）。gate 逐档判定，`violations[].tier` 标档位，
+`tier_summary[]` 每档一行。`plan` 示例与校验规则见 [`CACHE.md`](./CACHE.md) §3.2。
+
 **`GET /v1/runs/{run_id}/results/failures`** — 失败明细分页（对应 `export_failure_details.py`）：
 `?limit=50&cursor=&reason=timeout`，返回 `{items:[{step_index,request_index,reason,http_status,request_body_excerpt,response_body_excerpt,error}], next_cursor}`。
 

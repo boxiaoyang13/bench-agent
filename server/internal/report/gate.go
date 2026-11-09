@@ -280,132 +280,164 @@ func orDefaultStr(v, def string) string {
 //   - no_warmup 的 run 不判改善率（首轮即冷态，口径不同）
 //   - 无有效请求 / 无稳态样本 → eval_success 违规
 //   - 性能阈值（TPOT/decode_speed/input_throughput）为 0 时表示不判该项
+//
+// 多档 run（m.Tiers 非空）逐档判定：违规带 tier 标识，tier_summary 每档一行；
+// 单档行为与 v1 一致（tier_summary 的 tier="steady"，只含一行）。
 func EvaluateCacheGate(profile *config.GateProfile, m *domain.CacheMetrics, noWarmup bool) *domain.GateResult {
 	res := &domain.GateResult{Passed: true, Violations: []domain.Violation{}, TierSummary: []domain.TierSummary{}}
 	if profile == nil || m == nil {
-		return res
-	}
-	if m.TotalRequests == 0 {
-		res.Violations = append(res.Violations, domain.Violation{
-			Scope: "cache", Rule: "eval_success", Message: "没有有效请求（详见 run.log）",
-		})
-		res.Passed = false
 		return res
 	}
 	tier := &config.CacheGateTier{}
 	if len(profile.CacheTiers) > 0 {
 		tier = &profile.CacheTiers[0]
 	}
+	if len(m.Tiers) > 0 {
+		for _, t := range m.Tiers {
+			if t == nil {
+				continue
+			}
+			vs := evaluateCacheTier(tier, t, noWarmup, t.Bucket)
+			res.Violations = append(res.Violations, vs...)
+			res.TierSummary = append(res.TierSummary, cacheTierSummary(t.Bucket, t, len(vs) == 0))
+		}
+	} else {
+		vs := evaluateCacheTier(tier, m, noWarmup, "")
+		res.Violations = append(res.Violations, vs...)
+		if m.TotalRequests > 0 && m.SteadyState != nil && m.SteadyState.Requests > 0 {
+			res.TierSummary = append(res.TierSummary, cacheTierSummary("steady", m, len(vs) == 0))
+		}
+	}
+	res.Passed = len(res.Violations) == 0
+	return res
+}
+
+// evaluateCacheTier 判定单个档位（单档 run 也走这里），违规统一 Scope=cache、Tier=tierName。
+func evaluateCacheTier(tier *config.CacheGateTier, m *domain.CacheMetrics, noWarmup bool, tierName string) []domain.Violation {
+	violations := []domain.Violation{}
+	add := func(v domain.Violation) {
+		v.Scope = "cache"
+		v.Tier = tierName
+		violations = append(violations, v)
+	}
+	if m.TotalRequests == 0 {
+		add(domain.Violation{Rule: "eval_success", Message: "没有有效请求（详见 run.log）"})
+		return violations
+	}
 	if tier.SuccessRateMin > 0 && m.SuccessRate < tier.SuccessRateMin {
-		res.Violations = append(res.Violations, domain.Violation{
-			Scope: "cache", Rule: "min_success_rate",
+		add(domain.Violation{
+			Rule:   "min_success_rate",
 			Actual: round(m.SuccessRate, 4), Threshold: tier.SuccessRateMin,
 			Message: fmt.Sprintf("成功率 %.2f%% < %.2f%%", m.SuccessRate*100, tier.SuccessRateMin*100),
 		})
 	}
 	ss := m.SteadyState
 	if ss == nil || ss.Requests == 0 {
-		res.Violations = append(res.Violations, domain.Violation{
-			Scope: "cache", Rule: "eval_success", Message: "无稳态样本（每 session 只跑了首轮？延长 duration）",
+		add(domain.Violation{
+			Rule: "eval_success", Message: "无稳态样本（每 session 只跑了首轮？延长 duration）",
 		})
-	} else {
-		if tier.MinSamples > 0 && ss.Requests < tier.MinSamples {
-			res.Violations = append(res.Violations, domain.Violation{
-				Scope: "cache", Rule: "min_samples",
-				Actual: round(float64(ss.Requests), 0), Threshold: float64(tier.MinSamples),
-				Message: fmt.Sprintf("稳态样本 %d < %d，性能结论不可靠（延长 duration 或提高 QPS）",
-					ss.Requests, tier.MinSamples),
-			})
-		}
-		if tier.SteadyTTFTp50MaxMS > 0 && ss.TTFTp50MS > tier.SteadyTTFTp50MaxMS {
-			res.Violations = append(res.Violations, domain.Violation{
-				Scope: "cache", Rule: "steady_ttft_p50_max_ms",
-				Actual: round(ss.TTFTp50MS, 2), Threshold: tier.SteadyTTFTp50MaxMS,
-				Message: fmt.Sprintf("稳态 TTFT P50 %.0fms > %.0fms", ss.TTFTp50MS, tier.SteadyTTFTp50MaxMS),
-			})
-		}
-		if !noWarmup && tier.TTFTImprovementMin > 0 && ss.TTFTImprovement < tier.TTFTImprovementMin {
-			res.Violations = append(res.Violations, domain.Violation{
-				Scope: "cache", Rule: "ttft_improvement_min",
-				Actual: round(ss.TTFTImprovement, 4), Threshold: tier.TTFTImprovementMin,
-				Message: fmt.Sprintf("TTFT 改善率 %.1f%% < %.1f%%（前缀缓存未生效或收益不足）",
-					ss.TTFTImprovement*100, tier.TTFTImprovementMin*100),
-			})
-		}
-		// 前缀命中率（比改善率更直接回答「缓存有没有生效」）
-		if tier.PrefixHitRateMin > 0 && m.PrefixHitRate != nil {
-			if !m.CacheFieldReported {
-				res.Violations = append(res.Violations, domain.Violation{
-					Scope: "cache", Rule: "prefix_hit_rate_min",
-					Actual: 0, Threshold: tier.PrefixHitRateMin,
-					Message: "端点未上报 usage.prompt_tokens_details.cached_tokens，无法确认前缀缓存（可能未启用）",
-				})
-			} else if *m.PrefixHitRate < tier.PrefixHitRateMin {
-				res.Violations = append(res.Violations, domain.Violation{
-					Scope: "cache", Rule: "prefix_hit_rate_min",
-					Actual: round(*m.PrefixHitRate, 4), Threshold: tier.PrefixHitRateMin,
-					Message: fmt.Sprintf("前缀命中率 %.1f%% < %.1f%%（重复前缀的 cached_tokens 占比不足）",
-						*m.PrefixHitRate*100, tier.PrefixHitRateMin*100),
-				})
-			}
-		}
-		// 性能维度：TPOT / decode speed / input throughput。
-		// 数据缺失（<=0）视为违规而不是静默通过，避免门禁形同虚设。
-		if tier.TPOTP50MaxMS > 0 {
-			switch {
-			case ss.TPOTp50MS <= 0:
-				res.Violations = append(res.Violations, domain.Violation{
-					Scope: "cache", Rule: "tpot_p50_max_ms",
-					Threshold: tier.TPOTP50MaxMS,
-					Message:   "缺少稳态 TPOT 样本（CSV 无 decode_speed，且无法由时延推导）",
-				})
-			case ss.TPOTp50MS > tier.TPOTP50MaxMS:
-				res.Violations = append(res.Violations, domain.Violation{
-					Scope: "cache", Rule: "tpot_p50_max_ms",
-					Actual: round(ss.TPOTp50MS, 2), Threshold: tier.TPOTP50MaxMS,
-					Message: fmt.Sprintf("稳态 TPOT P50 %.1fms > %.1fms", ss.TPOTp50MS, tier.TPOTP50MaxMS),
-				})
-			}
-		}
-		if tier.DecodeSpeedMin > 0 {
-			ds := ss.DecodeSpeedP50
-			if ds <= 0 {
-				ds = m.DecodeSpeedP50 // 回退到全量 summary 口径
-			}
-			switch {
-			case ds <= 0:
-				res.Violations = append(res.Violations, domain.Violation{
-					Scope: "cache", Rule: "decode_speed_min",
-					Threshold: tier.DecodeSpeedMin,
-					Message:   "缺少 decode speed 样本，无法判定生成性能",
-				})
-			case ds < tier.DecodeSpeedMin:
-				res.Violations = append(res.Violations, domain.Violation{
-					Scope: "cache", Rule: "decode_speed_min",
-					Actual: round(ds, 2), Threshold: tier.DecodeSpeedMin,
-					Message: fmt.Sprintf("稳态解码速度 P50 %.1f t/s < %.1f t/s", ds, tier.DecodeSpeedMin),
-				})
-			}
-		}
-		if tier.InputThroughputMin > 0 {
-			if m.InputThroughput <= 0 {
-				res.Violations = append(res.Violations, domain.Violation{
-					Scope: "cache", Rule: "input_throughput_min",
-					Threshold: tier.InputThroughputMin,
-					Message:   "缺少 input throughput 数据，无法判定预填吞吐",
-				})
-			} else if m.InputThroughput < tier.InputThroughputMin {
-				res.Violations = append(res.Violations, domain.Violation{
-					Scope: "cache", Rule: "input_throughput_min",
-					Actual: round(m.InputThroughput, 2), Threshold: tier.InputThroughputMin,
-					Message: fmt.Sprintf("输入吞吐 %.1f t/s < %.1f t/s", m.InputThroughput, tier.InputThroughputMin),
-				})
-			}
-		}
-		res.TierSummary = append(res.TierSummary, domain.TierSummary{
-			Tier: "steady", Steps: ss.Requests, P50MaxSec: ss.TTFTp50MS, Passed: len(res.Violations) == 0,
+		return violations
+	}
+	if tier.MinSamples > 0 && ss.Requests < tier.MinSamples {
+		add(domain.Violation{
+			Rule:   "min_samples",
+			Actual: round(float64(ss.Requests), 0), Threshold: float64(tier.MinSamples),
+			Message: fmt.Sprintf("稳态样本 %d < %d，性能结论不可靠（延长 duration 或提高 QPS）",
+				ss.Requests, tier.MinSamples),
 		})
 	}
-	res.Passed = len(res.Violations) == 0
-	return res
+	if tier.SteadyTTFTp50MaxMS > 0 && ss.TTFTp50MS > tier.SteadyTTFTp50MaxMS {
+		add(domain.Violation{
+			Rule:   "steady_ttft_p50_max_ms",
+			Actual: round(ss.TTFTp50MS, 2), Threshold: tier.SteadyTTFTp50MaxMS,
+			Message: fmt.Sprintf("稳态 TTFT P50 %.0fms > %.0fms", ss.TTFTp50MS, tier.SteadyTTFTp50MaxMS),
+		})
+	}
+	if !noWarmup && tier.TTFTImprovementMin > 0 && ss.TTFTImprovement < tier.TTFTImprovementMin {
+		add(domain.Violation{
+			Rule:   "ttft_improvement_min",
+			Actual: round(ss.TTFTImprovement, 4), Threshold: tier.TTFTImprovementMin,
+			Message: fmt.Sprintf("TTFT 改善率 %.1f%% < %.1f%%（前缀缓存未生效或收益不足）",
+				ss.TTFTImprovement*100, tier.TTFTImprovementMin*100),
+		})
+	}
+	// 前缀命中率（比改善率更直接回答「缓存有没有生效」）
+	if tier.PrefixHitRateMin > 0 && m.PrefixHitRate != nil {
+		if !m.CacheFieldReported {
+			add(domain.Violation{
+				Rule:   "prefix_hit_rate_min",
+				Actual: 0, Threshold: tier.PrefixHitRateMin,
+				Message: "端点未上报 usage.prompt_tokens_details.cached_tokens，无法确认前缀缓存（可能未启用）",
+			})
+		} else if *m.PrefixHitRate < tier.PrefixHitRateMin {
+			add(domain.Violation{
+				Rule:   "prefix_hit_rate_min",
+				Actual: round(*m.PrefixHitRate, 4), Threshold: tier.PrefixHitRateMin,
+				Message: fmt.Sprintf("前缀命中率 %.1f%% < %.1f%%（重复前缀的 cached_tokens 占比不足）",
+					*m.PrefixHitRate*100, tier.PrefixHitRateMin*100),
+			})
+		}
+	}
+	// 性能维度：TPOT / decode speed / input throughput。
+	// 数据缺失（<=0）视为违规而不是静默通过，避免门禁形同虚设。
+	if tier.TPOTP50MaxMS > 0 {
+		switch {
+		case ss.TPOTp50MS <= 0:
+			add(domain.Violation{
+				Rule: "tpot_p50_max_ms", Threshold: tier.TPOTP50MaxMS,
+				Message: "缺少稳态 TPOT 样本（CSV 无 decode_speed，且无法由时延推导）",
+			})
+		case ss.TPOTp50MS > tier.TPOTP50MaxMS:
+			add(domain.Violation{
+				Rule:   "tpot_p50_max_ms",
+				Actual: round(ss.TPOTp50MS, 2), Threshold: tier.TPOTP50MaxMS,
+				Message: fmt.Sprintf("稳态 TPOT P50 %.1fms > %.1fms", ss.TPOTp50MS, tier.TPOTP50MaxMS),
+			})
+		}
+	}
+	if tier.DecodeSpeedMin > 0 {
+		ds := ss.DecodeSpeedP50
+		if ds <= 0 {
+			ds = m.DecodeSpeedP50 // 回退到全量 summary 口径
+		}
+		switch {
+		case ds <= 0:
+			add(domain.Violation{
+				Rule: "decode_speed_min", Threshold: tier.DecodeSpeedMin,
+				Message: "缺少 decode speed 样本，无法判定生成性能",
+			})
+		case ds < tier.DecodeSpeedMin:
+			add(domain.Violation{
+				Rule:   "decode_speed_min",
+				Actual: round(ds, 2), Threshold: tier.DecodeSpeedMin,
+				Message: fmt.Sprintf("稳态解码速度 P50 %.1f t/s < %.1f t/s", ds, tier.DecodeSpeedMin),
+			})
+		}
+	}
+	if tier.InputThroughputMin > 0 {
+		if m.InputThroughput <= 0 {
+			add(domain.Violation{
+				Rule: "input_throughput_min", Threshold: tier.InputThroughputMin,
+				Message: "缺少 input throughput 数据，无法判定预填吞吐",
+			})
+		} else if m.InputThroughput < tier.InputThroughputMin {
+			add(domain.Violation{
+				Rule:   "input_throughput_min",
+				Actual: round(m.InputThroughput, 2), Threshold: tier.InputThroughputMin,
+				Message: fmt.Sprintf("输入吞吐 %.1f t/s < %.1f t/s", m.InputThroughput, tier.InputThroughputMin),
+			})
+		}
+	}
+	return violations
+}
+
+// cacheTierSummary 生成单档的 tier_summary（TTFT 单位统一为秒，与 perf 报表一致）。
+func cacheTierSummary(name string, m *domain.CacheMetrics, passed bool) domain.TierSummary {
+	ts := domain.TierSummary{Tier: name, Passed: passed}
+	if m != nil && m.SteadyState != nil {
+		ts.Steps = m.SteadyState.Requests
+		ts.P50MaxSec = m.SteadyState.TTFTp50MS / 1000
+		ts.P90MaxSec = m.SteadyState.TTFTp90MS / 1000
+	}
+	return ts
 }

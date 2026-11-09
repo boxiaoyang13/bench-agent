@@ -311,6 +311,23 @@
       </div>
 
       <div class="grid-3">
+        <label class="field">并发档位（session 数）
+          <input id="c-ladder" type="text" placeholder="留空=单档；如 1,2,4">
+          <small>每档顺序跑一次（时长按每档计算），用于出 TTFT/TPOT/吞吐随并发的曲线</small>
+        </label>
+        <label class="field">每 session QPS
+          <input id="c-ladder-qps" type="number" value="0.5" min="0.1" max="100" step="0.1">
+          <small>仅多档生效：档位 QPS = session 数 × 该值（负载随并发等比放大）</small>
+        </label>
+        <label class="field">多档负载口径
+          <select id="c-ladder-mode">
+            <option value="scale">QPS 随并发等比放大（推荐）</option>
+            <option value="fixed">固定全局 QPS（各档同 QPS）</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="grid-3">
         <label class="field">预热
           <select id="c-warmup">
             <option value="true">开启（验收口径）</option>

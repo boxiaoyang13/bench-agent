@@ -156,7 +156,7 @@ make run   CONFIG=./config/thvv.dev.yaml     # http://127.0.0.1:18080/ui/
 | 报告：HTML / 45 列 xlsx / 失败 CSV / SLA json | ✅ |
 | `capability=eval` 效果评测（17 数据集，Step=数据集，产物 eval_report_v2.html/CSV/JSON/tar.gz） | ✅ |
 | eval 分数验收 `eval-sla-v1`（对齐《效果验收标准.xlsx》，支持 `baseline_by` 按模型覆盖） | ✅ |
-| 缓存测试（lmcache bench multi-round-chat；`cache-sla-v1` 缓存收益 + `cache-perf-sla-v1` 稳态性能验收，见 `docs/CACHE.md`） | ✅ |
+| 缓存测试（lmcache bench multi-round-chat；`cache-sla-v1` 缓存收益 + `cache-perf-sla-v1` 稳态性能 + 并发档位曲线，见 `docs/CACHE.md`） | ✅ |
 | Web 页面（登录、三步向导、运行监控、结果、历史（勾选后批量删除 / 单条删除 / 重测）、能力清单） | ✅ |
 | 引擎：`builtin` 模拟 / `subprocess` evalscope | ✅（subprocess 已端到端联调，见下） |
 | `capability=functional` | ⏳ 预留（返回 `501 not_implemented` + `available_at`） |

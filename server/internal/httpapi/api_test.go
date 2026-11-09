@@ -920,6 +920,171 @@ func TestCacheFlow(t *testing.T) {
 	}
 }
 
+// TestCacheLadderFlow 并发档位（方案 B）：多档展开为多 step、逐档结果与分档 gate。
+func TestCacheLadderFlow(t *testing.T) {
+	t.Setenv("THVV_FAKE_STEP_MS", "5")
+	t.Setenv("THVV_FAKE_FAIL_RATE", "0")
+	h := newHarness(t)
+	h.login()
+
+	resp, body := h.do("POST", "/targets", map[string]any{
+		"name": "cache-ladder", "vendor": "zhipu",
+		"api_url":  "https://api.example.com/v1/chat/completions",
+		"protocol": "openai", "model": "glm-5.2", "api_key": "sk-secret-1234",
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("建端点: %d %s", resp.StatusCode, body)
+	}
+	var target map[string]any
+	mustJSON(t, body, &target)
+	tid, _ := target["target_id"].(string)
+
+	resp, body = h.do("POST", "/runs", map[string]any{
+		"tool": "lmcache", "capability": "cache", "target_id": tid,
+		"plan": map[string]any{
+			"workload": "multi-round-chat", "duration_sec": 30, "qps": 1,
+			"shared_prompt_length": 2000, "chat_history_length": 10000,
+			"tokens_per_gb_kvcache": 65536,
+			"ladder": []map[string]any{
+				{"sessions": 1},
+				{"sessions": 4, "qps": 4},
+			},
+		},
+		"gate": map[string]any{"profile": "cache-perf-sla-v1", "mode": "report_only"},
+	}, map[string]string{"Idempotency-Key": "cache-ladder-1"})
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("提交并发档位: %d %s", resp.StatusCode, body)
+	}
+	var run map[string]any
+	mustJSON(t, body, &run)
+	runID, _ := run["run_id"].(string)
+	plan := run["plan"].(map[string]any)
+	if int(plan["steps_total"].(float64)) != 2 {
+		t.Fatalf("steps_total 期望 2: %v", plan["steps_total"])
+	}
+	ladder := plan["ladder"].([]any)
+	if len(ladder) != 2 {
+		t.Fatalf("ladder 规范化后应保留 2 档: %v", ladder)
+	}
+	tier0 := ladder[0].(map[string]any)
+	tier1 := ladder[1].(map[string]any)
+	// 档位按 sessions 升序；容量由 sessions × 单会话 token ÷ tokens/GB 反算
+	if tier0["sessions"].(float64) != 1 || tier1["sessions"].(float64) != 4 {
+		t.Fatalf("ladder 档位排序/内容错误: %v", ladder)
+	}
+	if tier0["qps"].(float64) != 1 {
+		t.Fatalf("档位 1 qps 应继承全局 1: %v", tier0["qps"])
+	}
+	if tier1["qps"].(float64) != 4 {
+		t.Fatalf("档位 4 qps 应保留 4: %v", tier1["qps"])
+	}
+	if v := tier0["kv_cache_volume_gb"].(float64); v < 0.1831 || v > 0.1832 {
+		t.Fatalf("c1 容量反算错误: %v", v)
+	}
+	if v := tier1["kv_cache_volume_gb"].(float64); v < 0.7324 || v > 0.7325 {
+		t.Fatalf("c4 容量反算错误: %v", v)
+	}
+
+	final := h.waitTerminal(runID, 20*time.Second)
+	if final["status"] != "succeeded" {
+		t.Fatalf("run 未成功: %v (%v)", final["status"], final["error"])
+	}
+
+	resp, body = h.do("GET", "/runs/"+runID+"/results", nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("/results: %d %s", resp.StatusCode, body)
+	}
+	var res struct {
+		Summary map[string]any `json:"summary"`
+		Cache   *struct {
+			TotalRequests int `json:"total_requests"`
+			Tiers         []struct {
+				Bucket      string  `json:"bucket"`
+				Sessions    int     `json:"sessions"`
+				QPS         float64 `json:"qps"`
+				NumSessions int     `json:"num_sessions"`
+			} `json:"tiers"`
+			SteadyState *struct {
+				TTFTp50MS float64 `json:"ttft_p50_ms"`
+			} `json:"steady_state"`
+		} `json:"cache"`
+		GateResult struct {
+			Passed     bool `json:"passed"`
+			Violations []struct {
+				Rule string `json:"rule"`
+				Tier string `json:"tier"`
+			} `json:"violations"`
+			TierSummary []struct {
+				Tier   string `json:"tier"`
+				Passed bool   `json:"passed"`
+			} `json:"tier_summary"`
+		} `json:"gate_result"`
+	}
+	mustJSON(t, body, &res)
+	if res.Cache == nil || res.Cache.TotalRequests != 24 {
+		t.Fatalf("多档聚合请求数错误: %+v", res.Cache)
+	}
+	if len(res.Cache.Tiers) != 2 {
+		t.Fatalf("tiers 期望 2，实际 %d", len(res.Cache.Tiers))
+	}
+	if res.Cache.Tiers[0].Bucket != "c1" || res.Cache.Tiers[0].Sessions != 1 ||
+		res.Cache.Tiers[0].NumSessions != 1 || res.Cache.Tiers[0].QPS != 1 {
+		t.Fatalf("c1 档指标错误: %+v", res.Cache.Tiers[0])
+	}
+	if res.Cache.Tiers[1].Bucket != "c4" || res.Cache.Tiers[1].Sessions != 4 || res.Cache.Tiers[1].QPS != 4 {
+		t.Fatalf("c4 档指标错误: %+v", res.Cache.Tiers[1])
+	}
+	if res.Summary["tiers_count"].(float64) != 2 {
+		t.Fatalf("summary.tiers_count 错误: %v", res.Summary)
+	}
+	if res.Cache.SteadyState != nil {
+		t.Fatalf("多档聚合不应带单一 steady_state: %+v", res.Cache.SteadyState)
+	}
+	// 性能 gate 逐档判定：fake 稳态样本 9 < min_samples=100，两档各一条违规
+	if res.GateResult.Passed {
+		t.Fatal("样本不足应不通过")
+	}
+	tierViol := map[string]bool{}
+	for _, v := range res.GateResult.Violations {
+		if v.Rule != "min_samples" {
+			t.Fatalf("意外违规: %+v", v)
+		}
+		tierViol[v.Tier] = true
+	}
+	if !tierViol["c1"] || !tierViol["c4"] {
+		t.Fatalf("违规应带档位标识: %+v", res.GateResult.Violations)
+	}
+	if len(res.GateResult.TierSummary) != 2 {
+		t.Fatalf("tier_summary 期望 2 行: %+v", res.GateResult.TierSummary)
+	}
+
+	// step 回填：每档的并发 / 请求数来自各自子进程
+	resp, body = h.do("GET", "/runs/"+runID+"?include=steps", nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("/runs/{id}: %d %s", resp.StatusCode, body)
+	}
+	var detail struct {
+		Steps []struct {
+			Bucket   string `json:"bucket"`
+			Parallel int    `json:"parallel"`
+			Number   int    `json:"number"`
+			Status   string `json:"status"`
+		} `json:"steps"`
+	}
+	mustJSON(t, body, &detail)
+	if len(detail.Steps) != 2 {
+		t.Fatalf("steps 期望 2，实际 %d", len(detail.Steps))
+	}
+	if detail.Steps[0].Bucket != "c1" || detail.Steps[0].Parallel != 1 ||
+		detail.Steps[0].Number != 12 || detail.Steps[0].Status != "succeeded" {
+		t.Fatalf("c1 step 回填错误: %+v", detail.Steps[0])
+	}
+	if detail.Steps[1].Bucket != "c4" || detail.Steps[1].Parallel != 4 ||
+		detail.Steps[1].Number != 12 {
+		t.Fatalf("c4 step 回填错误: %+v", detail.Steps[1])
+	}
+}
+
 // TestCacheValidation plan 校验。
 func TestCacheValidation(t *testing.T) {
 	h := newHarness(t)
@@ -947,6 +1112,44 @@ func TestCacheValidation(t *testing.T) {
 		{"qps 非法", map[string]any{"qps": -1}, http.StatusBadRequest},
 		{"tokens/gb 非法", map[string]any{"tokens_per_gb_kvcache": 1}, http.StatusBadRequest},
 	}
+	// 并发档位（方案 B）校验用例
+	shape := map[string]any{"shared_prompt_length": 2000, "chat_history_length": 10000}
+	longLadder := make([]map[string]any, 0, 20)
+	for i := 1; i <= 20; i++ {
+		longLadder = append(longLadder, map[string]any{"sessions": i})
+	}
+	withShape := func(extra map[string]any) map[string]any {
+		m := map[string]any{"duration_sec": 30}
+		for k, v := range shape {
+			m[k] = v
+		}
+		for k, v := range extra {
+			m[k] = v
+		}
+		return m
+	}
+	cases = append(cases,
+		struct {
+			name string
+			plan map[string]any
+			code int
+		}{"ladder sessions 非法", withShape(map[string]any{"ladder": []map[string]any{{"sessions": 0}}}), http.StatusBadRequest},
+		struct {
+			name string
+			plan map[string]any
+			code int
+		}{"ladder 重复", withShape(map[string]any{"ladder": []map[string]any{{"sessions": 1}, {"sessions": 1}}}), http.StatusBadRequest},
+		struct {
+			name string
+			plan map[string]any
+			code int
+		}{"ladder 缺形状", map[string]any{"duration_sec": 30, "ladder": []map[string]any{{"sessions": 1}}}, http.StatusBadRequest},
+		struct {
+			name string
+			plan map[string]any
+			code int
+		}{"ladder 总时长超限", withShape(map[string]any{"duration_sec": 3600, "ladder": longLadder}), http.StatusBadRequest},
+	)
 	for _, c := range cases {
 		resp, body := h.do("POST", "/runs", map[string]any{
 			"tool": "lmcache", "capability": "cache", "target_id": tid, "plan": c.plan,

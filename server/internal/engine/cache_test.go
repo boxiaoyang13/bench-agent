@@ -253,3 +253,65 @@ func TestDeriveProbeHitRate(t *testing.T) {
 		}
 	}
 }
+
+// TestTierPlan 多档：容量 / QPS 用规范化后的 ladder，普通字段继承 base。
+func TestTierPlan(t *testing.T) {
+	e := &CacheEngine{}
+	base := domain.Plan{
+		Workload: "multi-round-chat", KVCacheVolumeGB: 0.25, QPS: 1,
+		CacheLadder: []domain.CacheTier{
+			{Sessions: 1, QPS: 1, KVCacheVolumeGB: 0.183106},
+			{Sessions: 4, QPS: 4, KVCacheVolumeGB: 0.732422},
+		},
+	}
+	if p := e.tierPlan(base, 1); p.KVCacheVolumeGB != 0.732422 || p.QPS != 4 {
+		t.Fatalf("第二档生效参数错误: %+v", p)
+	}
+	// 单档（无 ladder）原样返回
+	single := domain.Plan{Workload: "multi-round-chat", KVCacheVolumeGB: 0.25, QPS: 0.5}
+	if p := e.tierPlan(single, 0); p.KVCacheVolumeGB != 0.25 || p.QPS != 0.5 {
+		t.Fatalf("单档不应被改写: %+v", p)
+	}
+}
+
+// TestAggregateCacheTiers 多档聚合：可加项求和、均值按样本加权、吞吐按总时长。
+func TestAggregateCacheTiers(t *testing.T) {
+	tiers := []*domain.CacheMetrics{
+		{
+			Bucket: "c1", Sessions: 1, QPS: 1, NumSessions: 1,
+			TotalRequests: 10, SuccessReqs: 10, FailedReqs: 0, SuccessRate: 1,
+			ElapsedSec: 10, MeanTTFTMS: 500, MeanDecodeSpeed: 100,
+			InputTokens: 10000, OutputTokens: 1000, DecodeSpeedP50: 100,
+		},
+		{
+			Bucket: "c4", Sessions: 4, QPS: 4, NumSessions: 4,
+			TotalRequests: 20, SuccessReqs: 18, FailedReqs: 2, SuccessRate: 0.9,
+			ElapsedSec: 20, MeanTTFTMS: 800, MeanDecodeSpeed: 50,
+			InputTokens: 50000, OutputTokens: 3000, DecodeSpeedP50: 50,
+		},
+	}
+	agg := aggregateCacheTiers(tiers)
+	if agg.TotalRequests != 30 || agg.SuccessReqs != 28 || agg.FailedReqs != 2 {
+		t.Fatalf("请求数聚合错误: %+v", agg)
+	}
+	if diff := agg.SuccessRate - 28.0/30.0; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("成功率聚合错误: %v", agg.SuccessRate)
+	}
+	if diff := agg.ElapsedSec - 30; diff > 1e-9 {
+		t.Fatalf("时长聚合错误: %v", agg.ElapsedSec)
+	}
+	// TTFT 按成功请求加权：(500*10 + 800*18) / 28
+	if diff := agg.MeanTTFTMS - (500*10+800*18.0)/28; diff > 1e-6 {
+		t.Fatalf("TTFT 加权错误: %v", agg.MeanTTFTMS)
+	}
+	// decode speed 按输出 token 加权：(100*1000 + 50*3000) / 4000 = 62.5
+	if diff := agg.MeanDecodeSpeed - 62.5; diff > 1e-6 {
+		t.Fatalf("decode speed 加权错误: %v", agg.MeanDecodeSpeed)
+	}
+	if diff := agg.InputThroughput - 60000.0/30; diff > 1e-6 {
+		t.Fatalf("输入吞吐聚合错误: %v", agg.InputThroughput)
+	}
+	if agg.Tiers != nil {
+		t.Fatalf("聚合函数不应写 Tiers")
+	}
+}

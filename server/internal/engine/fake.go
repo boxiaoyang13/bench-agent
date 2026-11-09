@@ -275,75 +275,111 @@ func (f *Fake) runEval(ctx context.Context, spec Spec, emit func(Event)) (Result
 }
 
 // runCache 是 cache 能力的模拟实现：首轮 TTFT 高、后续低，产出可判定的改善率。
+// plan.ladder 非空时按档位逐档模拟（每档独立 step），与真实引擎的多档结构一致。
 func (f *Fake) runCache(ctx context.Context, spec Spec, emit func(Event)) (Result, error) {
 	res := Result{DBPaths: map[int]string{}}
-	emit(Event{Kind: EvStepStarted, At: time.Now().UTC(), Data: map[string]any{
-		"step_index": 0, "bucket": "multi-round-chat", "parallel": 0, "number": 0,
-	}})
-	if err := ctx.Err(); err != nil {
-		return res, err
-	}
-	select {
-	case <-ctx.Done():
-		return res, ctx.Err()
-	case <-time.After(time.Duration(f.StepMS) * time.Millisecond):
+	var tiers []*domain.CacheMetrics
+	for i, st := range spec.Steps {
+		if err := ctx.Err(); err != nil {
+			return res, err
+		}
+		select {
+		case <-ctx.Done():
+			return res, ctx.Err()
+		case <-time.After(time.Duration(f.StepMS) * time.Millisecond):
+		}
+
+		sessions := st.Parallel
+		if sessions <= 0 {
+			sessions = 3
+		}
+		qps := spec.Plan.QPS
+		if i < len(spec.Plan.CacheLadder) && spec.Plan.CacheLadder[i].QPS > 0 {
+			qps = spec.Plan.CacheLadder[i].QPS
+		}
+		bucket := st.Bucket
+		if bucket == "" {
+			bucket = "multi-round-chat"
+		}
+		emit(Event{Kind: EvStepStarted, At: time.Now().UTC(), Data: map[string]any{
+			"step_index": st.Index, "bucket": bucket, "parallel": sessions, "number": 0,
+		}})
+
+		first := 900.0 + rand.Float64()*300                 // 首轮 900~1200ms
+		steadyP50 := first * (1 - 0.5 - rand.Float64()*0.2) // 稳态改善 50~70%
+		total := 12
+		failed := 0
+		if rand.Float64() < f.FailRate {
+			failed = 1 + rand.Intn(2)
+		}
+		sr := float64(total-failed) / float64(total)
+		// cache 的「测量窗口」是 plan.duration_sec（吞吐口径），不是模拟 step 耗时
+		dur := float64(spec.Plan.DurationSec)
+		if dur <= 0 {
+			dur = float64(f.StepMS) / 1000
+		}
+		ok := failed < total
+		status := domain.StepSucceeded
+		if !ok {
+			status = domain.StepFailed
+		}
+		res.Steps = append(res.Steps, domain.Step{
+			Index: st.Index, Bucket: bucket, Parallel: sessions, Number: total,
+			Status: status, SuccessRate: &sr, DurationSec: &dur,
+		})
+		hitRate := 0.90 + rand.Float64()*0.08
+		// 性能维度（与真实 lmcache summary/CSV 派生口径一致）
+		decodeSpeed := 120.0 + rand.Float64()*60 // 120~180 t/s
+		tpot := 1000 / decodeSpeed
+		latP50 := steadyP50 + 900 + rand.Float64()*200
+		inputTP := 2000.0 + rand.Float64()*800
+		outputTP := 50.0 + rand.Float64()*30
+		metrics := &domain.CacheMetrics{
+			Workload: "multi-round-chat", Model: spec.Target.Model,
+			Bucket: bucket, Sessions: sessions, QPS: qps, NumSessions: sessions,
+			TotalRequests: total, SuccessReqs: total - failed, FailedReqs: failed,
+			SuccessRate: sr, ElapsedSec: dur, MeanTTFTMS: first * 0.6,
+			InputTokens: 12000 * total, OutputTokens: 128 * total,
+			PrefixHitRate: &hitRate, CacheFieldReported: true,
+			OutputThroughput: outputTP, InputThroughput: inputTP,
+			MeanDecodeSpeed: decodeSpeed, DecodeSpeedP50: decodeSpeed * 0.98,
+			DecodeSpeedP90: decodeSpeed * 1.05, TPOTMeanMS: tpot,
+			LatencyP50MS: latP50, LatencyP90MS: latP50 * 1.2, LatencyP99MS: latP50 * 1.5,
+			ProbeRounds: []domain.CacheProbeRound{
+				{Round: 0, PromptTokens: 12000, CachedTokens: 0},
+				{Round: 1, PromptTokens: 12200, CachedTokens: 12000, HitRate: hitRate},
+				{Round: 2, PromptTokens: 12400, CachedTokens: 12200, HitRate: hitRate},
+			},
+			FirstRound: &domain.CacheRoundStats{Round: 0, Requests: 3, TTFTMeanMS: first},
+			SteadyState: &domain.CacheSteadyStats{
+				Requests: total - 3, TTFTp50MS: steadyP50, TTFTp90MS: steadyP50 * 1.3,
+				TTFTp99MS: steadyP50 * 1.8, TTFTImprovement: 1 - steadyP50/first,
+				Latencyp50MS: latP50, DecodeSpeedP50: decodeSpeed * 0.98,
+				TPOTp50MS: tpot, TPOTp90MS: tpot * 1.2,
+			},
+			Rounds: []domain.CacheRoundStats{
+				{Round: 0, Requests: 3, TTFTMeanMS: first},
+				{Round: 1, Requests: 3, TTFTMeanMS: steadyP50 * 1.1},
+				{Round: 2, Requests: 3, TTFTMeanMS: steadyP50},
+			},
+		}
+		tiers = append(tiers, metrics)
+		emit(Event{Kind: EvStepFinished, At: time.Now().UTC(), Data: map[string]any{
+			"step_index": st.Index, "status": string(status), "success_rate": sr,
+			"ttft_steady_p50_ms": steadyP50, "duration_sec": dur,
+		}})
 	}
 
-	first := 900.0 + rand.Float64()*300                 // 首轮 900~1200ms
-	steadyP50 := first * (1 - 0.5 - rand.Float64()*0.2) // 稳态改善 50~70%
-	total := 12
-	failed := 0
-	if rand.Float64() < f.FailRate {
-		failed = 1 + rand.Intn(2)
+	switch {
+	case len(tiers) == 1 && len(spec.Steps) == 1:
+		res.Cache = tiers[0]
+	case len(tiers) > 0:
+		agg := aggregateCacheTiers(tiers)
+		attachProbe(agg, tiers[0].ProbeRounds)
+		agg.Tiers = tiers
+		res.Cache = agg
+	default:
+		res.Cache = &domain.CacheMetrics{Workload: spec.Plan.Workload}
 	}
-	sr := float64(total-failed) / float64(total)
-	dur := float64(f.StepMS) / 1000
-	ok := failed < total
-	status := domain.StepSucceeded
-	if !ok {
-		status = domain.StepFailed
-	}
-	res.Steps = append(res.Steps, domain.Step{
-		Index: 0, Bucket: "multi-round-chat", Parallel: 3, Number: total,
-		Status: status, SuccessRate: &sr, DurationSec: &dur,
-	})
-	hitRate := 0.90 + rand.Float64()*0.08
-	// 性能维度（与真实 lmcache summary/CSV 派生口径一致）
-	decodeSpeed := 120.0 + rand.Float64()*60 // 120~180 t/s
-	tpot := 1000 / decodeSpeed
-	latP50 := steadyP50 + 900 + rand.Float64()*200
-	inputTP := 2000.0 + rand.Float64()*800
-	outputTP := 50.0 + rand.Float64()*30
-	res.Cache = &domain.CacheMetrics{
-		Workload: "multi-round-chat", Model: spec.Target.Model, NumSessions: 3,
-		TotalRequests: total, SuccessReqs: total - failed, FailedReqs: failed,
-		SuccessRate: sr, ElapsedSec: dur, MeanTTFTMS: first * 0.6,
-		PrefixHitRate: &hitRate, CacheFieldReported: true,
-		OutputThroughput: outputTP, InputThroughput: inputTP,
-		MeanDecodeSpeed: decodeSpeed, DecodeSpeedP50: decodeSpeed * 0.98,
-		DecodeSpeedP90: decodeSpeed * 1.05, TPOTMeanMS: tpot,
-		LatencyP50MS: latP50, LatencyP90MS: latP50 * 1.2, LatencyP99MS: latP50 * 1.5,
-		ProbeRounds: []domain.CacheProbeRound{
-			{Round: 0, PromptTokens: 12000, CachedTokens: 0},
-			{Round: 1, PromptTokens: 12200, CachedTokens: 12000, HitRate: hitRate},
-			{Round: 2, PromptTokens: 12400, CachedTokens: 12200, HitRate: hitRate},
-		},
-		FirstRound: &domain.CacheRoundStats{Round: 0, Requests: 3, TTFTMeanMS: first},
-		SteadyState: &domain.CacheSteadyStats{
-			Requests: total - 3, TTFTp50MS: steadyP50, TTFTp90MS: steadyP50 * 1.3,
-			TTFTp99MS: steadyP50 * 1.8, TTFTImprovement: 1 - steadyP50/first,
-			Latencyp50MS: latP50, DecodeSpeedP50: decodeSpeed * 0.98,
-			TPOTp50MS: tpot, TPOTp90MS: tpot * 1.2,
-		},
-		Rounds: []domain.CacheRoundStats{
-			{Round: 0, Requests: 3, TTFTMeanMS: first},
-			{Round: 1, Requests: 3, TTFTMeanMS: steadyP50 * 1.1},
-			{Round: 2, Requests: 3, TTFTMeanMS: steadyP50},
-		},
-	}
-	emit(Event{Kind: EvStepFinished, At: time.Now().UTC(), Data: map[string]any{
-		"step_index": 0, "status": string(status), "success_rate": sr,
-		"ttft_steady_p50_ms": steadyP50, "duration_sec": dur,
-	}})
 	return res, nil
 }

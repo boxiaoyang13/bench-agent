@@ -157,7 +157,84 @@ func (e *CacheEngine) Probe(ctx context.Context, t ResolvedTarget) ProbeReport {
 // benchPhaseRe 匹配工具的关键阶段行（预热/运行中/CSV 落盘），用于进度事件。
 var benchPhaseRe = regexp.MustCompile(`(?i)(warmup|benchmark|CSV results written|JSON summary written|Workload:)`)
 
-// Run 执行一次 workload。
+// tierPlan 返回第 idx 档的生效 plan：容量 / QPS 用 ladder 里规范化后的值。
+func (e *CacheEngine) tierPlan(base domain.Plan, idx int) domain.Plan {
+	p := base
+	if len(p.CacheLadder) == 0 || idx < 0 || idx >= len(p.CacheLadder) {
+		return p
+	}
+	t := p.CacheLadder[idx]
+	if t.KVCacheVolumeGB > 0 {
+		p.KVCacheVolumeGB = t.KVCacheVolumeGB
+	}
+	if t.QPS > 0 {
+		p.QPS = t.QPS
+	}
+	return p
+}
+
+// tierResult 是单档执行结果。
+type tierResult struct {
+	step    domain.Step
+	metrics *domain.CacheMetrics
+	note    string
+	files   []FileArtifact
+}
+
+// attachProbe 把前缀命中率探针结果挂到汇总指标上（探针整 run 只跑一次）。
+func attachProbe(m *domain.CacheMetrics, rounds []domain.CacheProbeRound) {
+	if m == nil || len(rounds) == 0 {
+		return
+	}
+	m.ProbeRounds = rounds
+	if hr, reported := DeriveProbeHitRate(rounds); len(rounds) > 1 {
+		m.PrefixHitRate = &hr
+		m.CacheFieldReported = reported
+	}
+}
+
+// aggregateCacheTiers 把多档结果聚合成顶层指标（明细留在 Tiers）。
+//
+// 顶层只做「可加」的聚合：请求数 / token 数 / 时长 / 成功数；
+// 均值按样本加权（TTFT 按成功请求、decode speed 按输出 token），吞吐按总 token / 总时长。
+// 分位数无法跨档合并，只在各档 Tiers 内保留。
+func aggregateCacheTiers(tiers []*domain.CacheMetrics) *domain.CacheMetrics {
+	agg := &domain.CacheMetrics{Workload: "multi-round-chat"}
+	var ttftWeighted, dsWeighted float64
+	for _, t := range tiers {
+		if t == nil {
+			continue
+		}
+		agg.TotalRequests += t.TotalRequests
+		agg.SuccessReqs += t.SuccessReqs
+		agg.FailedReqs += t.FailedReqs
+		agg.InputTokens += t.InputTokens
+		agg.OutputTokens += t.OutputTokens
+		agg.ElapsedSec += t.ElapsedSec
+		ttftWeighted += t.MeanTTFTMS * float64(t.SuccessReqs)
+		dsWeighted += t.MeanDecodeSpeed * float64(t.OutputTokens)
+		if agg.Model == "" {
+			agg.Model = t.Model
+		}
+	}
+	if agg.TotalRequests > 0 {
+		agg.SuccessRate = float64(agg.SuccessReqs) / float64(agg.TotalRequests)
+	}
+	if agg.SuccessReqs > 0 {
+		agg.MeanTTFTMS = ttftWeighted / float64(agg.SuccessReqs)
+	}
+	if agg.OutputTokens > 0 && dsWeighted > 0 {
+		agg.MeanDecodeSpeed = dsWeighted / float64(agg.OutputTokens)
+		agg.TPOTMeanMS = 1000 / agg.MeanDecodeSpeed
+	}
+	if agg.ElapsedSec > 0 {
+		agg.InputThroughput = float64(agg.InputTokens) / agg.ElapsedSec
+		agg.OutputThroughput = float64(agg.OutputTokens) / agg.ElapsedSec
+	}
+	return agg
+}
+
+// Run 执行 multi-round-chat：plan.ladder 为空时单档，否则按并发档位顺序执行多档。
 func (e *CacheEngine) Run(ctx context.Context, spec Spec, emit func(Event)) (Result, error) {
 	res := Result{DBPaths: map[int]string{}}
 	res.LogPath = filepath.Join(spec.WorkDir, "logs", fmt.Sprintf("%s-cache.log", spec.RunID))
@@ -170,19 +247,14 @@ func (e *CacheEngine) Run(ctx context.Context, spec Spec, emit func(Event)) (Res
 	}
 	defer logFile.Close()
 
-	st := spec.Steps[0]
-	outDir := filepath.Join(spec.WorkDir, "cache", sanitizeDirName(st.Bucket))
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
+	cacheRoot := filepath.Join(spec.WorkDir, "cache")
+	if err := os.MkdirAll(cacheRoot, 0o755); err != nil {
 		return res, err
 	}
 
-	emit(Event{Kind: EvStepStarted, At: time.Now().UTC(), Data: map[string]any{
-		"step_index": 0, "bucket": st.Bucket, "parallel": 0, "number": 0,
-	}})
-
-	// 前缀命中率探针：在 bench 之前直连端点抓原始 usage（含 cached_tokens）。
+	// 前缀命中率探针：整 run 只跑一次（在全部档位之前），抓原始 usage（含 cached_tokens）。
 	// lmcache bench 的 CSV 不含该字段；探针失败不阻断 bench。
-	probeRounds, probeErr := e.probePrefixCache(ctx, spec, outDir)
+	probeRounds, probeErr := e.probePrefixCache(ctx, spec, cacheRoot)
 	for _, pr := range probeRounds {
 		fmt.Fprintf(logFile, "[probe] round=%d prompt=%d cached=%d hit=%.1f%% ttft=%.0fms\n",
 			pr.Round, pr.PromptTokens, pr.CachedTokens, pr.HitRate*100, pr.ReqMS)
@@ -191,23 +263,114 @@ func (e *CacheEngine) Run(ctx context.Context, spec Spec, emit func(Event)) (Res
 		fmt.Fprintf(logFile, "[probe] 探针未完成: %v（不影响 bench）\n", probeErr)
 	}
 
+	var (
+		tiers []*domain.CacheMetrics
+		files []FileArtifact
+		notes []string
+	)
+	for i, st := range spec.Steps {
+		if ctx.Err() != nil {
+			break
+		}
+		tp := e.tierPlan(spec.Plan, i)
+		tierSpec := spec
+		tierSpec.Plan = tp
+
+		tr, err := e.runTier(ctx, tierSpec, st, logFile, emit)
+		res.Steps = append(res.Steps, tr.step)
+		if tr.metrics != nil {
+			tr.metrics.Bucket = st.Bucket
+			tr.metrics.Sessions = st.Parallel
+			tr.metrics.QPS = tp.QPS
+			tiers = append(tiers, tr.metrics)
+		}
+		files = append(files, tr.files...)
+		if tr.note != "" {
+			notes = append(notes, fmt.Sprintf("%s: %s", st.Bucket, tr.note))
+		}
+		if err != nil {
+			// 启动失败等致命错误：已完成档位的结果仍归档，由 runmgr 记录失败原因。
+			res.Files = files
+			res.Cache = aggregateCacheTiers(tiers)
+			if len(tiers) > 0 {
+				res.Cache.Tiers = tiers
+			}
+			return res, err
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+
+	// 探针原始文件归档（文件名保持与 v1 一致）。
+	if p := filepath.Join(cacheRoot, "prefix_usage.csv"); fileExists(p) {
+		files = append(files, FileArtifact{
+			Kind: domain.ArtBenchCSV, Filename: "multi-round-chat-prefix_usage.csv",
+			Path: p, ContentType: "text/csv; charset=utf-8",
+		})
+	}
+	res.Files = files
+
+	switch {
+	case len(tiers) == 1 && len(spec.Steps) == 1:
+		m := tiers[0]
+		attachProbe(m, probeRounds)
+		res.Cache = m
+	case len(tiers) > 0:
+		agg := aggregateCacheTiers(tiers)
+		attachProbe(agg, probeRounds)
+		agg.Tiers = tiers
+		res.Cache = agg
+	default:
+		res.Cache = &domain.CacheMetrics{Workload: spec.Plan.Workload}
+	}
+	if len(notes) > 0 {
+		res.CacheNote = strings.Join(notes, "；")
+	}
+	if ctx.Err() != nil {
+		// 返回 ctx.Err() 而不是固定 context.Canceled：runmgr 要靠它区分
+		// 用户取消（Canceled）与单次运行超时（DeadlineExceeded）。
+		return res, ctx.Err()
+	}
+	return res, nil
+}
+
+// runTier 执行单个档位：一个 lmcache 子进程 + 独立输出目录。
+func (e *CacheEngine) runTier(ctx context.Context, spec Spec, st domain.StepSpec, logFile *os.File, emit func(Event)) (tierResult, error) {
+	tr := tierResult{}
+	outDir := filepath.Join(spec.WorkDir, "cache", sanitizeDirName(st.Bucket))
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		tr.step = domain.Step{Index: st.Index, Bucket: st.Bucket, Status: domain.StepFailed}
+		tr.note = err.Error()
+		return tr, nil
+	}
+
+	emit(Event{Kind: EvStepStarted, At: time.Now().UTC(), Data: map[string]any{
+		"step_index": st.Index, "bucket": st.Bucket, "parallel": st.Parallel, "number": 0,
+	}})
+
 	args := e.benchArgs(spec, outDir)
 	cmd := exec.CommandContext(ctx, e.cli, args...)
 	cmd.Dir = e.workdir
 	cmd.Env = e.childEnv(spec.Target.APIKey)
 	setPgid(cmd)
 
-	fmt.Fprintf(logFile, "\n=== workload: %s ===\n$ %s %s\n", st.Bucket, e.cli, strings.Join(redactArgs(args), " "))
+	fmt.Fprintf(logFile, "\n=== workload: %s（sessions≈%d, qps=%g） ===\n$ %s %s\n",
+		st.Bucket, st.Parallel, spec.Plan.QPS, e.cli, strings.Join(redactArgs(args), " "))
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return res, err
+		tr.step = domain.Step{Index: st.Index, Bucket: st.Bucket, Status: domain.StepFailed}
+		tr.note = err.Error()
+		return tr, err
 	}
 	cmd.Stderr = cmd.Stdout
 	if err := cmd.Start(); err != nil {
 		emit(Event{Kind: EvError, At: time.Now().UTC(), Data: map[string]any{
 			"code": "engine_failed", "detail": err.Error()}})
-		return res, err
+		tr.step = domain.Step{Index: st.Index, Bucket: st.Bucket, Status: domain.StepFailed}
+		tr.note = err.Error()
+		return tr, err
 	}
 
 	var wg sync.WaitGroup
@@ -222,7 +385,7 @@ func (e *CacheEngine) Run(ctx context.Context, spec Spec, emit func(Event)) (Res
 			emit(Event{Kind: EvLog, At: time.Now().UTC(), Data: map[string]any{"line": line}})
 			if benchPhaseRe.MatchString(line) {
 				emit(Event{Kind: EvStepProgress, At: time.Now().UTC(), Data: map[string]any{
-					"step_index": 0, "completed": 50, "total": 100, "phase": phaseOf(line),
+					"step_index": st.Index, "completed": 50, "total": 100, "phase": phaseOf(line),
 				}})
 			}
 		}
@@ -230,6 +393,7 @@ func (e *CacheEngine) Run(ctx context.Context, spec Spec, emit func(Event)) (Res
 
 	waitErr := make(chan error, 1)
 	go func() { waitErr <- cmd.Wait() }()
+
 	var runErr error
 	select {
 	case <-ctx.Done():
@@ -241,31 +405,29 @@ func (e *CacheEngine) Run(ctx context.Context, spec Spec, emit func(Event)) (Res
 			<-waitErr
 		}
 		wg.Wait()
-		return res, ctx.Err()
+		tr.step = domain.Step{Index: st.Index, Bucket: st.Bucket, Status: domain.StepCanceled}
+		tr.note = "已取消"
+		return tr, nil
 	case err := <-waitErr:
 		wg.Wait()
 		runErr = err
 	}
-	if runErr != nil {
-		res.ExitCode = exitCode(runErr)
-	}
 
 	// 导出最终生效参数（幂等：失败也不影响已有产物）
-	if cfgArgs := e.exportArgs(spec); cfgArgs != nil {
+	if cfgArgs := e.exportArgs(spec, outDir); cfgArgs != nil {
 		exp := exec.Command(e.cli, cfgArgs...)
 		exp.Env = e.childEnv(spec.Target.APIKey)
 		_ = exp.Run()
 	}
 
-	// 读取结果
-	metrics, ferr := readBenchResults(outDir, probeRounds)
+	metrics, ferr := readBenchResults(outDir, nil)
 	status := domain.StepSucceeded
 	errMsg := ""
 	if ferr != nil {
 		status = domain.StepFailed
 		errMsg = ferr.Error()
 		if runErr != nil {
-			errMsg = fmt.Sprintf("%s（退出码 %d）", errMsg, res.ExitCode)
+			errMsg = fmt.Sprintf("%s（退出码 %d）", errMsg, exitCode(runErr))
 		}
 	} else if metrics.TotalRequests > 0 && metrics.FailedReqs == metrics.TotalRequests {
 		status = domain.StepFailed
@@ -276,26 +438,23 @@ func (e *CacheEngine) Run(ctx context.Context, spec Spec, emit func(Event)) (Res
 		sr = float64(metrics.SuccessReqs) / float64(metrics.TotalRequests)
 	}
 	dur := metrics.ElapsedSec
-	res.Steps = append(res.Steps, domain.Step{
-		Index: 0, Bucket: st.Bucket, Parallel: metrics.NumSessions, Number: metrics.TotalRequests,
+	tr.step = domain.Step{
+		Index: st.Index, Bucket: st.Bucket, Parallel: metrics.NumSessions, Number: metrics.TotalRequests,
 		Status: status, SuccessRate: &sr, DurationSec: &dur,
-	})
-	res.Cache = metrics
-	if errMsg != "" {
-		res.CacheNote = errMsg
 	}
+	tr.metrics = metrics
+	tr.note = errMsg
+	tr.files = collectCacheFiles(st.Bucket, outDir)
 
 	var steadyP50 float64
 	if metrics.SteadyState != nil {
 		steadyP50 = metrics.SteadyState.TTFTp50MS
 	}
 	emit(Event{Kind: EvStepFinished, At: time.Now().UTC(), Data: map[string]any{
-		"step_index": 0, "status": string(status), "success_rate": sr,
+		"step_index": st.Index, "status": string(status), "success_rate": sr,
 		"ttft_steady_p50_ms": steadyP50, "duration_sec": dur,
 	}})
-
-	res.Files = collectCacheFiles(st.Bucket, outDir)
-	return res, nil
+	return tr, nil
 }
 
 // benchArgs 构造 lmcache bench engine 的 argv。
@@ -344,8 +503,8 @@ func (e *CacheEngine) benchArgs(spec Spec, outDir string) []string {
 	return args
 }
 
-// exportArgs 生成 --export-config 的 argv（落 resolved_config.json，不实际发请求）。
-func (e *CacheEngine) exportArgs(spec Spec) []string {
+// exportArgs 生成 --export-config 的 argv（落该档目录的 resolved_config.json，不实际发请求）。
+func (e *CacheEngine) exportArgs(spec Spec, outDir string) []string {
 	args := e.benchArgs(spec, "")
 	if len(args) < 2 {
 		return nil
@@ -359,7 +518,7 @@ func (e *CacheEngine) exportArgs(spec Spec) []string {
 		}
 		out = append(out, args[i])
 	}
-	out = append(out, "--export-config", filepath.Join(spec.WorkDir, "cache", "resolved_config.json"))
+	out = append(out, "--export-config", filepath.Join(outDir, "resolved_config.json"))
 	return out
 }
 
@@ -663,29 +822,23 @@ func pctF(v []float64, p float64) float64 {
 }
 
 // collectCacheFiles 收集产物。
-func collectCacheFiles(workload, dir string) []FileArtifact {
-	prefix := workload + "-"
-	candidates := []struct {
+func collectCacheFiles(prefix, dir string) []FileArtifact {
+	names := []struct {
 		name string
 		kind domain.ArtifactKind
 		ct   string
 	}{
 		{"bench_results.csv", domain.ArtBenchCSV, "text/csv; charset=utf-8"},
 		{"bench_summary.json", domain.ArtBenchSummary, "application/json"},
-		{"prefix_usage.csv", domain.ArtBenchCSV, "text/csv; charset=utf-8"},
+		{"resolved_config.json", domain.ArtBenchConfig, "application/json"},
 	}
 	var out []FileArtifact
-	for _, c := range candidates {
+	for _, c := range names {
 		p := filepath.Join(dir, c.name)
 		if st, err := os.Stat(p); err != nil || st.IsDir() {
 			continue
 		}
-		out = append(out, FileArtifact{Kind: c.kind, Filename: prefix + c.name, Path: p, ContentType: c.ct})
-	}
-	// resolved_config.json 落在 cache/ 下
-	if p := filepath.Join(filepath.Dir(dir), "resolved_config.json"); fileExists(p) {
-		out = append(out, FileArtifact{Kind: domain.ArtBenchConfig, Filename: prefix + "resolved_config.json",
-			Path: p, ContentType: "application/json"})
+		out = append(out, FileArtifact{Kind: c.kind, Filename: prefix + "-" + c.name, Path: p, ContentType: c.ct})
 	}
 	return out
 }

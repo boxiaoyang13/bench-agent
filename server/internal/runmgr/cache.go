@@ -3,8 +3,12 @@ package runmgr
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"sort"
+	"time"
 
 	"github.com/apexcloud/thvv/server/internal/config"
 	"github.com/apexcloud/thvv/server/internal/domain"
@@ -18,6 +22,9 @@ const (
 	cacheMinDurationSec = 10
 	cacheMaxDurationSec = 3600
 	cacheMaxQPS         = 100.0
+	cacheMaxTiers       = 20  // 并发档位上限
+	cacheStepBudgetSec  = 120 // 每档预留的预热 + 进程启停预算（用于总时长校验）
+	cacheMaxSessions    = 10000
 )
 
 func (m *Manager) cacheCapability(tool string) *config.Capability {
@@ -28,7 +35,7 @@ func (m *Manager) cacheCapability(tool string) *config.Capability {
 	return eng.Capabilities["cache"]
 }
 
-// normalizeCachePlan 规范化 cache plan，展开成单 step。
+// normalizeCachePlan 规范化 cache plan：单档展开 1 个 step，ladder 展开多个 step。
 func (m *Manager) normalizeCachePlan(tool string, p domain.Plan) (domain.Plan, []domain.StepSpec, error) {
 	cap := m.cacheCapability(tool)
 	if cap == nil || !cap.Enabled {
@@ -113,7 +120,68 @@ func (m *Manager) normalizeCachePlan(tool string, p domain.Plan) (domain.Plan, [
 	}
 
 	steps := []domain.StepSpec{{Index: 0, Bucket: p.Workload}}
+	if len(p.CacheLadder) > 0 {
+		var lerr error
+		if steps, lerr = m.expandCacheLadder(&p); lerr != nil {
+			return p, nil, lerr
+		}
+	}
+	// 总时长校验：每档都有独立的 duration + 预热/启停预算。
+	if m.cfg.Limits.MaxRunDuration > 0 {
+		est := time.Duration(len(steps)) * (time.Duration(p.DurationSec)*time.Second +
+			cacheStepBudgetSec*time.Second)
+		if est > m.cfg.Limits.MaxRunDuration {
+			return p, nil, invalid("并发档位总时长约 %s（%d 档 ×（%ds + 预热预算 %ds））超过单次运行上限 %s，请缩短时长或减少档位",
+				est.Round(time.Minute), len(steps), p.DurationSec, cacheStepBudgetSec, m.cfg.Limits.MaxRunDuration)
+		}
+	}
 	return p, steps, nil
+}
+
+// expandCacheLadder 把 plan.ladder 展开成多个 step，并把 sessions 反算成 KV 容量回填。
+//
+// MRC 只接受 kv-cache-volume（session 数 = 容量 × tokens/GB ÷ 单会话 token），
+// 所以每档的 KVCacheVolumeGB 由 sessions 反推；档位按 sessions 升序执行。
+func (m *Manager) expandCacheLadder(p *domain.Plan) ([]domain.StepSpec, error) {
+	if len(p.CacheLadder) > cacheMaxTiers {
+		return nil, invalid("并发档位最多 %d 档（当前 %d）", cacheMaxTiers, len(p.CacheLadder))
+	}
+	perSession := p.SharedPromptLen + p.ChatHistoryLen
+	if perSession <= 0 {
+		return nil, invalid("并发档位需要 shared_prompt_length + chat_history_length > 0（可由 cache_defaults 提供）")
+	}
+	seen := make(map[int]bool, len(p.CacheLadder))
+	tiers := make([]domain.CacheTier, 0, len(p.CacheLadder))
+	for i, t := range p.CacheLadder {
+		if t.Sessions < 1 || t.Sessions > cacheMaxSessions {
+			return nil, invalid("ladder[%d].sessions 非法（1..%d，当前 %d）", i, cacheMaxSessions, t.Sessions)
+		}
+		if seen[t.Sessions] {
+			return nil, invalid("ladder 档位重复（sessions=%d）", t.Sessions)
+		}
+		seen[t.Sessions] = true
+		qps := t.QPS
+		if qps == 0 {
+			qps = p.QPS
+		}
+		if qps <= 0 || qps > cacheMaxQPS {
+			return nil, invalid("ladder[%d].qps 非法（0 < qps ≤ %g，当前 %g）", i, cacheMaxQPS, qps)
+		}
+		// 向上取整到 1e-6 GB：容量 × tokens/GB ÷ perSession 必须 ≥ sessions
+		vol := math.Ceil(float64(t.Sessions*perSession)/float64(p.TokensPerGBKV)*1e6) / 1e6
+		tiers = append(tiers, domain.CacheTier{
+			Sessions: t.Sessions, QPS: qps, KVCacheVolumeGB: vol,
+		})
+	}
+	sort.Slice(tiers, func(i, j int) bool { return tiers[i].Sessions < tiers[j].Sessions })
+	p.CacheLadder = tiers
+	steps := make([]domain.StepSpec, 0, len(tiers))
+	for i, t := range tiers {
+		steps = append(steps, domain.StepSpec{
+			Index: i, Bucket: fmt.Sprintf("c%d", t.Sessions), Parallel: t.Sessions,
+		})
+	}
+	return steps, nil
 }
 
 // reportCache 生成 cache run 的汇总与产物。
@@ -162,6 +230,17 @@ func (m *Manager) reportCache(ctx context.Context, lr *liveRun, res engine.Resul
 		if ss.DecodeSpeedP50 > 0 {
 			summary["decode_speed_steady_p50"] = round6(ss.DecodeSpeedP50)
 		}
+	}
+	// 多档：顶层是聚合，明细在 results.cache.tiers；history 等只需要档位数。
+	if len(cm.Tiers) > 0 {
+		summary["tiers_count"] = len(cm.Tiers)
+		var maxSessions int
+		for _, t := range cm.Tiers {
+			if t != nil && t.Sessions > maxSessions {
+				maxSessions = t.Sessions
+			}
+		}
+		summary["max_sessions"] = maxSessions
 	}
 	// 性能维度：口径是「前缀缓存命中态下的表观性能」，与 perf 冷启动口径不可直接横比。
 	// TTFT 受前缀缓存影响大，decode speed / TPOT 主要反映模型生成性能。

@@ -629,3 +629,65 @@ func TestEvaluateCacheGatePerf(t *testing.T) {
 		}
 	}
 }
+
+// TestEvaluateCacheGateTiers 多档：逐档判定，违规带 tier，tier_summary 每档一行。
+func TestEvaluateCacheGateTiers(t *testing.T) {
+	profile := &config.GateProfile{
+		Capability: "cache",
+		CacheTiers: []config.CacheGateTier{{
+			SteadyTTFTp50MaxMS: 800, TTFTImprovementMin: 0.30, SuccessRateMin: 0.99,
+			TPOTP50MaxMS: 80, DecodeSpeedMin: 15, MinSamples: 10,
+		}},
+	}
+	agg := &domain.CacheMetrics{
+		Workload: "multi-round-chat",
+		Tiers: []*domain.CacheMetrics{
+			{
+				Bucket: "c1", Sessions: 1, QPS: 1,
+				TotalRequests: 20, SuccessReqs: 20, SuccessRate: 1,
+				SteadyState: &domain.CacheSteadyStats{
+					Requests: 17, TTFTp50MS: 400, TTFTImprovement: 0.60,
+					TPOTp50MS: 20, DecodeSpeedP50: 50,
+				},
+			},
+			{
+				Bucket: "c4", Sessions: 4, QPS: 4,
+				TotalRequests: 10, SuccessReqs: 10, SuccessRate: 1,
+				SteadyState: &domain.CacheSteadyStats{
+					Requests: 5, TTFTp50MS: 900, TTFTImprovement: 0.10,
+					TPOTp50MS: 120, DecodeSpeedP50: 8,
+				},
+			},
+		},
+	}
+	res := EvaluateCacheGate(profile, agg, false)
+	if res.Passed {
+		t.Fatal("c4 档多项超限应不通过")
+	}
+	rules := map[string]string{} // rule -> tier
+	for _, v := range res.Violations {
+		rules[v.Rule+"@"+v.Tier] = v.Message
+	}
+	for _, want := range []string{"steady_ttft_p50_max_ms@c4", "ttft_improvement_min@c4",
+		"tpot_p50_max_ms@c4", "decode_speed_min@c4", "min_samples@c4"} {
+		if _, ok := rules[want]; !ok {
+			t.Fatalf("缺违规 %s: %+v", want, res.Violations)
+		}
+	}
+	if _, ok := rules["steady_ttft_p50_max_ms@c1"]; ok {
+		t.Fatalf("c1 档不应有违规: %+v", res.Violations)
+	}
+	if len(res.TierSummary) != 2 {
+		t.Fatalf("tier_summary 期望 2 行，实际 %d", len(res.TierSummary))
+	}
+	byTier := map[string]domain.TierSummary{}
+	for _, ts := range res.TierSummary {
+		byTier[ts.Tier] = ts
+	}
+	if byTier["c1"].Passed != true || byTier["c4"].Passed != false {
+		t.Fatalf("tier_summary 结论错误: %+v", res.TierSummary)
+	}
+	if byTier["c1"].P50MaxSec != 0.4 {
+		t.Fatalf("tier_summary TTFT 应换算为秒: %+v", byTier["c1"])
+	}
+}
