@@ -9,7 +9,7 @@ help:
 
 build: ## 编译为 bin/thvv-server
 	@mkdir -p bin
-	go build -trimpath -ldflags "-s -w -X main.version=$${VERSION:-1.0.0} -X main.commit=$$(git rev-parse --short HEAD 2>/dev/null || echo dev)" -o $(BINARY) ./cmd/thvv-server
+	go build -trimpath -ldflags "-s -w -X main.version=$${VERSION:-1.0.1} -X main.commit=$$(git rev-parse --short HEAD 2>/dev/null || echo dev)" -o $(BINARY) ./cmd/thvv-server
 
 run: build ## 用指定配置启动（CONFIG=...）
 	@test -n "$$THVV_SECRET_KEY" || { echo "请先 export THVV_SECRET_KEY=$$(openssl rand -base64 32)"; exit 1; }

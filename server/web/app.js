@@ -315,7 +315,7 @@ function setServerBadge(ok, meta) {
   el.hidden = false;
   if (ok) {
     el.className = 'badge ok';
-    el.textContent = `服务正常 · v${meta?.server?.version || '1.0.0'}`;
+    el.textContent = `服务正常 · v${meta?.server?.version || '1.0.1'}`;
   } else {
     el.className = 'badge err';
     el.textContent = '服务不可用';
